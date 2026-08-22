@@ -53,17 +53,32 @@ static uint8_t  s_mirx = 1, s_miry = 0;
 static float    s_lfpx = 184.7f, s_lfeq = 90.0f;
 static uint64_t s_prev_us = 0;
 
+// Duplicate-report cache. The caller polls at loop rate but the wiicam only
+// updates internally at its own frame rate, so most polls return the exact
+// bytes of the previous one. Reprocessing those would (a) hand the resolver,
+// lead and One Euro filter a dt of the LOOP interval instead of the camera
+// interval, decaying the velocity estimate between real frames, and (b) flood
+// the Q stream at loop rate during an uncapped lens sweep.
+static int      s_cache_px[4], s_cache_py[4];
+static unsigned s_cache_seen = 0xFFFFFFFFu;    // impossible: never matches first
+static bool     s_cache_ret = false;
+static float    s_cache_sx = 0.0f, s_cache_sy = 0.0f;
+
 void wiicam_aim_begin(void)
 {
     quad_reset(0);                 // defaults are tuned for exactly this space
     int lead = 0;
     if (aim_lead_load(&lead)) s_lead_ms = (float)lead;
+    int smooth = 0;
+    if (aim_smooth_load(&smooth)) aim_smooth_set(smooth);
     aim_lens_t ls;
     if (aim_lens_load(&ls)) {
         s_lens = (uint8_t)ls.model;
         s_lk1 = ls.k1; s_lk2 = ls.k2; s_lfpx = ls.fpx; s_lfeq = ls.feq;
     }
     s_prev_us = 0;
+    s_cache_seen = 0xFFFFFFFFu;
+    s_cache_ret = false;
 }
 
 // Identical model to the ESP32 build's lens_undistort, in 240-space.
@@ -111,6 +126,20 @@ static void emit_q(uint64_t now_us, const float* xs, const float* ys, int n)
 bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
                         uint64_t now_us, float* sx, float* sy)
 {
+    // A byte-identical report is the previous camera frame seen again: return
+    // the cached answer and leave every stateful stage untouched.
+    bool same = (seen == s_cache_seen);
+    for (int i = 0; same && i < 4; ++i)
+        if ((seen & (1u << i)) && (px[i] != s_cache_px[i] || py[i] != s_cache_py[i]))
+            same = false;
+    if (same) {
+        *sx = s_cache_sx; *sy = s_cache_sy;
+        return s_cache_ret;
+    }
+    s_cache_seen = seen;
+    for (int i = 0; i < 4; ++i) { s_cache_px[i] = px[i]; s_cache_py[i] = py[i]; }
+    s_cache_ret = false;
+
     // Seen-mask gate: the driver retains an unseen slot's previous
     // coordinates, so unmasked reads would feed the resolver stale points.
     float xs[4], ys[4];
@@ -153,7 +182,10 @@ bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
     if (!aim_runtime_active()) return false;
     aim_pt_t q[4];
     for (int i = 0; i < 4; ++i) { q[i].x = qx[i]; q[i].y = qy[i]; }
-    return aim_runtime_solve(q, WIICAM_NORM_W, WIICAM_NORM_H, sx, sy, dt);
+    s_cache_ret = aim_runtime_solve(q, WIICAM_NORM_W, WIICAM_NORM_H,
+                                    &s_cache_sx, &s_cache_sy, dt);
+    *sx = s_cache_sx; *sy = s_cache_sy;
+    return s_cache_ret;
 }
 
 // ---- the '~cam' command subset -------------------------------------------
@@ -170,14 +202,15 @@ bool wiicam_cam_command(const char* line)
     if (!line) return false;
     if (!strncmp(line, "camsave", 7)) {
         aim_lead_store((int)s_lead_ms);
+        aim_smooth_store(aim_smooth_get());
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq };
         bool lens_ok = true;
         if (ls.model == 0) aim_lens_clear();
         else               lens_ok = aim_lens_store(&ls);
-        reply(lens_ok ? "CAM: saved lead=%dms lens=%d (sens lives in the OpenFIRE profile)\n"
-                      : "CAM: SAVE FAILED lead=%dms lens=%d\n",
-              (int)s_lead_ms, (int)s_lens);
+        reply(lens_ok ? "CAM: saved lead=%dms smooth=%d lens=%d (sens lives in the OpenFIRE profile)\n"
+                      : "CAM: SAVE FAILED lead=%dms smooth=%d lens=%d\n",
+              (int)s_lead_ms, aim_smooth_get(), (int)s_lens);
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
@@ -188,9 +221,9 @@ bool wiicam_cam_command(const char* line)
     }
     if (!strncmp(line, "cam?", 4)) {
         reply("CAM: board=rp2040-wiicam sens=%d mirx=%d miry=%d lead=%d "
-              "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d res=%u dash=%u\n",
+              "smooth=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d res=%u dash=%u\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
-              (int)s_lead_ms,
+              (int)s_lead_ms, aim_smooth_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
               (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
               (unsigned)s_res, (unsigned)s_dash);
@@ -218,12 +251,14 @@ bool wiicam_cam_command(const char* line)
         else if (!strcmp(key, "lk2u")) { s_lk2 = (float)val * 1e-6f; }
         else if (!strcmp(key, "lfpx")) { if (val > 0) s_lfpx = (float)val / 10.0f; }
         else if (!strcmp(key, "lfeq")) { if (val > 0) s_lfeq = (float)val / 10.0f; }
+        else if (!strcmp(key, "smooth")) { aim_smooth_set(val); }
         else if (!strcmp(key, "sens")) { if (s_sens_set && val >= 0 && val <= 2) s_sens_set(val); }
         else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); quad_reset(0); }
         else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); quad_reset(0); }
     }
-    reply("CMD ok (tune) | sens=%d lead=%d lens=%u res=%u dash=%u\n",
-          s_sens_get ? s_sens_get() : -1, (int)s_lead_ms,
+    s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
+    reply("CMD ok (tune) | sens=%d lead=%d smooth=%d lens=%u res=%u dash=%u\n",
+          s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
           (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash);
     return true;
 }

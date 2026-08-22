@@ -81,6 +81,9 @@ class Link:
         self.last = {}
         self.replies = []
         self.hid_on = True        # the gun boots this way; we do not change it uninvited
+        self.partial_t = 0.0      # wall clock of the last <4-LED frame
+        self.partial_n = 0        # running count of <4-LED frames
+        self.full_t = 0.0         # wall clock of the last 4-LED frame
 
     def connect(self, port=None):
         self.port = port or find_gun()
@@ -157,9 +160,21 @@ class Link:
                 self.last["trig"] = self.last.get("trig", 0) + 1
                 continue
             pq = parse_q(line)
-            if pq is None: continue
+            if pq is None:
+                # a Q line with fewer than four points is a DROPOUT, not
+                # noise on the wire -- remember when we last saw one so the
+                # live view can say WHY it is not updating
+                if line.startswith("Q,"):
+                    try:
+                        if 0 <= int(line.split(",")[2]) < 4:
+                            self.partial_t = time.time()
+                            self.partial_n += 1
+                    except (ValueError, IndexError):
+                        pass
+                continue
             q, gt = pq
             self.frames += 1
+            self.full_t = time.time()
             self.hist.append((gt, q))
         cut = self.hist[-1][0] - 2.0 if self.hist else 0
         self.hist = [h for h in self.hist if h[0] >= cut][-400:]
@@ -283,7 +298,7 @@ def main():
         (2, "Camera tuning",  "exposure, threshold, noise floor"),
         (3, "Lens / FOV",     "only if your lens is not the stock 66\u00b0"),
         (4, "Aim calibration","five dots x three distances"),
-        (5, "Fine tune",      "iron sights to cursor, and lead"),
+        (5, "Fine tune",      "iron sights to cursor, lead and smoothing"),
         (6, "Verify",         "measures whose error it is")]):
         f = tk.Frame(left, bg=C_BG); f.pack(fill="x", pady=5)
         b = tk.Button(f, text="%d.  %s" % (num, title), font=FB, width=22, anchor="w",
@@ -574,13 +589,28 @@ def main():
         if not link.src:
             log("lens: not connected"); return
         lens_busy["on"] = True
+        # Snapshot the live lens state BEFORE the sweep turns it off, so a
+        # refusal can put it back instead of leaving the correction off.
+        prev_lens = {k: link.last.get(k, 0) for k in LENS_KEYS}
+        # Snapshot the pointer choice BEFORE freezing: the gun's "pointer
+        # FROZEN" reply to our own freeze writes hid_on=False through the
+        # pump's feedback parser, so reading hid_on at restore time would
+        # restore the freeze itself and leave the cursor dead after Measure.
+        want_hid = link.hid_on
+        # Dropout accounting baseline: full and partial frames seen so far.
+        n_full0, n_part0 = link.frames, link.partial_n
+        # Freeze the pointer for the sweep: with the resolver off the firmware
+        # falls back to OpenFIRE's stock aim, which sends the cursor jumping
+        # all over the desktop while you pan. Restored when the fit lands.
+        link.pointer(False, remember=False)
         # raw data: resolver off (it invents corners), correction off (fitting
         # corrected data fits garbage), full frame rate
         link.send("~cam=res:0,lens:0,dashhz:0")
-        log("lens: MEASURING for 20 s. Stand ~2 m from the rig, feet planted,")
-        log("and slowly pan/tilt/roll the gun so the LEDs travel across the")
-        log("WHOLE image -- push them out to the edges and corners. Keep all")
-        log("four in frame.")
+        log("lens: MEASURING for 20 s. Stand at a distance that keeps all four")
+        log("LEDs in view with the quad still a good size, feet planted, and")
+        log("slowly pan/tilt/roll the gun so the LEDs travel across the WHOLE")
+        log("image -- push them out to the edges and corners. Wiicam: use at")
+        log("least High sensitivity for a fisheye; go up if the view is choppy.")
         t0 = time.time()
         frames = []
         # hist timestamps are the GUN's clock, not ours -- comparing them
@@ -603,16 +633,80 @@ def main():
             lens_state.config(text="fitting...", fg=C_WARN)
             snap = np.array(frames) if frames else np.zeros((0, 4, 2))
 
+            # Save every sweep, pass or fail, in the Q format calib_lens.py
+            # reads -- a refusal without data cannot be diagnosed.
+            sweep_path = ""
+            if len(snap):
+                try:
+                    outdir = os.path.join(HERE, "calib_out")
+                    os.makedirs(outdir, exist_ok=True)
+                    sweep_path = os.path.join(outdir,
+                        time.strftime("lenssweep-%Y%m%d-%H%M%S.log"))
+                    with open(sweep_path, "w") as fh:
+                        for i, q in enumerate(snap):
+                            fh.write("Q,%d,4," % (i * 7) +
+                                     ",".join("%d,%d" % (round(pt[0]*10), round(pt[1]*10))
+                                              for pt in q) + "\n")
+                except Exception:
+                    sweep_path = ""
+
             def fit():
-                r = calib_lens.fit_from_frames(snap, fov)
+                # never let an exception strand the sweep with the pointer
+                # frozen and the lens off -- done() runs whatever happens
+                try:
+                    r = calib_lens.fit_from_frames(snap, fov)
+                except Exception as e:
+                    r = dict(ok=False, why="fitter crashed: %r" % e,
+                             model=None, rms_px=0.0, coverage=0.0)
 
                 def done():
                     lens_busy["on"] = False
+                    # release the pointer back to the user's pre-sweep choice
+                    link.pointer(want_hid)
+                    # the numbers a refusal needs to be diagnosable
+                    if len(snap):
+                        rad = np.linalg.norm(snap - (120.0, 88.0), axis=-1)
+                        spans = [aim_fit.quad_span(q) for q in snap]
+                        log("lens: sweep %d frames, coverage %.0f%%, quad span "
+                            "median %.1f px, max radius %.1f px"
+                            % (len(snap), r.get("coverage", 0)*100,
+                               float(np.median(spans)), float(rad.max())))
+                        if float(np.median(spans)) < 25.0:
+                            log("lens: the quad is SMALL -- with an ultra-wide "
+                                "lens stand ~0.5 m from the rig and sweep again")
+                    # Dropout accounting: the sweep runs RAW, so what the
+                    # resolver normally hides is visible here. A wide lens
+                    # dims off-axis LEDs and the sensor drops them.
+                    fulls = link.frames - n_full0
+                    parts = link.partial_n - n_part0
+                    if parts > fulls:
+                        log("lens: DROPOUTS -- %d of %d frames were missing "
+                            "LEDs. The lens dims off-axis LEDs below the "
+                            "sensor threshold. Raise sensitivity (camera "
+                            "tab), add LED power, or stand closer, then "
+                            "re-run Measure for a cleaner fit."
+                            % (parts, parts + fulls))
+                    if sweep_path:
+                        log("lens: sweep saved: %s" % sweep_path)
                     if not r["ok"]:
+                        # put the pre-sweep correction back -- the sweep
+                        # switched it off and a refusal must not leave it off
+                        if prev_lens.get("lens"):
+                            link.send("~cam=" + ",".join(
+                                "%s:%d" % (k, prev_lens[k]) for k in LENS_KEYS))
+                            log("lens: previous correction restored")
                         lens_state.config(text="measure failed -- see the log", fg=C_BAD)
                         log("lens: REFUSED: %s" % r["why"])
                         return
                     link.send("~cam=" + calib_lens.tune_line(r))
+                    if r["model"] == "none":
+                        lens_state.config(
+                            text="measured: no correction needed (pinhole "
+                                 "within noise)", fg=C_OK)
+                        log("lens: this lens shows no measurable distortion "
+                            "on this sensor -- correction set to OFF.")
+                        log("Press 'Save to gun' to keep it across power cycles.")
+                        return
                     lens_state.config(
                         text="measured: %s  rms %.2f px  (coverage %.0f%%)"
                              % (r["model"], r["rms_px"], r["coverage"] * 100), fg=C_OK)
@@ -620,6 +714,9 @@ def main():
                     if r["rms_px"] > 1.0:
                         log("lens: residual is high -- consider redoing the sweep more slowly.")
                     log("Applied live. Press 'Save to gun' to keep it across power cycles.")
+                    log("IMPORTANT: the aim calibration was made under the OLD "
+                        "lens mapping -- redo Calibrate (step 4) now, then "
+                        "Fine tune, or aim will be warped.")
                 root.after(0, done)
             threading.Thread(target=fit, daemon=True).start()
         root.after(250, collect)
@@ -723,9 +820,24 @@ def main():
         cv.delete("all")
         W, H = 380, 280
         cv.create_rectangle(2, 2, W-2, H-2, outline="#30363d")
+        now = time.time()
+        dropping = (now - link.partial_t) < 1.0 and (now - link.full_t) > 0.5
         if not link.hist:
-            cv.create_text(W/2, H/2, text="no four-LED frames", fill=C_BAD, font=FB)
+            # say WHY there is nothing to draw: a stream of partial frames
+            # is dropouts (background IR, too far, threshold), not silence
+            if dropping:
+                cv.create_text(W/2, H/2 - 10, text="seeing LEDs, but not all four",
+                               fill=C_WARN, font=FB)
+                cv.create_text(W/2, H/2 + 12,
+                               text="background IR too high, or too far away",
+                               fill=C_DIM, font=(F[0], 9))
+            else:
+                cv.create_text(W/2, H/2, text="no four-LED frames", fill=C_BAD, font=FB)
             return
+        if dropping:
+            # the view below is the LAST GOOD frame; the banner says it is old
+            cv.create_text(W/2, 14, text="LEDs dropping out -- view is the last "
+                           "full frame", fill=C_WARN, font=(F[0], 9))
         q = aim_fit.canon(link.hist[-1][1])
         for i, nm in enumerate(("TL", "TR", "BL", "BR")):
             x = 4 + (q[i][0]/FRAME_W)*(W-8)

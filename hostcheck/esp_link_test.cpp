@@ -62,15 +62,21 @@ esp_err_t nvs_get_u32(nvs_handle_t, const char*, uint32_t* v) {
     *v = g_u32;
     return ESP_OK;
 }
-// the lead is an i16 under its own key, deliberately NOT part of the cam blob
-static int16_t g_i16 = 0; static bool g_i16have = false;
-esp_err_t nvs_set_i16(nvs_handle_t, const char*, int16_t v) {
-    g_i16 = v; g_i16have = true; return ESP_OK;
+// i16 values live under their own keys (lead, smoothing); the stub is
+// key-aware or the second key would silently alias the first.
+struct I16Slot { char key[16]; int16_t v; bool have; };
+static I16Slot g_i16s[4];
+esp_err_t nvs_set_i16(nvs_handle_t, const char* k, int16_t v) {
+    for (auto& s : g_i16s)
+        if (s.have && !strcmp(s.key, k)) { s.v = v; return ESP_OK; }
+    for (auto& s : g_i16s)
+        if (!s.have) { strncpy(s.key, k, 15); s.v = v; s.have = true; return ESP_OK; }
+    return -1;
 }
-esp_err_t nvs_get_i16(nvs_handle_t, const char*, int16_t* v) {
-    if (!g_i16have) return ESP_ERR_NVS_NOT_FOUND;
-    *v = g_i16;
-    return ESP_OK;
+esp_err_t nvs_get_i16(nvs_handle_t, const char* k, int16_t* v) {
+    for (auto& s : g_i16s)
+        if (s.have && !strcmp(s.key, k)) { *v = s.v; return ESP_OK; }
+    return ESP_ERR_NVS_NOT_FOUND;
 }
 esp_err_t nvs_commit(nvs_handle_t) { return ESP_OK; }
 void      nvs_close(nvs_handle_t) {}
@@ -127,6 +133,28 @@ int main()
     ck(aim_cam_load(&back0) && back0.thr == 60 && back0.aec == 40,
        "camera settings untouched by a lead write");
     ck(aim_lead_load(&lead) && lead == 7, "lead untouched by a camera write");
+
+    printf("\nsmoothing level:\n");
+    int sm = -1;
+    ck(!aim_smooth_load(&sm), "nothing stored to begin with");
+    ck(aim_smooth_store(7), "store level 7");
+    ck(aim_smooth_load(&sm) && sm == 7, "reads back 7");
+    ck(aim_smooth_store(99) && aim_smooth_load(&sm) && sm == 10, "clamped to 10");
+    ck(aim_smooth_store(-2) && aim_smooth_load(&sm) && sm == 0, "clamped to 0");
+    aim_smooth_set(3);
+    const float fc3 = aim_filter_min_cutoff(), b3 = aim_filter_beta();
+    ck(fc3 == 1.0f && b3 == 15.0f, "level 3 is the build-time default pair");
+    aim_smooth_set(10);
+    ck(aim_filter_min_cutoff() < fc3 && aim_filter_beta() < b3,
+       "level 10 is heavier than level 3 on both coefficients");
+    aim_smooth_set(0);
+    ck(aim_filter_min_cutoff() == 0.0f, "level 0 turns the filter off");
+    ck(aim_smooth_get() == 0, "get reports the level that was set");
+    aim_smooth_set(3);                        // back to defaults for the rest
+    // lead and smoothing are both i16 keys; they must not alias
+    aim_lead_store(12); aim_smooth_store(5);
+    ck(aim_lead_load(&lead) && lead == 12 && aim_smooth_load(&sm) && sm == 5,
+       "lead and smoothing keys do not alias each other");
 
     // a stored blob of the wrong size must be rejected, not reinterpreted
     g_blob_len = sizeof(aim_calib_t) - 4;

@@ -13,7 +13,8 @@ points and what your LED rectangle really is — so aim holds when you move
 around the room and the camera does not need to be aligned with the barrel;
 **corner identity** that survives an LED dropping out mid-motion instead of
 re-sorting and springing; a tunable **latency lead** (0–50 ms) so the cursor
-stops trailing fast swings; a **fine tune** that lines the cursor up with your
+stops trailing fast swings; an adjustable **smoothing level** (0–10) to trade
+cursor jitter for glide, tuned live from the fine-tune screen; a **fine tune** that lines the cursor up with your
 iron sights; and a **verify** step that measures the result instead of assuming
 it. Studio detects which gun is plugged in and adapts.
 
@@ -32,12 +33,13 @@ Please test. You get extremely accurate aim with snappy aim. No springy effect w
 | Lens filter | IR long-pass over the lens — **800 nm recommended (non tested)**, 700 nm works |
 | Cable | One USB-C cable to the board's **native USB** socket (see below) |
 
-**Why those wavelengths.** 850 nm LEDs with an 800 nm long-pass filter is a
-matched pair: the LEDs pass, room light and screen glow do not. Do not
-substitute 940 nm LEDs — silicon sensitivity falls off steeply past 850 nm, so
-you lose most of the signal you are filtering for. A 700 nm filter works but
-lets more of the visible red end through, which raises the blob noise floor you
-will be fighting in the camera tuning step.
+**Why those wavelengths (OV2640 build).** 850 nm LEDs with an 800 nm
+long-pass filter is a matched pair: the LEDs pass, room light and screen glow
+do not. Do not substitute 940 nm LEDs on THIS build — the OV2640's silicon
+sensitivity falls off steeply past 850 nm, so you lose most of the signal you
+are filtering for. A 700 nm filter works but lets more of the visible red end
+through, which raises the blob noise floor you will be fighting in the camera
+tuning step. The wiicam build is the opposite case — see its section below.
 
 **The camera must be the IR-cut-free version.** A normal OV2640 has a filter
 glued over the sensor that blocks exactly the light you want. Some modules let
@@ -55,11 +57,24 @@ The wiicam does blob detection on its own chip, so there is no camera to tune �
 its three sensitivity levels replace that step, and its stock 33° lens needs no
 correction.
 
+**Why 940 nm here.** The Wii camera was designed around the Wii sensor bar,
+which is 940 nm, and its built-in filter is matched to it — so on this build
+940 nm LEDs are the right choice, not 850 nm.
+
+**Wide and fisheye lenses cost signal.** A fisheye dims off-axis LEDs
+(vignetting plus the extra glass) and shrinks every blob, and the wiicam's
+on-chip detector silently drops whatever falls below its threshold — LEDs
+vanish long before they reach the frame edge. Use at least **High** sensitivity
+with a very large FOV, and go up a level if the live preview is choppy; add LED
+power or stand closer if dropouts persist. Expect brief dropouts when aiming at
+screen corners during play (the resolver coasts through them). Measure reports
+the dropout count after every sweep.
+
 **Both builds**
 
 | Part | Specification |
 |---|---|
-| IR LEDs | 4 × **850 nm**, one per screen corner, **5 W class recommended** |
+| IR LEDs | 4 ×, one per screen corner, **5 W class recommended** — **850 nm for the ESP32/OV2640 build, 940 nm for the RP2040/wiicam build** (wavelength notes above) |
 | Trigger | A button wired per OpenFIRE's pinout |
 
 The LED rectangle does not have to match your screen — the calibration measures
@@ -236,12 +251,19 @@ the calibration has nowhere to put a radially-varying error — so it must be
 corrected upstream, in the firmware, and this step configures that. Two ways:
 **Preset from FOV** (type the lens listing's field of view; good first
 approximation for fisheye lenses) or **Measure** — a guided 20-second sweep:
-stand ~2 m from the rig, feet planted, and slowly pan/tilt/roll so the LEDs
-travel out to the image edges. It fits both distortion models, applies the
-better one, and refuses honestly when the sweep did not cover enough of the
-frame to pin the answer. **Save to gun** persists it; it reloads at every boot.
+stand at a respectable distance — whatever keeps all four LEDs in view with the
+quad still a good size (Measure warns if it is too small) — feet planted, and
+slowly pan/tilt/roll so the LEDs travel out to the image edges. On the wiicam,
+raise the sensitivity first: at least **High** for a very large FOV like a
+fisheye, and go up a level whenever the preview is choppy during the sweep —
+that choppiness is LEDs dropping below the sensor threshold, and Measure counts
+the dropouts and says so. It fits both distortion
+models, applies the better one, and refuses honestly when the sweep did not
+cover enough of the frame to pin the answer. **Save to gun** persists it; it reloads at every boot.
 Know the trade: a wide lens lets you stand closer, but the shorter focal
-magnifies every noise source on screen.
+magnifies every noise source on screen. Applying or changing a lens correction
+invalidates the aim calibration — redo step 4, then step 5, after every change
+here.
 
 **4 — Aim calibration** *(both boards)*. Five dots at each of two or three distances. Aim, pull
 the trigger four times per dot. Stepping back between rounds is **required** —
@@ -259,6 +281,10 @@ exactly what you see as a constant offset from one position. Mixing them is
 safe: a ring shot only measures what is left after your nudges, so nothing is
 ever counted twice. `LEAD ±` trades latency for overshoot — raise it while the
 cursor trails you, stop as soon as it overshoots when you reverse direction.
+`SMOOTH ±` (0–10) trades cursor jitter for glide — raise it until the jitter
+settles, stop when the cursor starts to feel floaty. Wide and fisheye lenses
+magnify sensor noise, so they usually want a level or two more than stock.
+Both are saved with the fine tune.
 You will see a big difference here
 
 **6 — Verify** *(both boards)*. Shoots a nine-point grid and reports the error of the pipeline
@@ -431,11 +457,12 @@ All are prefixed `~` on the native USB port.
 | `~aimcal?` | Print the active calibration |
 | `~aimcal=...` | Install and save a calibration |
 | `~aimhid=0` / `=1` | Freeze / release the cursor (never saved) |
-| `~cam?` | Camera settings, including `lead` and the lens correction |
+| `~cam?` | Camera settings, including `lead`, `smooth` and the lens correction |
 | `~cam=thr:60,aec:40` | Tune the camera live |
 | `~cam=lead:10` | Latency lead in ms, 0–50 |
+| `~cam=smooth:5` | Cursor smoothing level 0–10 (0 = off, 3 = default) |
 | `~cam=lens:2,lfeq:900,lfpx:840` | Set the lens correction live |
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only) |
-| `~camsave` | Persist camera settings, lead and lens |
+| `~camsave` | Persist camera settings, lead, smoothing and lens |
 
 See `NOTICE.md` for third-party code and licences.

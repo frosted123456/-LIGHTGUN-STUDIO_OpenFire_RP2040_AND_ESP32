@@ -91,6 +91,70 @@ void  aim_filter_reset(void) { s_f_have = false; }
 float aim_filter_min_cutoff(void) { return s_fc; }
 float aim_filter_beta(void) { return s_beta; }
 
+// ---- smoothing level ------------------------------------------------------
+// One knob over the One Euro pair. Level 3 equals the build-time defaults, so
+// a gun that never stored a level behaves exactly as before the knob existed.
+#define AIM_NVS_SMOOTH "smth0"
+static const float SMOOTH_TAB[11][2] = {
+    {0.00f,  0.0f},   // 0: filter off
+    {2.00f, 40.0f},   // 1: barely there
+    {1.40f, 25.0f},
+    {1.00f, 15.0f},   // 3: the build-time default pair
+    {0.90f, 10.0f},
+    {0.80f,  7.0f},
+    {0.70f,  5.0f},
+    {0.60f,  3.5f},
+    {0.50f,  2.5f},
+    {0.45f,  1.7f},
+    {0.40f,  1.2f},   // 10: heaviest, noticeable glide
+};
+static int s_smooth = 3;
+
+// Clamps, applies the mapped coefficients, and remembers the level.
+void aim_smooth_set(int level)
+{
+    if (level < 0) level = 0;
+    if (level > 10) level = 10;
+    s_smooth = level;
+    aim_filter_set(SMOOTH_TAB[level][0], SMOOTH_TAB[level][1]);
+}
+int aim_smooth_get(void) { return s_smooth; }
+
+// Persists the smoothing level, clamped to 0..10.
+bool aim_smooth_store(int level)
+{
+    if (level < 0) level = 0;
+    if (level > 10) level = 10;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_i16(h, AIM_NVS_SMOOTH, (int16_t)level) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)level; return true;
+#endif
+}
+
+// Reads the persisted smoothing level; false if nothing is stored.
+bool aim_smooth_load(int* out_level)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_level) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    int16_t v = 0;
+    const esp_err_t e = nvs_get_i16(h, AIM_NVS_SMOOTH, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    *out_level = (int)v;
+    return true;
+#else
+    (void)out_level; return false;
+#endif
+}
+
 // Applies the One Euro filter in place to one screen coordinate pair.
 static void oe_filter(float* x, float* y, float dt)
 {
@@ -185,7 +249,7 @@ static bool cam_plausible(const aim_cam_t* c)
     return true;
 }
 
-// Persists the latency lead, clamped to 0..30 ms.
+// Persists the latency lead, clamped to 0..50 ms.
 bool aim_lead_store(int ms)
 {
     if (ms < 0) ms = 0;

@@ -22,13 +22,13 @@ IMG_W, IMG_H = 240.0, 176.0
 CX, CY = IMG_W / 2.0, IMG_H / 2.0
 
 def fpx_for(fov_deg):
-    """Output pinhole focal that maps the lens's FULL horizontal field into
-    the 240px frame. This matters: the publish path clamps x to [0, 240), so
-    a too-large FPX silently destroys geometry for any LED past the angle
-    where tan(theta)*FPX exceeds the half-width (e.g. FPX=184.7 with a 160deg
-    lens clips everything beyond ~33deg off-axis). The simulator validated
-    exactly this mapping: 84.0 at 110deg, 21.2 at 160deg."""
-    return (IMG_W / 2.0) / math.tan(math.radians(fov_deg) / 2.0)
+    """Output pinhole focal for a given lens FOV. Maps at most 120 deg of
+    field into the frame: beyond that the mapping is pointless for a lightgun
+    (the LEDs live in the central region) and at 180 deg it is impossible
+    outright -- tan(90deg) is infinite, so the unclamped formula returned a
+    ZERO focal, which the firmware rejected, leaving a stale fpx behind."""
+    eff = min(float(fov_deg), 120.0)
+    return (IMG_W / 2.0) / math.tan(math.radians(eff) / 2.0)
 
 # --------------------------------------------------------------------------
 # parsing + correspondence
@@ -203,10 +203,20 @@ def scan_then_refine(fun, lo, hi, n, tol, log=False):
     x = golden(fun, xs[i - 1], xs[i + 1], tol)
     return float(x), float(fun(x)), float(ident)
 
-def fit_fisheye(frames, feq0):
+def fit_fisheye(frames, feq0=None):
     frames = subsample(frames)
-    fun = lambda feq: bundle_rms(rays_fisheye(frames, feq))
-    return scan_then_refine(fun, feq0 * 0.5, feq0 * 2.0, 9, 0.05, log=True)
+    # Cost in PIXELS (angular rms x feq): the raw angular cost is not
+    # scale-invariant -- the same pixel error subtends a smaller angle at a
+    # larger feq, so an unnormalised cost drifts to the bracket's top edge.
+    fun = lambda feq: bundle_rms(rays_fisheye(frames, feq)) * feq
+    # Data-bounded bracket, independent of the typed lens label. Lower bound:
+    # no observed point may reach the 1.45 rad clip -- below that, clipped
+    # points collapse onto a cone the bundle fits spuriously well, creating a
+    # fake minimum at the bracket edge.
+    rmax = float(np.linalg.norm(frames - (CX, CY), axis=-1).max())
+    lo = max(20.0, rmax / 1.40)
+    hi = max(600.0, lo * 4.0)
+    return scan_then_refine(fun, lo, hi, 17, 0.05, log=True)
 
 def fit_poly(frames, fpx, fit_k2=False):
     frames = subsample(frames)
@@ -286,7 +296,7 @@ def cmd_fit(a):
         print(f"identifiability (bracket-edge contrast): {ident*100:.0f}%")
         if ident < 0.30:
             sys.exit(REFUSE)
-        emit("fisheye", a.fpx, feq=feq, rms_px=rms * feq)
+        emit("fisheye", a.fpx, feq=feq, rms_px=rms)
     else:
         k1, k2, rms, ident = fit_poly(frames, a.fpx, fit_k2=a.k2)
         print(f"identifiability (bracket-edge contrast): {ident*100:.0f}%")
@@ -314,29 +324,49 @@ def fit_from_frames(raw, fov):
         return out
     cov = coverage(frames)
     out["coverage"] = cov
-    if cov < 0.45:
+    if cov < 0.55:
         out["why"] = ("sweep only reached %.0f%% of the frame -- push the LEDs "
                       "out toward the image edges and corners" % (cov * 100))
         return out
+    # A tiny LED quad carries no usable distortion signal at any noise level,
+    # so refuse it before fitting anything (a lucky ident on 6 px quads would
+    # otherwise bless a garbage fit).
+    spans = np.linalg.norm(frames.max(axis=1) - frames.min(axis=1), axis=1)
+    span = float(np.median(spans))
+    if span < 25.0:
+        out["why"] = ("the LED quad is only %.0f px across -- too small "
+                      "to measure the lens; stand closer (~0.5 m) and "
+                      "re-sweep" % span)
+        return out
     fpx = out["fpx"]
-    feq0 = (IMG_W / 2) / math.radians(fov) * 2
-    feq, rms_f, id_f = fit_fisheye(frames, feq0)
+    feq, rms_f, id_f = fit_fisheye(frames)
     k1, k2, rms_p, id_p = fit_poly(frames, fpx)
     fisheye_ok = id_f >= 0.30
     poly_ok = id_p >= 0.30
     if not fisheye_ok and not poly_ok:
-        out["why"] = ("the data cannot pin either model (identifiability "
-                      "%.0f%%/%.0f%%) -- redo the sweep, wider" %
-                      (id_f * 100, id_p * 100))
+        # Third verdict: no measurable distortion means pinhole, not failure.
+        # Distortion displacement grows with the cube of the field angle, so a
+        # mild wide converter on a narrow-FOV sensor is sub-noise -- the right
+        # correction is none. Relative test: pinhole wins when neither model
+        # beats it meaningfully, with an absolute cap against garbage sweeps.
+        rms_pin = bundle_rms(rays_poly(frames, 0.0, 0.0, fpx)) * fpx
+        rms_best = min(rms_f, rms_p * fpx)
+        if rms_pin <= max(1.0, 1.15 * rms_best) and rms_pin <= 3.0:
+            out.update(ok=True, model="none", rms_px=rms_pin, ident=0.0)
+            return out
+        out["why"] = ("the sweep is inconsistent with every model, pinhole "
+                      "included (%.2f px rms) -- LEDs unstable at the frame "
+                      "edges, or the lens is not radially symmetric" % rms_pin)
         return out
     # px residuals on a common footing
     cand = []
-    if fisheye_ok: cand.append(("fisheye", rms_f * feq, id_f))
+    if fisheye_ok: cand.append(("fisheye", rms_f, id_f))
     if poly_ok:    cand.append(("poly", rms_p * fpx, id_p))
     model, rms_px, ident = min(cand, key=lambda c: c[1])
     out.update(ok=True, model=model, rms_px=rms_px, ident=ident)
     if model == "fisheye":
         out["feq"] = feq
+        out["fpx"] = feq          # centre-matched output pinhole
     else:
         out["k1"], out["k2"] = k1, k2
     return out
@@ -344,6 +374,9 @@ def fit_from_frames(raw, fov):
 
 def tune_line(r):
     """the ~cam= payload for a fit_from_frames result (no leading ~cam=)."""
+    if r["model"] == "none":
+        return "lens:0"
+    assert r["fpx"] > 1.0, "refusing to emit a degenerate output focal"
     if r["model"] == "fisheye":
         return "lens:2,lfeq:%d,lfpx:%d" % (round(r["feq"] * 10), round(r["fpx"] * 10))
     return "lens:1,lk1u:%d,lk2u:%d,lfpx:%d" % (
@@ -351,9 +384,11 @@ def tune_line(r):
 
 
 def spec_fisheye(fov):
-    """precalc from the datasheet FOV alone (equidistant assumption)."""
-    return dict(model="fisheye", fpx=fpx_for(fov),
-                feq=(IMG_W / 2) / math.radians(fov) * 2, k1=0.0, k2=0.0)
+    """Precalc from the datasheet FOV alone (equidistant assumption).
+    fpx = feq: the correction is identity at the image centre, so gates and
+    gain match the raw lens and only the edges get straightened."""
+    feq = (IMG_W / 2) / math.radians(fov) * 2
+    return dict(model="fisheye", fpx=feq, feq=feq, k1=0.0, k2=0.0)
 
 
 # --------------------------------------------------------------------------
@@ -412,7 +447,7 @@ def cmd_selftest(_a):
     err = abs(feq - 85.9) / 85.9
     print(f"fisheye: {len(fr)} frames, coverage {coverage(fr)*100:.0f}%, fitted "
           f"FEQ {feq:.2f} (true 85.90, err {err*100:.1f}%), residual "
-          f"{rms*feq:.2f} px, ident {ident*100:.0f}%")
+          f"{rms:.2f} px, ident {ident*100:.0f}%")
     ok &= err < 0.02 and ident > 0.30
     fr = order_and_track(_synth("poly", k1=-0.30, fpx=84.0))
     k1, k2, rms, ident = fit_poly(fr, 84.0)
@@ -424,9 +459,9 @@ def cmd_selftest(_a):
     # approximate an equidistant map surprisingly well over this field, so the
     # honest discriminator is the residual RATIO, not an absolute px number.
     fr = order_and_track(_synth("fisheye", feq=85.9))
-    _, rms_right, _ = fit_fisheye(fr, 75.0)
+    _, rms_right, _ = fit_fisheye(fr, 75.0)          # already px
     _, _, rms_wrong, _ = fit_poly(fr, 84.0)
-    ratio = rms_wrong / max(rms_right, 1e-12)
+    ratio = (rms_wrong * 84.0) / max(rms_right, 1e-12)   # poly angular -> px
     print(f"control: wrong-model residual ratio {ratio:.1f}x (need > 1.8x)")
     ok &= ratio > 1.8
     # indeterminacy control: a CENTRAL-ONLY sweep must be REFUSED (this is the
@@ -440,9 +475,36 @@ def cmd_selftest(_a):
     # the programmatic path the Lens step uses must apply the same gates
     fr_raw = _synth("fisheye", feq=85.9)
     r = fit_from_frames(fr_raw, 160)
-    print(f"frames-api: model={r['model']} feq={r['feq']:.1f} "
+    print(f"frames-api: model={r['model']} feq={r['feq']:.1f} fpx={r['fpx']:.1f} "
           f"rms={r['rms_px']:.2f}px ok={r['ok']}")
     ok &= r["ok"] and r["model"] == "fisheye" and abs(r["feq"] - 85.9) / 85.9 < 0.02
+    ok &= r["fpx"] > 1.0
+    # a wildly wrong typed FOV must not change the fit (absolute bracket)
+    r2 = fit_from_frames(fr_raw, 60)
+    print(f"frames-api: same sweep, FOV typed as 60 -> feq={r2['feq']:.1f} "
+          f"(must still recover)")
+    ok &= r2["ok"] and abs(r2["feq"] - 85.9) / 85.9 < 0.02
+    # a MILD lens (distortion below the noise floor) must come back as a
+    # pinhole verdict, not a refusal -- the 0.67x converter case
+    r3 = fit_from_frames(_synth("poly", n=1500, k1=-0.008, fpx=405.1,
+                                noise=2.0, amp_override=0.15), 33)
+    print(f"frames-api: mild 0.67x-like lens -> model={r3['model']} "
+          f"rms={r3['rms_px']:.2f}px ok={r3['ok']} (want none/ok)")
+    ok &= r3["ok"] and r3["model"] == "none"
+    ok &= tune_line(dict(model="none", fpx=0.0)) == "lens:0"
+    # a sweep with tiny quads (LEDs too far) must be refused with the
+    # stand-closer hint, never fitted -- the 180-deg-at-2m case
+    _rng = np.random.default_rng(3)
+    _raw = _synth("fisheye", feq=85.9)
+    _cent = _raw.mean(axis=1, keepdims=True)
+    r4 = fit_from_frames(_cent + (_raw - _cent) * 0.12
+                         + _rng.normal(0, 0.5, _raw.shape), 160)
+    print(f"frames-api: tiny-quad sweep refused ({not r4['ok']}): {r4['why'][:55]}")
+    ok &= (not r4["ok"]) and "stand closer" in r4["why"]
+    # the 180-deg degenerate: preset must never emit fpx=0
+    sp = spec_fisheye(180)
+    print(f"spec 180deg: feq={sp['feq']:.1f} fpx={sp['fpx']:.1f} (fpx=0 was the bug)")
+    ok &= sp["fpx"] > 1.0 and abs(sp["fpx"] - sp["feq"]) < 1e-6
     r = fit_from_frames(_synth("fisheye", feq=85.9, amp_override=0.25), 160)
     print(f"frames-api: central-only sweep refused ({not r['ok']}): {r['why'][:60]}")
     ok &= not r["ok"]

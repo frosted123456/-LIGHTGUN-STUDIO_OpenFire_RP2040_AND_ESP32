@@ -38,6 +38,14 @@ void  aim_filter_reset(void);
 float aim_filter_min_cutoff(void);
 float aim_filter_beta(void);
 
+// Smoothing level: one knob over the One Euro pair. 0 = filter off,
+// 1 = lightest, 10 = heaviest; 3 matches the build-time defaults.
+void aim_smooth_set(int level);
+int  aim_smooth_get(void);
+// Persisted under its own NVS key, like the lead.
+bool aim_smooth_load(int* out_level);
+bool aim_smooth_store(int level);
+
 // The hot path. quad in native camera px, corner order TL TR BL BR.
 // Writes normalised screen coords (may fall outside 0..1 = aiming off-screen).
 // Returns false if there is no calibration or the quad is degenerate, in which

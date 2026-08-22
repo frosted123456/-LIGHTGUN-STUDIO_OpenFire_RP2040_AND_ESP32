@@ -543,13 +543,25 @@ class SerialSource(threading.Thread):
     def run(self):
         buf = b""
         last_arm = 0.0
+        last_q = 0.0
         while not self.stop:
-            # keep asking until the stream actually starts
-            if self.q.empty() and (time.time() - last_arm) > 2.0:
-                last_arm = time.time()
+            # keep asking until the stream actually starts. A healthy stream
+            # (a Q line in the last 2 s) is left alone -- the old queue-empty
+            # test misfired whenever the GUI drained faster than lines arrived,
+            # re-sending the command forever.
+            now = time.time()
+            if (now - last_q) > 2.0 and (now - last_arm) > 2.0:
+                last_arm = now
                 try: self.ser.write(b"~cam=dash:2\n~aimcap=1\n")
                 except Exception: pass
-            try: buf += self.ser.read(512)
+            # Read what has ARRIVED, not a fixed 512 bytes: read(512) blocks
+            # until 512 bytes accumulate or the timeout fires, which at Q-line
+            # rates is a ~200 ms burst -- the live view then updates at ~5 Hz
+            # and feels laggy. Drain in_waiting, with a 1-byte blocking read
+            # to idle on when the port is quiet.
+            try:
+                nwait = self.ser.in_waiting
+                buf += self.ser.read(nwait if nwait > 0 else 1)
             except Exception: break
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -557,6 +569,8 @@ class SerialSource(threading.Thread):
                 if txt.startswith("AIM:"):
                     self.replies.append(txt)
                     del self.replies[:-40]
+                elif txt.startswith("Q,"):
+                    last_q = time.time()
                 try: self.q.put_nowait(txt)
                 except queue.Full: pass
 

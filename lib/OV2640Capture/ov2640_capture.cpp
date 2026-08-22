@@ -1132,6 +1132,12 @@ int ov2640_capture_start(void)
             s_lead_ms = (float)lead_ms;
             printf("CAM: restored lead=%dms from NVS\n", lead_ms);
         }
+        // Smoothing level, own key like the lead.
+        int smooth = 0;
+        if (aim_smooth_load(&smooth)) {
+            aim_smooth_set(smooth);
+            printf("CAM: restored smooth=%d from NVS\n", smooth);
+        }
         // Lens is pure software state (no sensor registers), so the boot-recipe
         // ordering that bit the AEC/AGC restore cannot bite here.
         aim_lens_t ls;
@@ -1221,6 +1227,7 @@ extern "C" bool ov2640_cam_command(const char* line)
         aim_cam_t cs = { (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost };
         const bool ok = aim_cam_store(&cs);
         aim_lead_store((int)s_lead_ms);
+        aim_smooth_store(aim_smooth_get());
         // Lens rides along; model 0 clears rather than stores, so a stale
         // stored lens cannot survive a return to the stock lens.
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq };
@@ -1228,9 +1235,10 @@ extern "C" bool ov2640_cam_command(const char* line)
         if (ls.model == 0) aim_lens_clear();
         else               lens_ok = aim_lens_store(&ls);
         ov_reply(ok && lens_ok
-                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms lens=%d\n"
-                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms lens=%d\n",
-                 cs.thr, cs.aec, cs.agc, cs.boost, (int)s_lead_ms, ls.model);
+                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d lens=%d\n"
+                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d lens=%d\n",
+                 cs.thr, cs.aec, cs.agc, cs.boost, (int)s_lead_ms,
+                 aim_smooth_get(), ls.model);
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
@@ -1241,9 +1249,10 @@ extern "C" bool ov2640_cam_command(const char* line)
     }
     if (!strncmp(line, "cam?", 4)) {
         // Everything the tools read back, one line: lead and lens included.
-        ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d lead=%d "
+        ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d lead=%d smooth=%d "
                  "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d vfill=%d\n",
                  (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost, (int)s_lead_ms,
+                 aim_smooth_get(),
                  (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
                  (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f), (int)s_vfill_pct);
         return true;
@@ -1292,6 +1301,11 @@ extern "C" void ov2640_tune(const char* cmd)
             if (val < 0) val = 0;
             if ((float)val > LIGHTGUN_LEAD_MS_MAX) val = (int)LIGHTGUN_LEAD_MS_MAX;
             s_lead_ms = (float)val;
+        } else if (!strcmp(key, "smooth")) {
+#ifdef USE_AIM_PIPELINE
+            // output smoothing level, 0 (off) .. 10 (heaviest)
+            aim_smooth_set(val);
+#endif
         } else if (!strcmp(key, "vfill")) {
             // LED vertical span as a PERCENT of screen height; 100 = off.
             // Range is 20..300, not 20..100: the standard OpenFIRE layout puts

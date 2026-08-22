@@ -9,7 +9,8 @@ preview you are looking at as a constant offset. Mixing is safe: a ring shot
 only ever measures what is left AFTER your nudges.
 
 Nudges go out as "aimcal!=" (applied, not written to flash); saving installs
-and persists. LEAD +/- trades latency for overshoot on reversals."""
+and persists. LEAD +/- trades latency for overshoot on reversals.
+SMOOTH +/- trades cursor jitter for glide (0 = filter off, 10 = heaviest)."""
 import argparse, os, queue, sys, time
 import numpy as np
 
@@ -27,6 +28,7 @@ STEP_PX   = 4.0                 # screen px per nudge, at 1920 wide
 # whole 0-50 range.
 LEAD_STEP = 5                   # ms per lead nudge
 LEAD_MAX  = 50                  # the ceiling the capture layer clamps to anyway
+SMOOTH_MAX = 10                 # smoothing level range the firmware accepts
 MIN_SPREAD = 1.25               # quad-span ratio between the two stations
 # Where the ring sits, as a fraction of the window. ONE definition: the drawing
 # and the measurement both read it, so they cannot drift apart -- a ring drawn
@@ -42,14 +44,17 @@ C_OK, C_WARN, C_BAD = "#39c26e", "#d8a13a", "#d24b4b"
 class Tuner:
     """State and arithmetic. No GUI, so it is testable headlessly."""
 
-    def __init__(self, calib):
+    def __init__(self, calib, lead=0, smooth=3):
         self.c0 = dict(calib)          # what calibration produced, untouched
         self.stage = 0                 # 0 = near, 1 = far, 2 = done
         self.off = [np.zeros(2), np.zeros(2)]   # normalised screen nudges
         self.q = [None, None]          # a representative quad per station
         self.measured = [False, False]
         self.span = [None, None]
-        self.lead = 0
+        # Seeded from the gun so the first nudge steps FROM the saved value
+        # instead of stomping it back to a default.
+        self.lead = self.lead0 = int(lead)
+        self.smooth = self.smooth0 = int(smooth)
         self.msg = ""
 
     # ---- the live preview -------------------------------------------------
@@ -72,6 +77,9 @@ class Tuner:
 
     def nudge_lead(self, d):
         self.lead = int(min(LEAD_MAX, max(0, self.lead + d * LEAD_STEP)))
+
+    def nudge_smooth(self, d):
+        self.smooth = int(min(SMOOTH_MAX, max(0, self.smooth + d)))
 
     def note_quad(self, q):
         """A shot on the ring MEASURES the offset; it does not merely record a
@@ -152,7 +160,8 @@ class Tuner:
         if self.stage > 1:
             return None
         d = self.off[self.stage]
-        if abs(d[0]) < 1e-9 and abs(d[1]) < 1e-9 and self.lead == 0:
+        if (abs(d[0]) < 1e-9 and abs(d[1]) < 1e-9
+                and self.lead == self.lead0 and self.smooth == self.smooth0):
             self.msg = "nothing to save yet -- nudge or shoot the ring first"
             return None
         return self.preview()
@@ -181,9 +190,9 @@ def run_gui(src, tuner, on_send):
                        font=("DejaVu Sans", int(size), "bold" if bold else "normal"))
 
     # ---- the buttons, as canvas rectangles we hit-test ourselves ----------
-    BW, BH, BY = SW * 0.13, SH * 0.11, SH * 0.03
+    BW, BH, BY = SW * 0.105, SH * 0.11, SH * 0.03
     gap = SW * 0.012
-    total = 6 * BW + 5 * gap
+    total = 8 * BW + 7 * gap
     x0 = (SW - total) / 2.0
     BUTTONS = []
     for i, (lab, act) in enumerate((("◀", ("nudge", -1, 0)),
@@ -191,7 +200,9 @@ def run_gui(src, tuner, on_send):
                                     ("▲", ("nudge", 0, -1)),
                                     ("▼", ("nudge", 0, +1)),
                                     ("LEAD −", ("lead", -1)),
-                                    ("LEAD +", ("lead", +1)))):
+                                    ("LEAD +", ("lead", +1)),
+                                    ("SMOOTH −", ("smooth", -1)),
+                                    ("SMOOTH +", ("smooth", +1)))):
         bx = x0 + i * (BW + gap)
         BUTTONS.append(dict(x0=bx, y0=BY, x1=bx + BW, y1=BY + BH, lab=lab, act=act))
     DONE = dict(x0=SW*0.29, y0=SH*0.86, x1=SW*0.49, y1=SH*0.94, lab="DONE", act=("done",))
@@ -222,6 +233,14 @@ def run_gui(src, tuner, on_send):
                 say("lead already at %d ms (range 0-%d)" % (tuner.lead, LEAD_MAX), b)
             else:
                 say("lead  %d  ->  %d ms" % (before, tuner.lead), b)
+        elif act[0] == "smooth":
+            before = tuner.smooth
+            tuner.nudge_smooth(act[1])
+            on_send("~cam=smooth:%d" % tuner.smooth)
+            if tuner.smooth == before:
+                say("smoothing already at %d (range 0-%d)" % (tuner.smooth, SMOOTH_MAX), b)
+            else:
+                say("smoothing  %d  ->  %d" % (before, tuner.smooth), b)
         elif act[0] == "save":
             c = tuner.solve_direct()
             if c is not None:
@@ -270,6 +289,8 @@ def run_gui(src, tuner, on_send):
     root.bind("<minus>", lambda e: do(("lead", -1), BUTTONS[4]))
     root.bind("<plus>",  lambda e: do(("lead", +1), BUTTONS[5]))
     root.bind("<equal>", lambda e: do(("lead", +1), BUTTONS[5]))
+    root.bind("<bracketleft>",  lambda e: do(("smooth", -1), BUTTONS[6]))
+    root.bind("<bracketright>", lambda e: do(("smooth", +1), BUTTONS[7]))
     root.bind("<Return>", lambda e: do(("done",)))
 
     def push():
@@ -290,19 +311,21 @@ def run_gui(src, tuner, on_send):
                                 outline=C_OK if on else "#30363d", width=3 if on else 2)
             # word labels need a smaller face than the arrows or they overrun
             # the box and the two LEAD buttons run into each other
-            fs = SH*0.035 if len(b["lab"]) <= 2 else SH*0.024
+            fs = SH*0.035 if len(b["lab"]) <= 2 else SH*0.019
             text((b["x0"]+b["x1"])/2, (b["y0"]+b["y1"])/2, b["lab"], fs, C_FG, bold=True)
         # What the lead is WORTH right now, from the gun's own motion. A number
         # in ms means nothing to a hand; "about 40 px at the speed you are
         # moving" is the thing you can actually judge against the cursor.
         worth = st["vpx"] * (tuner.lead / 1000.0) * 1920.0
         text(SW/2, BY + BH + SH*0.026,
-             "lead %d ms   -   worth about %.0f screen px at the speed you are "
-             "moving right now" % (tuner.lead, abs(worth)), SH*0.019,
-             C_OK if tuner.lead else C_DIM)
+             "lead %d ms (worth about %.0f screen px at your current speed)"
+             "      smoothing %d / %d" % (tuner.lead, abs(worth),
+                                          tuner.smooth, SMOOTH_MAX), SH*0.019,
+             C_OK if (tuner.lead or tuner.smooth) else C_DIM)
         text(SW/2, BY + BH + SH*0.055,
-             "raise it while the cursor trails you; stop as soon as it "
-             "overshoots on direction reversals", SH*0.016, C_DIM)
+             "LEAD: raise while the cursor trails you, stop when reversals "
+             "overshoot.   SMOOTHING: raise until the jitter settles, stop "
+             "when the cursor starts to glide.", SH*0.016, C_DIM)
         if (time.time() - st["toast_t"]) < 1.6 and st["toast"]:
             text(SW/2, BY + BH + SH*0.090, st["toast"], SH*0.024, C_OK, bold=True)
 
@@ -423,19 +446,38 @@ def main():
         sys.exit("the gun has no calibration loaded -- run tools/aim_calib.py first.")
     print("current: %s" % aimcal_line(cal))
 
+    # Seed lead and smoothing from the gun, so the first nudge steps from the
+    # saved value instead of resetting it.
+    src.replies.clear()
+    src.ser.write(b"\n~cam?\n")
+    time.sleep(0.8)
+    lead0, smooth0 = 0, 3
+    for r in src.replies:
+        if "lead=" not in r:
+            continue
+        for tok in r.replace("CAM:", "").split():
+            k, _, v = tok.partition("=")
+            try:
+                if k == "lead":     lead0 = int(float(v.rstrip("ms")))
+                elif k == "smooth": smooth0 = int(float(v))
+            except ValueError:
+                pass
+    print("gun reports lead=%d ms smooth=%d" % (lead0, smooth0))
+
     def send(line):
         try: src.ser.write(("\n%s\n" % line).encode())
         except Exception: pass
 
-    tuner = Tuner(cal)
+    tuner = Tuner(cal, lead0, smooth0)
     out = run_gui(src, tuner, send)
     if out is None:
         send("~" + aimcal_line(cal))         # put the original back, saved
-        print("cancelled; original calibration restored")
+        send("~cam=lead:%d,smooth:%d" % (tuner.lead0, tuner.smooth0))
+        print("cancelled; original calibration, lead and smoothing restored")
         return
     print(install_over_serial(src, aimcal_line(out), out))
     send("~camsave")
-    print("lead %d ms saved" % tuner.lead)
+    print("lead %d ms + smoothing %d saved" % (tuner.lead, tuner.smooth))
 
 
 if __name__ == "__main__":

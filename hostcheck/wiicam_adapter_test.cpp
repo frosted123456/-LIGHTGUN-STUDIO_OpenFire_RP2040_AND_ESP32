@@ -27,9 +27,20 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
     if(!g_bh) return ESP_ERR_NVS_NOT_FOUND;
     if(*l<g_bl) return -1; memcpy(o,g_blob,g_bl); *l=g_bl; return ESP_OK; }
 esp_err_t nvs_erase_key(nvs_handle_t, const char* k){ if(is_lens(k)) g_lh=false; else g_bh=false; return ESP_OK; }
-static int16_t g_i16=0; static bool g_ih=false;
-esp_err_t nvs_set_i16(nvs_handle_t, const char*, int16_t v){ g_i16=v; g_ih=true; return ESP_OK; }
-esp_err_t nvs_get_i16(nvs_handle_t, const char*, int16_t* v){ if(!g_ih) return ESP_ERR_NVS_NOT_FOUND; *v=g_i16; return ESP_OK; }
+// key-aware i16 store: lead and smoothing live under their own keys
+struct I16Slot { char key[16]; int16_t v; bool have; };
+static I16Slot g_i16s[4];
+static I16Slot* i16_find(const char* k){
+    for (auto& s : g_i16s) if (s.have && !strcmp(s.key, k)) return &s;
+    return nullptr; }
+esp_err_t nvs_set_i16(nvs_handle_t, const char* k, int16_t v){
+    if (I16Slot* s = i16_find(k)) { s->v = v; return ESP_OK; }
+    for (auto& s : g_i16s)
+        if (!s.have) { strncpy(s.key, k, 15); s.v = v; s.have = true; return ESP_OK; }
+    return -1; }
+esp_err_t nvs_get_i16(nvs_handle_t, const char* k, int16_t* v){
+    if (I16Slot* s = i16_find(k)) { *v = s->v; return ESP_OK; }
+    return ESP_ERR_NVS_NOT_FOUND; }
 static uint32_t g_u32=0; static bool g_uh=false;
 esp_err_t nvs_set_u32(nvs_handle_t, const char*, uint32_t v){ g_u32=v; g_uh=true; return ESP_OK; }
 esp_err_t nvs_get_u32(nvs_handle_t, const char*, uint32_t* v){ if(!g_uh) return ESP_ERR_NVS_NOT_FOUND; *v=g_u32; return ESP_OK; }
@@ -87,6 +98,11 @@ int main()
     ck(n == 4 && qx[0] == 1798, "x un-mirrored and normalised (tenths)");
     // 384-144=240 native -> *176/768*10 = 550 tenths (Y untouched)
     ck(n == 4 && qy[0] == 550, "y normalised into 176-space (tenths)");
+    // a byte-identical poll is the previous camera frame seen again: skipped
+    g_lines.clear();
+    t += DT;
+    wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
+    ck(g_lines.empty(), "duplicate report is skipped, no Q re-emit");
     // the mirror is the difference between a valid rectangle and the negative
     // width the first bench calibration produced -- prove it flips
     wiicam_cam_command("cam=mirx:0");
@@ -115,6 +131,9 @@ int main()
     bool solved = false;
     for (int i = 0; i < 40; ++i) {         // let the resolver lock
         t += DT;
+        // integer jitter: a real sensor never repeats byte-identical frames,
+        // and the duplicate cache skips exact repeats by design
+        px[1] += (i & 1) ? 1 : -1;
         solved = wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
     }
     ck(solved, "locked resolver + active calibration produce a position");
@@ -148,10 +167,19 @@ int main()
     ck(!g_replies.empty() && g_replies[0].find("board=rp2040-wiicam") != std::string::npos,
        "cam? names the board");
     wiicam_cam_command("cam=lens:2,lfeq:900,lfpx:1847");
+    // smoothing goes through the shared runtime knob
+    const float fc_before = aim_filter_min_cutoff();
+    wiicam_cam_command("cam=smooth:8");
+    ck(aim_smooth_get() == 8 && aim_filter_min_cutoff() < fc_before,
+       "smooth key maps to a heavier One Euro pair");
     g_replies.clear();
     wiicam_cam_command("camsave");
     ck(g_lh, "camsave persisted the lens through the (fake) store");
-    ck(g_ih && g_i16 == 20, "camsave persisted the lead");
+    int16_t i16v = 0;
+    ck(nvs_get_i16(1, "lead0", &i16v) == ESP_OK && i16v == 20,
+       "camsave persisted the lead");
+    ck(nvs_get_i16(1, "smth0", &i16v) == ESP_OK && i16v == 8,
+       "camsave persisted the smoothing level under its own key");
     wiicam_cam_command("cam=sens:2");
     ck(t_sens == 2, "sens goes through the OpenFIRE hook");
     const int saves = t_sens_saved;
@@ -159,11 +187,13 @@ int main()
     ck(t_sens_saved == saves + 1,
        "camsave persists sensitivity via OpenFIRE's own prefs write");
     // reload path
+    aim_smooth_set(3);                     // forget the live level...
     wiicam_aim_begin();
     g_replies.clear();
     wiicam_cam_command("cam?");
     ck(!g_replies.empty() && g_replies[0].find("lens=2") != std::string::npos,
        "a reboot restores the stored lens");
+    ck(aim_smooth_get() == 8, "...and a reboot restores the stored smoothing");
 
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;
