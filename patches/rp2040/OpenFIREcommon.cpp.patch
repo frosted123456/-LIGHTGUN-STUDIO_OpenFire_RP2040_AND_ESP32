@@ -1,0 +1,68 @@
+--- a/OpenFIREmain/OpenFIREcommon.cpp
++++ b/OpenFIREmain/OpenFIREcommon.cpp
+@@ -16,6 +16,11 @@
+ #endif // ARDUINO_ARCH_RP2040
+ 
+ #include "OpenFIREcommon.h"
++#ifdef USE_AIM_PIPELINE
++#include "aim_runtime.h"
++#include "wiicam_aim.h"
++#include <pico/time.h>
++#endif
+ #include "OpenFIREFeedback.h"
+ #include "OpenFIRElights.h"
+ #include "OpenFIREserial.h"
+@@ -650,6 +655,24 @@
+     if(dfrIRPos != nullptr) {
+         int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
+         if(error == DFRobotIRPositionEx::Error_Success) {
++#ifdef USE_AIM_PIPELINE
++            // Calibrated aim pipeline; falls through to the stock path when
++            // no calibration is loaded. The seen() mask is applied inside
++            // the adapter.
++            bool aim_ok = false;
++            {
++                float asx = 0.0f, asy = 0.0f;
++                if (wiicam_aim_process(dfrIRPos->xPositions(), dfrIRPos->yPositions(),
++                                       dfrIRPos->seen(),
++                                       to_us_since_boot(get_absolute_time()),
++                                       &asx, &asy)) {
++                    mouseX = (int32_t)lroundf(asx * (float)res_x);
++                    mouseY = (int32_t)lroundf(asy * (float)res_y);
++                    aim_ok = true;
++                }
++            }
++            if(!aim_ok) {
++#endif
+             // if diamond layout, or square
+             if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) {
+                 OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
+@@ -675,6 +698,9 @@
+             // Output mapped to screen resolution because offsets are measured in pixels
+             mouseX = map(OpenFIREper.getX(), 0, res_x, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].leftOffset), (res_x + OF_Prefs::profiles[OF_Prefs::currentProfile].rightOffset));                 
+             mouseY = map(OpenFIREper.getY(), 0, res_y, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].topOffset), (res_y + OF_Prefs::profiles[OF_Prefs::currentProfile].bottomOffset));
++#ifdef USE_AIM_PIPELINE
++            }
++#endif
+ 
+             switch(runMode) {
+                 case FW_Const::RunMode_Average:
+@@ -753,9 +779,15 @@
+                      buttons.offScreen = true;
+                 else buttons.offScreen = false;
+ 
+-                if(buttons.analogOutput)
+-                     Gamepad16.moveCam(conMoveX, conMoveY);
+-                else AbsMouse5.move(conMoveX, conMoveY);
++#ifdef USE_AIM_PIPELINE
++                // Pointer gate (~aimhid=0): skip the cursor move while frozen.
++                if(aim_runtime_hid_enabled())
++#endif
++                {
++                    if(buttons.analogOutput)
++                         Gamepad16.moveCam(conMoveX, conMoveY);
++                    else AbsMouse5.move(conMoveX, conMoveY);
++                }
+ 
+             } else {
+                 if(gunMode == FW_Const::GunMode_Verification) {

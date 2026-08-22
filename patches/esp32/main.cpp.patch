@@ -1,0 +1,155 @@
+--- a/lightgun/src/main.cpp
++++ b/lightgun/src/main.cpp
+@@ -27,6 +27,54 @@
+  */
+ 
+ #include "OpenFIREmain.h"
++#ifdef USE_AIM_PIPELINE
++// Overlay hooks: the '~' serial channel, telemetry sinks and the aim runtime.
++#include "aim_runtime.h"
++#include "ov2640_capture.h"
++#include <string.h>   // strlen, for the non-blocking sink
++static void aim_serial_sink(const char* line)
++{
++    const size_t n = strlen(line);
++    if ((size_t)Serial.availableForWrite() < n) return;
++    Serial.write((const uint8_t*)line, n);
++}
++static void aim_reply_sink(const char* line)
++{
++    const size_t n = strlen(line);
++    size_t off = 0;
++    const uint32_t t0 = millis();
++    while (off < n && (millis() - t0) < 20u) {
++        const int room = Serial.availableForWrite();
++        if (room <= 0) { delay(1); continue; }
++        const size_t w = ((size_t)room < (n - off)) ? (size_t)room : (n - off);
++        Serial.write((const uint8_t*)line + off, w);
++        off += w;
++    }
++}
++static bool s_sink_installed = false;
++static void aim_announce()
++{
++    aim_set_out(aim_reply_sink);           // replies belong on the port we are on
++    ov2640_set_reply_sink(aim_reply_sink);  // ...including the camera tuner's
++    for (int i = 0; i < 40 && !Serial.availableForWrite(); ++i) delay(25);
++    Serial.print("AIM: pipeline ready (v30) -- send ~ping or ~aimcal?\n");
++}
++static inline void aim_serial_pump()
++{
++    while(Serial.available()) {
++        const int ch = Serial.peek();
++        if(ch < 0) break;
++        if(!aim_serial_rx((char)ch)) break;   // theirs -- leave it in the buffer
++        Serial.read();
++        if(!s_sink_installed) {
++            ov2640_set_line_sink(aim_serial_sink);   // telemetry: drop if full
++            aim_set_out(aim_reply_sink);             // replies: chunked
++            ov2640_set_reply_sink(aim_reply_sink);
++            s_sink_installed = true;
++        }
++    }
++}
++#endif
+ #include "boards/OpenFIREshared.h"
+ #include "OpenFIREcolors.h"
+ #include "OpenFIRElights.h"
+@@ -647,7 +695,20 @@
+         #endif // USES_DISPLAY
+ 
+         while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
++#ifdef USE_AIM_PIPELINE
++            // Do not hold a fresh gun here: the overlay's calibration lives in
++            // its own NVS namespace, so OpenFIRE's zeroed edge offsets say
++            // nothing about it, and this loop never reaches the Run loop that
++            // emits the trigger markers our calibration tool captures on. A
++            // camera that failed to start still holds.
++            if(!FW_Common::camNotAvailable)
++                break;
++#endif
+             // Check and process serial commands, in case user needs to change EEPROM settings.
++#ifdef USE_AIM_PIPELINE
++            // Service the '~' channel while docked.
++            aim_serial_pump();
++#endif
+             if(Serial.available())
+                 OF_Serial::SerialProcessingDocked();
+             
+@@ -692,7 +753,12 @@
+         // skip cali if we're prematurely set to run from the above loop
+         // (i.e. cal'd from Desktop)
+         if(FW_Common::gunMode != FW_Const::GunMode_Run)
++#ifdef USE_AIM_PIPELINE
++            // Straight to Run: calibration is the overlay tool's job.
++            FW_Common::SetMode(FW_Const::GunMode_Run);
++#else
+             FW_Common::SetMode(FW_Const::GunMode_Calibration);
++#endif
+     } else {
+         // this will turn off the DotStar/RGB LED and ensure proper transition to Run
+         FW_Common::SetMode(FW_Const::GunMode_Run);
+@@ -770,9 +836,19 @@
+     rp2040.fifo.pop();
+     #endif
+     while(FW_Common::gunMode == FW_Const::GunMode_Run) {
++#ifdef USE_AIM_PIPELINE
++        // Announce once on the first pass of the run loop.
++        static bool announced = false;
++        if(!announced) { announced = true; aim_announce(); }
++#endif
+         // All buttons' outputs except for the trigger are processed here.
+         FW_Common::buttons.Poll(0);
+ 
++#ifdef USE_AIM_PIPELINE
++        // Trigger marker for the calibration tool (only emitted after aimcap=1).
++        aim_runtime_trigger_tick((FW_Common::buttons.pressed & FW_Const::BtnMask_Trigger) != 0);
++#endif
++
+         #ifdef USES_TEMP
+             if(OF_Prefs::pins[OF_Const::tempPin] > -1)
+                 OF_FFB::TemperatureUpdate();
+@@ -793,6 +869,10 @@
+             FW_Common::buttons.SendReports();
+         }
+ 
++#ifdef USE_AIM_PIPELINE
++        // Service the '~' channel.
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessing();
+ 
+         #ifdef MAMEHOOKER
+@@ -897,6 +977,10 @@
+     }
+ 
+     #ifdef MAMEHOOKER
++#ifdef USE_AIM_PIPELINE
++        // Service the '~' channel.
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessing();
+     #endif // MAMEHOOKER
+ 
+@@ -1275,6 +1359,10 @@
+         }
+ 
+         // Run through serial receive buffer once this run, if it has contents.
++#ifdef USE_AIM_PIPELINE
++        // Service the '~' channel.
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessing();
+ 
+         #ifdef MAMEHOOKER
+@@ -1481,6 +1569,10 @@
+             #endif // USES_ANALOG
+         }
+ 
++#ifdef USE_AIM_PIPELINE
++        // Service the '~' channel.
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessingDocked();
+ 
+         if(FW_Common::gunMode != FW_Const::GunMode_Docked)

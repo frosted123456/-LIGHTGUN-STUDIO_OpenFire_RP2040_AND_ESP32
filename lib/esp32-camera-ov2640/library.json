@@ -1,0 +1,38 @@
+{
+  "name": "esp32-camera-ov2640",
+  "version": "5.0.0-lightgun.1",
+  "description": "IDF5/Arduino3 rebase of the lightgun esp32-camera fork (S3+OV2640 only). All LIGHTGUN patches ported 2026-08-06: exact fractional XCLK, streaming chunk callback + loss counters + short-frame tolerance (cam_hal.c wholesale from the IDF4 fork + 3 IDF5 API shims), SCCB read-error flag, OV2640 bank-cache-on-ACK, ll_cam_memcpy honest length. Shadows the Arduino core PREBUILT esp32-camera at link time - verified zero live members from the bundled archive.",
+  "build": {
+    "flags": [
+      "-I driver/include",
+      "-I driver/private_include",
+      "-I sensors/private_include",
+      "-I target/private_include",
+      "-I target/esp32s3/private_include",
+      "-UCONFIG_BF20A6_SUPPORT",
+      "-UCONFIG_BF3005_SUPPORT",
+      "-UCONFIG_GC0308_SUPPORT",
+      "-UCONFIG_GC032A_SUPPORT",
+      "-UCONFIG_GC2145_SUPPORT",
+      "-UCONFIG_HM0360_SUPPORT",
+      "-UCONFIG_HM1055_SUPPORT",
+      "-UCONFIG_MEGA_CCM_SUPPORT",
+      "-UCONFIG_NT99141_SUPPORT",
+      "-UCONFIG_OV3660_SUPPORT",
+      "-UCONFIG_OV5640_SUPPORT",
+      "-UCONFIG_OV7670_SUPPORT",
+      "-UCONFIG_OV7725_SUPPORT",
+      "-UCONFIG_SC030IOT_SUPPORT",
+      "-UCONFIG_SC031GS_SUPPORT",
+      "-UCONFIG_SC101IOT_SUPPORT",
+      "-DPATCH_ACCEPT_SHORT_FRAMES=1",
+      "-DPATCH_CAM_TASK_CORE1=1"
+    ],
+    "srcFilter": [
+      "+<driver/>",
+      "-<driver/sccb.c>",
+      "+<sensors/>",
+      "+<target/>"
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "NvsShimRP2040",
+  "version": "1.0.0",
+  "description": "ESP-IDF NVS/timer/system API shim over LittleFS for RP2040, so the shared aim pipeline persists unchanged.",
+  "build": { "srcFilter": ["+<*.cpp>"] }
+}

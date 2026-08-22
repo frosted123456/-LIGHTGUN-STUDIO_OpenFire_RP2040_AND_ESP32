@@ -1,0 +1,6 @@
+{
+  "name": "WiicamAim",
+  "version": "1.0.0",
+  "description": "RP2040 + wiicam (SEN0158) front end for the shared aim pipeline: seen-mask gate, 240x176 normalisation, lens undistort, quad resolver, lead, Q/T telemetry.",
+  "build": { "srcFilter": ["+<*.cpp>"] }
+}

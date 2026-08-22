@@ -1,0 +1,16 @@
+# The OpenFIRE checkout is fetched by tools/patch_openfire.py, never committed:
+# it is upstream's LGPL source, not ours to redistribute.
+OpenFIRE-Firmware-ESP32/
+OpenFIRE-Firmware-RP2040/
+
+# Build and editor state.
+.pio/
+.vscode/*
+!.vscode/tasks.json
+__pycache__/
+*.pyc
+*.orig
+
+# Local tool output.
+tools/aim_fit_cli
+tools/calib_out/

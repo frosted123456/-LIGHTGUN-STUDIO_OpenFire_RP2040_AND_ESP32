@@ -1,0 +1,175 @@
+--- a/OpenFIREmain/OpenFIREmain.ino
++++ b/OpenFIREmain/OpenFIREmain.ino
+@@ -23,6 +23,60 @@
+ #include "OpenFIREFeedback.h"
+ #include "OpenFIREprefs.h"
+ #include "OpenFIREconstant.h"
++#ifdef USE_AIM_PIPELINE
++// Overlay hooks: the '~' serial channel, wiicam front end, shared aim runtime.
++#include "aim_runtime.h"
++#include "wiicam_aim.h"
++#include <string.h>
++// Telemetry sink: all-or-nothing, drops when the host is not draining.
++static void aim_line_sink(const char* line)
++{
++    const size_t n = strlen(line);
++    if ((size_t)Serial.availableForWrite() < n) return;
++    Serial.write((const uint8_t*)line, n);
++}
++// Reply sink: chunked writes with a 20 ms deadline.
++static void aim_reply_sink(const char* line)
++{
++    const size_t n = strlen(line);
++    size_t off = 0;
++    const uint32_t t0 = millis();
++    while (off < n && (millis() - t0) < 20u) {
++        const int room = Serial.availableForWrite();
++        if (room <= 0) { delay(1); continue; }
++        const size_t w = ((size_t)room < (n - off)) ? (size_t)room : (n - off);
++        Serial.write((const uint8_t*)line + off, w);
++        off += w;
++    }
++}
++static void aim_announce()
++{
++    aim_set_out(aim_reply_sink);
++    wiicam_set_reply_sink(aim_reply_sink);
++    wiicam_set_line_sink(aim_line_sink);
++    for (int i = 0; i < 40 && !Serial.availableForWrite(); ++i) delay(25);
++    Serial.print("AIM: pipeline ready (rp2040-wiicam) -- send ~ping or ~aimcal?\n");
++}
++// Claim our own bytes out of OpenFIRE's Serial stream before their parser runs.
++static inline void aim_serial_pump()
++{
++    while(Serial.available()) {
++        const int ch = Serial.peek();
++        if(ch < 0) break;
++        if(!aim_serial_rx((char)ch)) break;   // theirs -- leave it in the buffer
++        Serial.read();
++    }
++}
++// Sensitivity goes through OpenFIRE's own persisted setting.
++static void aim_sens_set(int v) { FW_Common::SetIrSensitivity((uint32_t)v); }
++static int  aim_sens_get(void)  { return (int)OF_Prefs::profiles[OF_Prefs::currentProfile].irSens; }
++// Persists the profile (SetIrSensitivity alone does not write flash).
++static void aim_sens_save(void)
++{
++    FW_Common::stateFlags |= FW_Const::StateFlag_SavePreferencesEn;
++    FW_Common::SavePreferences();
++}
++#endif
+ 
+ // Sets up the environment
+ void setup() {
+@@ -143,6 +197,17 @@
+     // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
+     startIrCamTimer(209);
+ 
++#ifdef USE_AIM_PIPELINE
++    aim_runtime_begin();
++    wiicam_aim_begin();
++    aim_serial_set_extra(wiicam_cam_command);
++    wiicam_set_sens_hooks(aim_sens_set, aim_sens_get, aim_sens_save);
++    // Install sinks at boot so replies work before the Run loop starts.
++    aim_set_out(aim_reply_sink);
++    wiicam_set_reply_sink(aim_reply_sink);
++    wiicam_set_line_sink(aim_line_sink);
++#endif
++
+     FW_Common::OpenFIREper.source(OF_Prefs::profiles[OF_Prefs::currentProfile].adjX,
+                                   OF_Prefs::profiles[OF_Prefs::currentProfile].adjY);
+     FW_Common::OpenFIREper.deinit(0);
+@@ -165,6 +230,14 @@
+         #endif // USES_DISPLAY
+ 
+         while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
++#ifdef USE_AIM_PIPELINE
++            // Skip the first-boot hold: the overlay stores its calibration
++            // separately, so zeroed offsets mean nothing here. A dead camera
++            // still holds.
++            if(!FW_Common::camNotAvailable)
++                break;
++            aim_serial_pump();
++#endif
+             // Check and process serial commands, in case user needs to change EEPROM settings.
+             if(Serial.available())
+                 OF_Serial::SerialProcessingDocked();
+@@ -210,7 +283,12 @@
+         // skip cali if we're prematurely set to run from the above loop
+         // (i.e. cal'd from Desktop)
+         if(FW_Common::gunMode != FW_Const::GunMode_Run)
++#ifdef USE_AIM_PIPELINE
++            // Straight to Run: calibration is the overlay tool's job.
++            FW_Common::SetMode(FW_Const::GunMode_Run);
++#else
+             FW_Common::SetMode(FW_Const::GunMode_Calibration);
++#endif
+     } else {
+         // this will turn off the DotStar/RGB LED and ensure proper transition to Run
+         FW_Common::SetMode(FW_Const::GunMode_Run);
+@@ -272,6 +350,12 @@
+         // All buttons' outputs except for the trigger are processed here.
+         FW_Common::buttons.Poll(0);
+ 
++#ifdef USE_AIM_PIPELINE
++        // Trigger marker for the calibration tool (core 1 path; the
++        // ExecRunMode copy serves single-core builds).
++        aim_runtime_trigger_tick((FW_Common::buttons.pressed & FW_Const::BtnMask_Trigger) != 0);
++#endif
++
+         #ifdef USES_TEMP
+             if(OF_Prefs::pins[OF_Const::tempPin] > -1)
+                 OF_FFB::TemperatureUpdate();
+@@ -292,6 +376,9 @@
+             FW_Common::buttons.SendReports();
+         }
+ 
++#ifdef USE_AIM_PIPELINE
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessing();
+ 
+         #ifdef MAMEHOOKER
+@@ -369,6 +456,9 @@
+     }
+ 
+     #ifdef MAMEHOOKER
++#ifdef USE_AIM_PIPELINE
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessing();
+     #endif // MAMEHOOKER
+ 
+@@ -648,6 +738,10 @@
+     #endif // ARDUINO_ARCH_RP2040 && DUAL_CORE
+ 
+     for(;;) {
++#ifdef USE_AIM_PIPELINE
++        static bool aim_announced = false;
++        if(!aim_announced) { aim_announced = true; aim_announce(); }
++#endif
+         // Setting the state of our toggles, if used.
+         // Only sets these values if the switches are mapped to valid pins.
+         #ifdef USES_SWITCHES
+@@ -723,6 +817,11 @@
+ 
+         FW_Common::buttons.Poll(0);
+ 
++#ifdef USE_AIM_PIPELINE
++        // Trigger marker for the calibration tool (only emitted after aimcap=1).
++        aim_runtime_trigger_tick((FW_Common::buttons.pressed & FW_Const::BtnMask_Trigger) != 0);
++#endif
++
+         // For processing the trigger specifically.
+         // (FW_Common::buttons.debounced is a binary variable intended to be read 1 bit at a time,
+         // with the 0'th point == rightmost == decimal 1 == trigger, 3 = start, 4 = select)
+@@ -739,6 +838,9 @@
+         }
+ 
+         // Run through serial receive buffer once this run, if it has contents.
++#ifdef USE_AIM_PIPELINE
++        aim_serial_pump();
++#endif
+         if(Serial.available()) OF_Serial::SerialProcessing();
+ 
+         #ifdef MAMEHOOKER

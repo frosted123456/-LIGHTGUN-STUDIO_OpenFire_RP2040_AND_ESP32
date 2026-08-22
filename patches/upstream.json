@@ -1,0 +1,48 @@
+{
+  "esp32": {
+    "repo": "https://github.com/alessandro-satanassi/OpenFIRE-Firmware-ESP32.git",
+    "pinned_commit": "f8f9bf265c48",
+    "pinned_commit_date": "2026-07-17",
+    "checkout_dir": "OpenFIRE-Firmware-ESP32",
+    "src_subdir": "lightgun/src",
+    "files": [
+      "main.cpp",
+      "OpenFIREcommon.cpp"
+    ],
+    "pristine": {
+      "main.cpp": {
+        "sha256": "b2b4ed7482fe97e0a52ea60b0b24f5c6a4806778b6f658a2cede20dda73ca2e9",
+        "bytes": 99816,
+        "lines": 2086
+      },
+      "OpenFIREcommon.cpp": {
+        "sha256": "2eed8fcb9f21ebbec4a127e9e144bd3b6ad5d1b10e98e8afe16f0f5386ad4a40",
+        "bytes": 57615,
+        "lines": 1328
+      }
+    }
+  },
+  "rp2040": {
+    "repo": "https://github.com/TeamOpenFIRE/OpenFIRE-Firmware.git",
+    "pinned_commit": "8b651a25143606d03733da455981cbad1dac31c6",
+    "pinned_commit_date": "2026-04-19",
+    "checkout_dir": "OpenFIRE-Firmware-RP2040",
+    "src_subdir": "OpenFIREmain",
+    "files": [
+      "OpenFIREmain.ino",
+      "OpenFIREcommon.cpp"
+    ],
+    "pristine": {
+      "OpenFIREmain.ino": {
+        "sha256": "826d457893adbfdd1f40024a1465b9d2a438f2ee77c7548605180310cf33bb38",
+        "lines": 1426,
+        "bytes": 63098
+      },
+      "OpenFIREcommon.cpp": {
+        "sha256": "a574d93cb19a8e99d9abc0a4ae78766475a64615ff632d371de5e89aa2d14369",
+        "lines": 1167,
+        "bytes": 50121
+      }
+    }
+  }
+}

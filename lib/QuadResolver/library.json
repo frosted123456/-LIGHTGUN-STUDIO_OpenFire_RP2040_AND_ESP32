@@ -1,0 +1,6 @@
+{
+  "name": "QuadResolver",
+  "version": "1.0.0",
+  "description": "Persistent 4-corner identity + rigid reconstruction, sensor-agnostic. Shared by the OV2640 and wiicam front ends.",
+  "build": { "srcFilter": ["+<*.cpp>"] }
+}

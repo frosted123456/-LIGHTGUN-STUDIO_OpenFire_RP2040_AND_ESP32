@@ -1,0 +1,151 @@
+--- a/lightgun/src/OpenFIREcommon.cpp
++++ b/lightgun/src/OpenFIREcommon.cpp
+@@ -32,6 +32,12 @@
+ #endif // ARDUINO_ARCH_RP2040
+ 
+ #include "OpenFIREcommon.h"
++#ifdef USE_AIM_PIPELINE
++// Overlay aim pipeline.
++#include "aim_runtime.h"
++#include "esp_timer.h"
++#include <math.h>
++#endif
+ #include "OpenFIREFeedback.h"
+ #include "OpenFIRElights.h"
+ #include "OpenFIREserial.h"
+@@ -774,10 +780,74 @@
+         int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
+         if(error == DFRobotIRPositionEx::Error_Success) {
+            
+-            // if diamond layout, or square
++#ifdef USE_AIM_PIPELINE
++            // Replace OpenFIRE's mapping with the calibrated aim pipeline when one is loaded.
++            bool aim_ok = false;
++            if(aim_runtime_active() && dfrIRPos->nativeCount >= 4) {
++                aim_pt_t q[4];
++                for(int i = 0; i < 4; ++i) {
++                    q[i].x = dfrIRPos->nativeX[i];
++                    q[i].y = dfrIRPos->nativeY[i];
++                }
++                float sx = 0.0f, sy = 0.0f;
++                static uint32_t s_aim_prev_us = 0;
++                const uint32_t now_us = (uint32_t)esp_timer_get_time();
++                const float dt = s_aim_prev_us ? (now_us - s_aim_prev_us) * 1e-6f : 0.0f;
++                s_aim_prev_us = now_us;
++                if(aim_runtime_solve(q, (float)dfrIRPos->nativeW,
++                                        (float)dfrIRPos->nativeH, &sx, &sy, dt)) {
++                    mouseX = (int32_t)lroundf(sx * (float)res_x);
++                    mouseY = (int32_t)lroundf(sy * (float)res_y);
++                    aim_ok = true;
++                }
++            }
++            if(!aim_ok) {
++                if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) { // layoutDiamond = 1
++                    OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
++                    OpenFIREper.warp(OpenFIREdiamond.X(0), OpenFIREdiamond.Y(0),
++                                    OpenFIREdiamond.X(1), OpenFIREdiamond.Y(1),
++                                    OpenFIREdiamond.X(2), OpenFIREdiamond.Y(2),
++                                    OpenFIREdiamond.X(3), OpenFIREdiamond.Y(3),
++                                    res_x / 2, 0, 0,
++                                    res_y / 2, res_x / 2,
++                                    res_y, res_x, res_y / 2);
++                } else { // layoutSquare = 0
++                    OpenFIREsquare.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());              
++                    #ifdef USE_MULTI_ONE_EURO_FILTER 
++                        X_in[0] = OpenFIREsquare.X(0);
++                        Y_in[0] = OpenFIREsquare.Y(0);
++                        X_in[1] = OpenFIREsquare.X(1);
++                        Y_in[1] = OpenFIREsquare.Y(1);
++                        X_in[2] = OpenFIREsquare.X(2);
++                        Y_in[2] = OpenFIREsquare.Y(2);
++                        X_in[3] = OpenFIREsquare.X(3);
++                        Y_in[3] = OpenFIREsquare.Y(3);          
++                        oef_multi.process(X_in, Y_in, X_out, Y_out);
++                        OpenFIREper.warp(X_out[0], Y_out[0],
++                                    X_out[1], Y_out[1],
++                                    X_out[2], Y_out[2],
++                                    X_out[3], Y_out[3],
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, 0,
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, 0,
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, res_y,
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, res_y);
++                    #else
++                        OpenFIREper.warp(OpenFIREsquare.X(0), OpenFIREsquare.Y(0),
++                                    OpenFIREsquare.X(1), OpenFIREsquare.Y(1),
++                                    OpenFIREsquare.X(2), OpenFIREsquare.Y(2),
++                                    OpenFIREsquare.X(3), OpenFIREsquare.Y(3),
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, 0,
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, 0,
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, res_y,
++                                    OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, res_y);
++                    #endif // USE_MULTI_ONE_EURO_FILTER 
++                }
++                mouseX = map(OpenFIREper.getX(), 0, res_x, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].leftOffset), (res_x + OF_Prefs::profiles[OF_Prefs::currentProfile].rightOffset));                 
++                mouseY = map(OpenFIREper.getY(), 0, res_y, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].topOffset), (res_y + OF_Prefs::profiles[OF_Prefs::currentProfile].bottomOffset));         
++            }
++#else
+             if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) { // layoutDiamond = 1
+                 OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
+-
+                 OpenFIREper.warp(OpenFIREdiamond.X(0), OpenFIREdiamond.Y(0),
+                                 OpenFIREdiamond.X(1), OpenFIREdiamond.Y(1),
+                                 OpenFIREdiamond.X(2), OpenFIREdiamond.Y(2),
+@@ -787,7 +857,6 @@
+                                 res_y, res_x, res_y / 2);
+             } else { // layoutSquare = 0
+                 OpenFIREsquare.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());              
+-               
+                 #ifdef USE_MULTI_ONE_EURO_FILTER 
+                     X_in[0] = OpenFIREsquare.X(0);
+                     Y_in[0] = OpenFIREsquare.Y(0);
+@@ -797,9 +866,7 @@
+                     Y_in[2] = OpenFIREsquare.Y(2);
+                     X_in[3] = OpenFIREsquare.X(3);
+                     Y_in[3] = OpenFIREsquare.Y(3);          
+-
+                     oef_multi.process(X_in, Y_in, X_out, Y_out);
+-
+                     OpenFIREper.warp(X_out[0], Y_out[0],
+                                 X_out[1], Y_out[1],
+                                 X_out[2], Y_out[2],
+@@ -808,7 +875,6 @@
+                                 OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, 0,
+                                 OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, res_y,
+                                 OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, res_y);
+-   
+                 #else
+                     OpenFIREper.warp(OpenFIREsquare.X(0), OpenFIREsquare.Y(0),
+                                 OpenFIREsquare.X(1), OpenFIREsquare.Y(1),
+@@ -819,12 +885,10 @@
+                                 OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, res_y,
+                                 OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, res_y);
+                 #endif // USE_MULTI_ONE_EURO_FILTER 
+-
+             }
+-
+-            // Output mapped to screen resolution because offsets are measured in pixels
+             mouseX = map(OpenFIREper.getX(), 0, res_x, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].leftOffset), (res_x + OF_Prefs::profiles[OF_Prefs::currentProfile].rightOffset));                 
+             mouseY = map(OpenFIREper.getY(), 0, res_y, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].topOffset), (res_y + OF_Prefs::profiles[OF_Prefs::currentProfile].bottomOffset));         
++#endif // USE_AIM_PIPELINE
+ 
+             switch(runMode) {
+                 case FW_Const::RunMode_Average:
+@@ -903,9 +967,15 @@
+                      buttons.offScreen = true;
+                 else buttons.offScreen = false;
+ 
+-                if(buttons.analogOutput)
+-                     Gamepad16.moveCam(conMoveX, conMoveY);
+-                else AbsMouse5.move(conMoveX, conMoveY);
++#ifdef USE_AIM_PIPELINE
++                // Pointer gate: skip the cursor move while the desktop app has it frozen.
++                if(aim_runtime_hid_enabled())
++#endif
++                {
++                    if(buttons.analogOutput)
++                         Gamepad16.moveCam(conMoveX, conMoveY);
++                    else AbsMouse5.move(conMoveX, conMoveY);
++                }
+             } else {
+                 if(gunMode == FW_Const::GunMode_Verification) {
+                     // Output mapped to Mouse resolution
