@@ -39,12 +39,25 @@ float aim_filter_min_cutoff(void);
 float aim_filter_beta(void);
 
 // Smoothing level: one knob over the One Euro pair. 0 = filter off,
-// 1 = lightest, 10 = heaviest; 3 matches the build-time defaults.
+// 1 = lightest, 10 = heaviest; 3 is the default and matches the build-time
+// coefficients. min_cutoff sets the AT-REST lag; beta stays high at every
+// level so fast motion is never filtered. Rest lag by level, in ms:
+//   L1 20  L2 32  L3 45  L4 64  L5 76  L6 88  L7 103  L8 118  L9 138  L10 159
 void aim_smooth_set(int level);
 int  aim_smooth_get(void);
 // Persisted under its own NVS key, like the lead.
 bool aim_smooth_load(int* out_level);
 bool aim_smooth_store(int level);
+
+// Output dead-band, in final output units at the move call. Swallows
+// sub-threshold shimmer around the last SENT position; motion at or above the
+// threshold passes with no added delay. 0 = off, the default; ~16-32 suits a
+// wide lens. The patches call aim_dead_pass() just before the cursor move.
+bool aim_dead_pass(int x, int y);
+void aim_dead_set(int units);
+int  aim_dead_get(void);
+bool aim_dead_load(int* out_units);
+bool aim_dead_store(int units);
 
 // The hot path. quad in native camera px, corner order TL TR BL BR.
 // Writes normalised screen coords (may fall outside 0..1 = aiming off-screen).
@@ -91,6 +104,9 @@ typedef struct {
     int   model;
     float k1, k2;
     float fpx, feq;
+    // Distortion-centre offset from the frame centre, in native px.
+    // Non-zero for a decentered clip-on lens; the fitter measures it.
+    float cx, cy;
 } aim_lens_t;
 
 bool aim_lens_load(aim_lens_t* out);

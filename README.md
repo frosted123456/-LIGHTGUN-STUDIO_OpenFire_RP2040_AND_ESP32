@@ -19,7 +19,6 @@ iron sights; and a **verify** step that measures the result instead of assuming
 it. Studio detects which gun is plugged in and adapts.
 
 Please test. You get extremely accurate aim with snappy aim. No springy effect when fine tunning is properly performed. Give me your feedback!
-Note Lightgun studio use a preview at a lower refresh rate (for preview purpose obviously). Actual refresh rate is define by the cam used.   
 
 ---
 
@@ -240,7 +239,14 @@ back and reconnects on its own. Reconnect in the header is there if you ever nee
 to force it.
 
 **2 — Camera tuning.** *ESP32-S3:* exposure, gain and threshold. Aim for a blob
-noise floor **under 0.30 px**; 0.60 is the limit. `Auto` sweeps for you.
+noise floor **under 0.30 px**; 0.60 is the limit. `Auto` sweeps for you and
+applies a small safety margin (slightly higher threshold, slightly shorter
+exposure) whenever the four-blob rate holds — headroom against background
+light creeping up later. If background contamination still shows after Auto
+(phantom blobs, jumpy quad), raise `thr` a step and lower `aec` slightly by
+hand. The step 3 sweep doubles as a check: whenever fewer than four dots are
+detected the preview freezes on the last full frame and says so, making
+contamination and dropouts visible at a glance.
 *RP2040:* the tab shows the wiicam's three sensitivity levels instead —
 Default fits most rigs — and the noise floor is still measured, with limits
 scaled for this sensor.
@@ -264,18 +270,30 @@ corrected upstream in the firmware — this step configures that.
 - Measure fits both distortion models, applies the better one, and refuses
   honestly when the sweep did not cover enough of the frame to pin the answer.
 - **Save to gun** persists it; it reloads at every boot.
-- **A decentered lens leaves a one-sided error.** Both distortion models are
-  radially symmetric about the frame centre — the standard assumption, and
-  exactly what a clip-on lens that is not perfectly coaxial breaks. A small
-  decenter puts the true distortion centre off to one side, and the residual
-  shows up as an offset that grows toward that edge. To verify, re-sweep with
-  good coverage close to that edge: if the offset survives a clean sweep it is
-  mechanical, and re-sweeping only measures it more precisely. Re-seat the
-  lens as centred as possible; the fine tune absorbs part of what remains.
-  (Fitting the distortion centre itself is a possible future extension — not
-  currently implemented.)
-- Know the trade: a wide lens lets you stand closer, but the shorter focal
-  magnifies every noise source on screen.
+- **A decentered lens leaves a one-sided error — and Measure now fits it.**
+  A clip-on lens that is not perfectly coaxial has its distortion centre off
+  the frame centre, which shows up as an offset that grows toward one edge.
+  Measure searches for that centre automatically, applies it when it clearly
+  improves the fit, and logs *"decentered lens detected"* with the offset.
+  Re-seating the lens as centred as possible is still worth doing — the fit
+  compensates most of a small decenter, not all of it — and a re-sweep with
+  good coverage near the affected edge gives the search its best data.
+- **Know the trade — smaller FOV wins.** A wide lens lets you stand closer,
+  but every extra degree of lens angle makes each camera pixel cover more
+  screen, so jitter grows. Smoothing hides the jitter but adds delay; lead
+  can compensate the delay but adds its own overshoot. Each mechanism papers
+  over the previous one — the chain works, and Studio tunes all of it, but
+  the smallest FOV that still fits your play distance beats every layer of
+  compensation. Pick the lens for the distance you actually play at.
+- **Dead-band (optional, off by default).** The − / + control below the lens
+  buttons. What it does: when the gun is at rest, sensor noise still wiggles
+  the cursor by a pixel or two; the dead-band holds the cursor perfectly
+  still until it moves MORE than the threshold from the last drawn position,
+  then movement passes through instantly — it never adds delay to real
+  motion. When to use it: only if the cursor still shimmers at rest after
+  tuning smoothing (step 5) — typical with a wide lens. Start at 16, raise
+  by 8 until the rest shimmer stops, and stop there: too high and slow
+  deliberate drags start to step. **Save to gun** keeps it.
 - **Applying or changing a lens correction invalidates the aim calibration** —
   redo step 4, then step 5, after every change here.
 
@@ -288,18 +306,23 @@ the fit will refuse. It ends by sending the calibration to the gun and reading
 it back to confirm.
 
 **5 — Fine tune** *(both boards)*. Lines the cursor up with your **iron sights**, which is not
-where the camera points. The full flow: shoot the ring, nudge with the arrows if
-needed, step back, repeat — two positions let it separate an angular offset
-(grows with distance) from a parallax one (constant), and the wrong correction
-is worse than none. The short flow: skip the ring entirely, nudge with the
-arrows until the cursor sits on your notch, and press **SAVE NOW** — that keeps
-exactly what you see as a constant offset from one position. Mixing them is
-safe: a ring shot only measures what is left after your nudges, so nothing is
-ever counted twice. `LEAD ±` trades latency for overshoot — raise it while the
-cursor trails you, stop as soon as it overshoots when you reverse direction.
-`SMOOTH ±` (0–10) trades cursor jitter for glide — raise it until the jitter
-settles, stop when the cursor starts to feel floaty. Wide and fisheye lenses
-magnify sensor noise, so they usually want a level or two more than stock.
+where the camera points. It opens showing the gun's SAVED lead and smoothing,
+so the first press steps from where you left off. Do it in this order:
+
+1. **Align first.** Shoot the ring with your iron sights, nudge with the
+   arrows if needed, step back and repeat — two positions let it separate an
+   angular offset (grows with distance) from a parallax one (constant), and
+   the wrong correction is worse than none. Short flow: skip the ring, nudge
+   until the cursor sits on your notch, press **SAVE NOW**. Mixing them is
+   safe: a ring shot only measures what is left after your nudges.
+2. **Then SMOOTH ± (0–10)** until the cursor's tracking feels consistent —
+   raise it while the cursor jitters, stop when it starts to feel floaty.
+   Wide and fisheye lenses usually want a level or two more than stock.
+3. **Then LEAD ±, last** — smoothing changes the total latency, so lead
+   tuned before smoothing no longer matches (the screen reminds you). Raise
+   it while the cursor trails your swings, stop as soon as it overshoots
+   when you reverse direction.
+
 Both are saved with the fine tune.
 You will see a big difference here
 
@@ -477,8 +500,9 @@ All are prefixed `~` on the native USB port.
 | `~cam=thr:60,aec:40` | Tune the camera live |
 | `~cam=lead:10` | Latency lead in ms, 0–50 |
 | `~cam=smooth:5` | Cursor smoothing level 0–10 (0 = off, 3 = default) |
+| `~cam=dead:16` | Output dead-band in cursor units, 0 = off (default); swallows rest shimmer, never delays real motion |
 | `~cam=lens:2,lfeq:900,lfpx:840` | Set the lens correction live |
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only) |
-| `~camsave` | Persist camera settings, lead, smoothing and lens |
+| `~camsave` | Persist camera settings, lead, smoothing, dead-band and lens |
 
 See `NOTICE.md` for third-party code and licences.

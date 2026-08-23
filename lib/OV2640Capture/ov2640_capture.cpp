@@ -326,10 +326,12 @@ static volatile float s_lead_ms = (float)LIGHTGUN_LEAD_MS;
 static volatile float s_vfill_pct = (float)LIGHTGUN_VFILL_PCT;
 
 // Maps a distorted centroid back to pinhole coordinates, in place.
+static volatile float s_lcx = 0.0f, s_lcy = 0.0f;  // distortion-centre offset, px
+
 static inline void lens_undistort(float* px, float* py)
 {
     if (!s_lens) return;
-    const float cx = FRAME_W * 0.5f, cy = FRAME_H * 0.5f;
+    const float cx = FRAME_W * 0.5f + s_lcx, cy = FRAME_H * 0.5f + s_lcy;
     const float dx = *px - cx, dy = *py - cy;
     const float rd = sqrtf(dx*dx + dy*dy);
     if (rd < 1e-3f) return;
@@ -1138,6 +1140,12 @@ int ov2640_capture_start(void)
             aim_smooth_set(smooth);
             printf("CAM: restored smooth=%d from NVS\n", smooth);
         }
+        // Output dead-band, own key like the lead.
+        int dead = 0;
+        if (aim_dead_load(&dead)) {
+            aim_dead_set(dead);
+            printf("CAM: restored dead=%d from NVS\n", dead);
+        }
         // Lens is pure software state (no sensor registers), so the boot-recipe
         // ordering that bit the AEC/AGC restore cannot bite here.
         aim_lens_t ls;
@@ -1145,6 +1153,7 @@ int ov2640_capture_start(void)
             s_lens = (uint8_t)ls.model;
             s_lk1  = ls.k1;  s_lk2  = ls.k2;
             s_lfpx = ls.fpx; s_lfeq = ls.feq;
+            s_lcx  = ls.cx;  s_lcy  = ls.cy;
             printf("CAM: restored lens=%d k1=%.4f k2=%.4f fpx=%.1f feq=%.1f from NVS\n",
                    ls.model, (double)ls.k1, (double)ls.k2,
                    (double)ls.fpx, (double)ls.feq);
@@ -1228,33 +1237,37 @@ extern "C" bool ov2640_cam_command(const char* line)
         const bool ok = aim_cam_store(&cs);
         aim_lead_store((int)s_lead_ms);
         aim_smooth_store(aim_smooth_get());
+        aim_dead_store(aim_dead_get());
         // Lens rides along; model 0 clears rather than stores, so a stale
         // stored lens cannot survive a return to the stock lens.
-        aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq };
+        aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
+                          s_lcx, s_lcy };
         bool lens_ok = true;
         if (ls.model == 0) aim_lens_clear();
         else               lens_ok = aim_lens_store(&ls);
         ov_reply(ok && lens_ok
-                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d lens=%d\n"
-                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d lens=%d\n",
+                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d dead=%d lens=%d\n"
+                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d dead=%d lens=%d\n",
                  cs.thr, cs.aec, cs.agc, cs.boost, (int)s_lead_ms,
-                 aim_smooth_get(), ls.model);
+                 aim_smooth_get(), aim_dead_get(), ls.model);
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
         aim_cam_clear();
         aim_lens_clear();
+        s_lcx = 0.0f; s_lcy = 0.0f;
         ov_reply("CAM: stored settings cleared (camera + lens); next boot uses the built-in recipe\n");
         return true;
     }
     if (!strncmp(line, "cam?", 4)) {
         // Everything the tools read back, one line: lead and lens included.
-        ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d lead=%d smooth=%d "
-                 "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d vfill=%d\n",
+        ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d lead=%d smooth=%d dead=%d "
+                 "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d lcxu=%d lcyu=%d vfill=%d\n",
                  (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost, (int)s_lead_ms,
-                 aim_smooth_get(),
+                 aim_smooth_get(), aim_dead_get(),
                  (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
-                 (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f), (int)s_vfill_pct);
+                 (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
+                 (int)(s_lcx*10.0f), (int)(s_lcy*10.0f), (int)s_vfill_pct);
         return true;
     }
 #endif
@@ -1306,6 +1319,11 @@ extern "C" void ov2640_tune(const char* cmd)
             // output smoothing level, 0 (off) .. 10 (heaviest)
             aim_smooth_set(val);
 #endif
+        } else if (!strcmp(key, "dead")) {
+#ifdef USE_AIM_PIPELINE
+            // output dead-band in final output units, 0 = off
+            aim_dead_set(val);
+#endif
         } else if (!strcmp(key, "vfill")) {
             // LED vertical span as a PERCENT of screen height; 100 = off.
             // Range is 20..300, not 20..100: the standard OpenFIRE layout puts
@@ -1327,6 +1345,16 @@ extern "C" void ov2640_tune(const char* cmd)
             if (val > 0) s_lfpx = (float)val / 10.0f;  // tenths of a pixel
         } else if (!strcmp(key, "lfeq")) {
             if (val > 0) s_lfeq = (float)val / 10.0f;
+        } else if (!strcmp(key, "lcxu")) {
+            float v = (float)val / 10.0f;
+            if (v > 30.0f) v = 30.0f;
+            if (v < -30.0f) v = -30.0f;
+            s_lcx = v;
+        } else if (!strcmp(key, "lcyu")) {
+            float v = (float)val / 10.0f;
+            if (v > 30.0f) v = 30.0f;
+            if (v < -30.0f) v = -30.0f;
+            s_lcy = v;
         } else if (!strcmp(key, "coin")) {
             s_coin = (val != 0);       // temporal coincidence gate, A/B live
         } else if (!strcmp(key, "dbg")) {

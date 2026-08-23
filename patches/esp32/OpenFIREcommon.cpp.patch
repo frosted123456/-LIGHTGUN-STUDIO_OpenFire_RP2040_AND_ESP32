@@ -13,7 +13,7 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIRElights.h"
  #include "OpenFIREserial.h"
-@@ -774,10 +780,74 @@
+@@ -774,10 +780,74 @@ void FW_Common::GetPosition()
          int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
          if(error == DFRobotIRPositionEx::Error_Success) {
             
@@ -90,7 +90,7 @@
                  OpenFIREper.warp(OpenFIREdiamond.X(0), OpenFIREdiamond.Y(0),
                                  OpenFIREdiamond.X(1), OpenFIREdiamond.Y(1),
                                  OpenFIREdiamond.X(2), OpenFIREdiamond.Y(2),
-@@ -787,7 +857,6 @@
+@@ -787,7 +857,6 @@ void FW_Common::GetPosition()
                                  res_y, res_x, res_y / 2);
              } else { // layoutSquare = 0
                  OpenFIREsquare.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());              
@@ -98,7 +98,7 @@
                  #ifdef USE_MULTI_ONE_EURO_FILTER 
                      X_in[0] = OpenFIREsquare.X(0);
                      Y_in[0] = OpenFIREsquare.Y(0);
-@@ -797,9 +866,7 @@
+@@ -797,9 +866,7 @@ void FW_Common::GetPosition()
                      Y_in[2] = OpenFIREsquare.Y(2);
                      X_in[3] = OpenFIREsquare.X(3);
                      Y_in[3] = OpenFIREsquare.Y(3);          
@@ -108,7 +108,7 @@
                      OpenFIREper.warp(X_out[0], Y_out[0],
                                  X_out[1], Y_out[1],
                                  X_out[2], Y_out[2],
-@@ -808,7 +875,6 @@
+@@ -808,7 +875,6 @@ void FW_Common::GetPosition()
                                  OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, 0,
                                  OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, res_y,
                                  OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, res_y);
@@ -116,7 +116,7 @@
                  #else
                      OpenFIREper.warp(OpenFIREsquare.X(0), OpenFIREsquare.Y(0),
                                  OpenFIREsquare.X(1), OpenFIREsquare.Y(1),
-@@ -819,12 +885,10 @@
+@@ -819,13 +885,16 @@ void FW_Common::GetPosition()
                                  OF_Prefs::profiles[OF_Prefs::currentProfile].TLled, res_y,
                                  OF_Prefs::profiles[OF_Prefs::currentProfile].TRled, res_y);
                  #endif // USE_MULTI_ONE_EURO_FILTER 
@@ -128,9 +128,15 @@
              mouseY = map(OpenFIREper.getY(), 0, res_y, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].topOffset), (res_y + OF_Prefs::profiles[OF_Prefs::currentProfile].bottomOffset));         
 +#endif // USE_AIM_PIPELINE
  
++#ifdef USE_AIM_PIPELINE
++            // Stock frame averaging applies to the stock solve only; the
++            // pipeline output is already filtered and must not be averaged.
++            if(!aim_ok)
++#endif
              switch(runMode) {
                  case FW_Const::RunMode_Average:
-@@ -903,9 +967,15 @@
+                     // 2 position moving average
+@@ -903,9 +972,15 @@ void FW_Common::GetPosition()
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  
@@ -139,7 +145,7 @@
 -                else AbsMouse5.move(conMoveX, conMoveY);
 +#ifdef USE_AIM_PIPELINE
 +                // Pointer gate: skip the cursor move while the desktop app has it frozen.
-+                if(aim_runtime_hid_enabled())
++                if(aim_runtime_hid_enabled() && aim_dead_pass(conMoveX, conMoveY))
 +#endif
 +                {
 +                    if(buttons.analogOutput)

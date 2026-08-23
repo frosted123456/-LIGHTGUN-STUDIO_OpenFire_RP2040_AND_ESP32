@@ -12,7 +12,7 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIRElights.h"
  #include "OpenFIREserial.h"
-@@ -650,6 +655,24 @@
+@@ -650,6 +655,24 @@ void FW_Common::GetPosition()
      if(dfrIRPos != nullptr) {
          int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
          if(error == DFRobotIRPositionEx::Error_Success) {
@@ -37,17 +37,17 @@
              // if diamond layout, or square
              if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) {
                  OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
-@@ -675,6 +698,9 @@
-             // Output mapped to screen resolution because offsets are measured in pixels
-             mouseX = map(OpenFIREper.getX(), 0, res_x, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].leftOffset), (res_x + OF_Prefs::profiles[OF_Prefs::currentProfile].rightOffset));                 
-             mouseY = map(OpenFIREper.getY(), 0, res_y, (0 - OF_Prefs::profiles[OF_Prefs::currentProfile].topOffset), (res_y + OF_Prefs::profiles[OF_Prefs::currentProfile].bottomOffset));
+@@ -699,6 +722,9 @@ void FW_Common::GetPosition()
+                 default:
+                     break;
+                 }
 +#ifdef USE_AIM_PIPELINE
 +            }
 +#endif
  
-             switch(runMode) {
-                 case FW_Const::RunMode_Average:
-@@ -753,9 +779,15 @@
+             // Constrain that bisch so negatives don't cause underflow
+             int32_t conMoveX = constrain(mouseX, 0, res_x);
+@@ -753,9 +779,18 @@ void FW_Common::GetPosition()
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  
@@ -55,8 +55,11 @@
 -                     Gamepad16.moveCam(conMoveX, conMoveY);
 -                else AbsMouse5.move(conMoveX, conMoveY);
 +#ifdef USE_AIM_PIPELINE
-+                // Pointer gate (~aimhid=0): skip the cursor move while frozen.
-+                if(aim_runtime_hid_enabled())
++                // Pointer gate (~aimhid=0): skip the cursor move while
++                // frozen. Dead-band (~cam=dead:N): swallow sub-threshold
++                // shimmer around the last sent position; motion at or above
++                // the threshold passes with zero added delay.
++                if(aim_runtime_hid_enabled() && aim_dead_pass(conMoveX, conMoveY))
 +#endif
 +                {
 +                    if(buttons.analogOutput)

@@ -240,7 +240,10 @@ def run_gui(src, tuner, on_send):
             if tuner.smooth == before:
                 say("smoothing already at %d (range 0-%d)" % (tuner.smooth, SMOOTH_MAX), b)
             else:
-                say("smoothing  %d  ->  %d" % (before, tuner.smooth), b)
+                # smoothing lag adds AFTER the lead compensation, so a tuned
+                # lead no longer matches once the level changes
+                say("smoothing  %d  ->  %d   (re-check LEAD: its lag changed)"
+                    % (before, tuner.smooth), b)
         elif act[0] == "save":
             c = tuner.solve_direct()
             if c is not None:
@@ -430,7 +433,7 @@ def main():
     time.sleep(1.0)
     cal = None
     for r in src.replies:
-        if "cx=" in r:
+        if r.startswith("AIM:") and "cx=" in r:
             g = {}
             for tok in r.replace("AIM:", "").split():
                 if "=" in tok:

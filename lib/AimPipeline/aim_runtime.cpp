@@ -59,7 +59,7 @@ static bool        s_trig_prev = false;
 // ---- One Euro filter state ----------------------------------------------
 // The derivative is in normalised screen widths per second, so beta is order 10.
 #ifndef AIM_FILT_MIN_CUTOFF
-#define AIM_FILT_MIN_CUTOFF 1.0f
+#define AIM_FILT_MIN_CUTOFF 3.5f   // == SMOOTH_TAB level 3, the default level
 #endif
 #ifndef AIM_FILT_BETA
 #define AIM_FILT_BETA 15.0f
@@ -92,21 +92,24 @@ float aim_filter_min_cutoff(void) { return s_fc; }
 float aim_filter_beta(void) { return s_beta; }
 
 // ---- smoothing level ------------------------------------------------------
-// One knob over the One Euro pair. Level 3 equals the build-time defaults, so
-// a gun that never stored a level behaves exactly as before the knob existed.
+// One knob over the One Euro pair. min_cutoff sets the at-rest lag (tau =
+// 1/(2*pi*fc)); beta is flat and high so fast motion is never filtered at any
+// level. Level 10 is the pre-retune default pair, so the old feel stays
+// reachable. Rest lag per level, in ms:
+//   L1 20  L2 32  L3 45  L4 64  L5 76  L6 88  L7 103  L8 118  L9 138  L10 159
 #define AIM_NVS_SMOOTH "smth0"
 static const float SMOOTH_TAB[11][2] = {
     {0.00f,  0.0f},   // 0: filter off
-    {2.00f, 40.0f},   // 1: barely there
-    {1.40f, 25.0f},
-    {1.00f, 15.0f},   // 3: the build-time default pair
-    {0.90f, 10.0f},
-    {0.80f,  7.0f},
-    {0.70f,  5.0f},
-    {0.60f,  3.5f},
-    {0.50f,  2.5f},
-    {0.45f,  1.7f},
-    {0.40f,  1.2f},   // 10: heaviest, noticeable glide
+    {8.00f, 15.0f},   // 1: lightest
+    {5.00f, 15.0f},
+    {3.50f, 15.0f},   // 3: the default
+    {2.50f, 15.0f},
+    {2.10f, 15.0f},
+    {1.80f, 15.0f},
+    {1.55f, 15.0f},
+    {1.35f, 15.0f},
+    {1.15f, 15.0f},
+    {1.00f, 15.0f},   // 10: heaviest -- the pre-retune default pair
 };
 static int s_smooth = 3;
 
@@ -152,6 +155,69 @@ bool aim_smooth_load(int* out_level)
     return true;
 #else
     (void)out_level; return false;
+#endif
+}
+
+// ---- output dead-band -----------------------------------------------------
+// Swallows sub-threshold shimmer around the last SENT position; motion at or
+// above the threshold passes immediately, so it never adds delay. Units are
+// the final output units at the move call. 0 = off, the default.
+#define AIM_NVS_DEAD "dead0"
+static int s_dead = 0;
+static int s_dead_x = -1000000, s_dead_y = -1000000;
+
+// Clamps and applies the threshold.
+void aim_dead_set(int units)
+{
+    if (units < 0) units = 0;
+    if (units > 2000) units = 2000;
+    s_dead = units;
+}
+int aim_dead_get(void) { return s_dead; }
+
+// True when this position should be sent; updates the reference on send.
+bool aim_dead_pass(int x, int y)
+{
+    const int dx = x - s_dead_x, dy = y - s_dead_y;
+    if (s_dead > 0 &&
+        (long long)dx * dx + (long long)dy * dy < (long long)s_dead * s_dead)
+        return false;
+    s_dead_x = x; s_dead_y = y;
+    return true;
+}
+
+// Persists the dead-band threshold under its own key.
+bool aim_dead_store(int units)
+{
+    if (units < 0) units = 0;
+    if (units > 2000) units = 2000;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_i16(h, AIM_NVS_DEAD, (int16_t)units) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)units; return true;
+#endif
+}
+
+// Reads the persisted threshold; false if nothing is stored.
+bool aim_dead_load(int* out_units)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_units) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    int16_t v = 0;
+    const esp_err_t e = nvs_get_i16(h, AIM_NVS_DEAD, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    *out_units = (int)v;
+    return true;
+#else
+    (void)out_units; return false;
 #endif
 }
 
@@ -339,6 +405,8 @@ static bool lens_plausible(const aim_lens_t* c)
     if (!(c->k2 == c->k2) || c->k2 < -2.0f || c->k2 > 2.0f) return false;
     if (!(c->fpx == c->fpx) || c->fpx < 10.0f || c->fpx > 2000.0f) return false;
     if (!(c->feq == c->feq) || c->feq < 10.0f || c->feq > 2000.0f) return false;
+    if (!(c->cx == c->cx) || c->cx < -60.0f || c->cx > 60.0f) return false;
+    if (!(c->cy == c->cy) || c->cy < -60.0f || c->cy > 60.0f) return false;
     return true;
 }
 

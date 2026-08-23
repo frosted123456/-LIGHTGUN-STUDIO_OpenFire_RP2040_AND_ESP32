@@ -143,10 +143,20 @@ int main()
     ck(aim_smooth_store(-2) && aim_smooth_load(&sm) && sm == 0, "clamped to 0");
     aim_smooth_set(3);
     const float fc3 = aim_filter_min_cutoff(), b3 = aim_filter_beta();
-    ck(fc3 == 1.0f && b3 == 15.0f, "level 3 is the build-time default pair");
+    ck(fc3 == 3.5f && b3 == 15.0f, "level 3 is the build-time default pair");
     aim_smooth_set(10);
-    ck(aim_filter_min_cutoff() < fc3 && aim_filter_beta() < b3,
-       "level 10 is heavier than level 3 on both coefficients");
+    ck(aim_filter_min_cutoff() < fc3 && aim_filter_min_cutoff() == 1.0f,
+       "level 10 is heavier than 3 and equals the pre-retune default");
+    // table sanity: strictly more smoothing per level, motion never filtered
+    bool mono = true;
+    float prev_fc = 1e9f;
+    for (int l = 1; l <= 10; ++l) {
+        aim_smooth_set(l);
+        mono &= aim_filter_min_cutoff() < prev_fc && aim_filter_min_cutoff() > 0.0f
+             && aim_filter_beta() >= 15.0f;
+        prev_fc = aim_filter_min_cutoff();
+    }
+    ck(mono, "levels 1..10 are monotone, non-zero, beta stays >= 15");
     aim_smooth_set(0);
     ck(aim_filter_min_cutoff() == 0.0f, "level 0 turns the filter off");
     ck(aim_smooth_get() == 0, "get reports the level that was set");
@@ -155,6 +165,29 @@ int main()
     aim_lead_store(12); aim_smooth_store(5);
     ck(aim_lead_load(&lead) && lead == 12 && aim_smooth_load(&sm) && sm == 5,
        "lead and smoothing keys do not alias each other");
+
+    printf("\noutput dead-band:\n");
+    int dd = -1;
+    ck(!aim_dead_load(&dd), "nothing stored to begin with");
+    ck(aim_dead_store(24) && aim_dead_load(&dd) && dd == 24, "store + read back 24");
+    ck(aim_dead_store(-3) && aim_dead_load(&dd) && dd == 0, "negative clamped to 0");
+    aim_dead_set(0);
+    ck(aim_dead_pass(100, 100) && aim_dead_pass(101, 100),
+       "threshold 0 passes everything");
+    aim_dead_set(20);
+    ck(aim_dead_pass(500, 500), "first position after a jump passes");
+    ck(!aim_dead_pass(510, 500), "10 units of shimmer is swallowed");
+    ck(!aim_dead_pass(500, 514), "14 units the other way is swallowed too");
+    ck(aim_dead_pass(521, 500), "21 units is real motion and passes");
+    ck(!aim_dead_pass(530, 500),
+       "the reference moved to the SENT position, so 9 more is shimmer");
+    ck(aim_dead_pass(600, 600) && aim_dead_pass(700, 700),
+       "supra-threshold motion streams through with no added delay");
+    aim_dead_set(0);
+    // smoothing and dead-band keys must not alias
+    aim_smooth_store(5); aim_dead_store(30);
+    ck(aim_smooth_load(&sm) && sm == 5 && aim_dead_load(&dd) && dd == 30,
+       "smoothing and dead-band keys do not alias");
 
     // a stored blob of the wrong size must be rejected, not reinterpreted
     g_blob_len = sizeof(aim_calib_t) - 4;
@@ -183,10 +216,13 @@ int main()
     printf("\nlens correction persistence:\n");
     aim_lens_t ln = {};
     ck(!aim_lens_load(&ln), "nothing stored to begin with");
-    aim_lens_t fisheye = { 2, 0.0f, 0.0f, 84.0f, 85.9f };
+    aim_lens_t fisheye = { 2, 0.0f, 0.0f, 84.0f, 85.9f, 3.2f, -1.5f };
     ck(aim_lens_store(&fisheye), "store a fisheye setup");
-    ck(aim_lens_load(&ln) && ln.model==2 && ln.feq==85.9f && ln.fpx==84.0f,
-       "loads back identically");
+    ck(aim_lens_load(&ln) && ln.model==2 && ln.feq==85.9f && ln.fpx==84.0f
+       && ln.cx==3.2f && ln.cy==-1.5f,
+       "loads back identically, distortion centre included");
+    aim_lens_t badcen = { 2, 0.0f, 0.0f, 84.0f, 85.9f, 500.0f, 0.0f };
+    ck(!aim_lens_store(&badcen), "absurd distortion centre refused");
     aim_lens_t badl = { 3, 0, 0, 84.0f, 85.9f };
     ck(!aim_lens_store(&badl), "unknown model refused");
     badl = { 1, 5.0f, 0, 184.7f, 90.0f };

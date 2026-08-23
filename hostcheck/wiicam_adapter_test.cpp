@@ -166,7 +166,7 @@ int main()
     wiicam_cam_command("cam?");
     ck(!g_replies.empty() && g_replies[0].find("board=rp2040-wiicam") != std::string::npos,
        "cam? names the board");
-    wiicam_cam_command("cam=lens:2,lfeq:900,lfpx:1847");
+    wiicam_cam_command("cam=lens:2,lfeq:900,lfpx:1847,lcxu:32,lcyu:-15");
     // smoothing goes through the shared runtime knob
     const float fc_before = aim_filter_min_cutoff();
     wiicam_cam_command("cam=smooth:8");
@@ -180,6 +180,16 @@ int main()
        "camsave persisted the lead");
     ck(nvs_get_i16(1, "smth0", &i16v) == ESP_OK && i16v == 8,
        "camsave persisted the smoothing level under its own key");
+    wiicam_cam_command("cam=dead:24");
+    ck(aim_dead_get() == 24, "dead key reaches the shared runtime");
+    wiicam_cam_command("camsave");
+    ck(nvs_get_i16(1, "dead0", &i16v) == ESP_OK && i16v == 24,
+       "camsave persisted the dead-band under its own key");
+    g_replies.clear();
+    wiicam_cam_command("cam?");
+    ck(!g_replies.empty() && g_replies[0].find("dead=24") != std::string::npos,
+       "cam? reports the dead-band");
+    wiicam_cam_command("cam=dead:0");
     wiicam_cam_command("cam=sens:2");
     ck(t_sens == 2, "sens goes through the OpenFIRE hook");
     const int saves = t_sens_saved;
@@ -193,6 +203,9 @@ int main()
     wiicam_cam_command("cam?");
     ck(!g_replies.empty() && g_replies[0].find("lens=2") != std::string::npos,
        "a reboot restores the stored lens");
+    ck(!g_replies.empty() && g_replies[0].find("lcxu=32") != std::string::npos
+       && g_replies[0].find("lcyu=-15") != std::string::npos,
+       "...including the distortion-centre offset");
     ck(aim_smooth_get() == 8, "...and a reboot restores the stored smoothing");
 
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

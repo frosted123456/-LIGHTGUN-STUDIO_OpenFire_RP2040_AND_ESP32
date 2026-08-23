@@ -94,7 +94,9 @@ def install_over_serial(src, cmd, c, timeout=2.5):
     t0 = time.time()
     while time.time() - t0 < timeout:
         for r in list(src.replies):
-            if "cx=" not in r: continue
+            # AIM:-only: a CAM: line's "lcxu=" token contains "cx=" and would
+            # otherwise be parsed as a calibration read-back
+            if not r.startswith("AIM:") or "cx=" not in r: continue
             got = {}
             for tok in r.replace("AIM:", "").split():
                 if "=" in tok:
@@ -566,7 +568,11 @@ class SerialSource(threading.Thread):
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 txt = line.decode("ascii", "replace")
-                if txt.startswith("AIM:"):
+                if txt.startswith("AIM:") or txt.startswith("CAM:"):
+                    # CAM: included: fine-tune seeds lead/smoothing from cam?,
+                    # and an AIM:-only filter silently dropped that reply --
+                    # the tool then started from defaults and the first nudge
+                    # stomped the saved values.
                     self.replies.append(txt)
                     del self.replies[:-40]
                 elif txt.startswith("Q,"):

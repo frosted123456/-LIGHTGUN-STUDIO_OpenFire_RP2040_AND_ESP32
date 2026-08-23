@@ -25,7 +25,7 @@ def sigma_gates(board):
     return SIGMA_GOOD * k, SIGMA_OK * k
 APP_PORT_WAIT_S = 60.0                 # how long to keep trying after their app exits
 CAM_KEYS = ("thr", "aec", "agc", "boost")
-LENS_KEYS = ("lens", "lk1u", "lk2u", "lfpx", "lfeq")
+LENS_KEYS = ("lens", "lk1u", "lk2u", "lfpx", "lfeq", "lcxu", "lcyu")
 CAM_RANGE = {"thr": (8, 200), "aec": (4, 400), "agc": (0, 30), "boost": (0, 1)}
 
 
@@ -152,7 +152,7 @@ class Link:
                             k, v = tok.split("=", 1)
                             if k == "board":
                                 self.last["board"] = v
-                            elif k in CAM_KEYS or k in LENS_KEYS or k == "sens":
+                            elif k in CAM_KEYS or k in LENS_KEYS or k in ("sens", "dead"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -246,6 +246,26 @@ def auto_tune(link, log, stop):
     log("")
     log("best: aec=%d thr=%d  (%0.0f fps with four blobs, sigma %s)"
         % (aec, thr, rate, "%.3f" % sg if sg is not None else "not measured"))
+    # Safety margin: nudge AWAY from the contamination edge -- a slightly
+    # higher threshold and slightly shorter exposure -- and keep it only if
+    # the four-blob rate holds. Headroom against background creep (sun,
+    # lamps warming up) is worth more than the last hundredth of a px.
+    m_aec, m_thr = max(4, int(round(aec * 0.8))), min(200, thr + 20)
+    if (m_aec, m_thr) != (aec, thr) and not stop.is_set():
+        link.send("~cam=aec:%d,thr:%d" % (m_aec, m_thr))
+        time.sleep(0.35)
+        link.hist = []
+        t0 = time.time()
+        while time.time() - t0 < 0.9:
+            link.pump(); time.sleep(0.02)
+        m_rate = len(link.hist) / 0.9
+        if m_rate >= rate * 0.95:
+            log("margin: aec=%d thr=%d holds %0.0f fps -- applied with "
+                "headroom against background creep" % (m_aec, m_thr, m_rate))
+            aec, thr = m_aec, m_thr
+        else:
+            log("margin: aec=%d thr=%d drops to %0.0f fps -- no free headroom, "
+                "keeping the optimum" % (m_aec, m_thr, m_rate))
     link.send("~cam=aec:%d,thr:%d" % (aec, thr))
     time.sleep(0.3)
     log("applied. Press 'Save to gun' to keep it across power cycles.")
@@ -711,6 +731,10 @@ def main():
                         text="measured: %s  rms %.2f px  (coverage %.0f%%)"
                              % (r["model"], r["rms_px"], r["coverage"] * 100), fg=C_OK)
                     log("lens: fitted %s model, residual %.2f px rms." % (r["model"], r["rms_px"]))
+                    if r.get("lcx") or r.get("lcy"):
+                        log("lens: decentered lens detected -- distortion "
+                            "centre offset %+.1f, %+.1f px, compensated."
+                            % (r["lcx"], r["lcy"]))
                     if r["rms_px"] > 1.0:
                         log("lens: residual is high -- consider redoing the sweep more slowly.")
                     log("Applied live. Press 'Save to gun' to keep it across power cycles.")
@@ -728,6 +752,22 @@ def main():
               fg="white", relief="flat", padx=12, pady=6).pack(side="left", padx=8)
     tk.Button(rowb, text="Measure (20 s sweep)", command=lens_measure, font=FB,
               bg="#1f6feb", fg="white", relief="flat", padx=12, pady=6).pack(side="left")
+    # Output dead-band: swallows sub-threshold rest shimmer at the cursor,
+    # never delays real motion. Set-once-per-lens, so it lives here, not in
+    # the fine-tune bar. 0 = off; ~16-32 suits a wide lens.
+    def dead_nudge(d):
+        v = max(0, min(128, int(link.last.get("dead", 0)) + d))
+        link.last["dead"] = v
+        link.send("~cam=dead:%d" % v)
+        log("dead-band -> %d units (0 = off; Save to gun to keep)" % v)
+    rowd = tk.Frame(tab_lens, bg=C_BG); rowd.pack(fill="x", pady=(0, 4))
+    lab(rowd, "Dead-band (rest shimmer):", F, C_DIM).pack(side="left")
+    tk.Button(rowd, text="-", command=lambda: dead_nudge(-8), font=F, bg="#161b22",
+              fg=C_FG, relief="flat", padx=10).pack(side="left", padx=(8, 2))
+    tk.Button(rowd, text="+", command=lambda: dead_nudge(+8), font=F, bg="#161b22",
+              fg=C_FG, relief="flat", padx=10).pack(side="left", padx=2)
+    dead_lbl = lab(rowd, "off", F, C_DIM); dead_lbl.pack(side="left", padx=8)
+
     tk.Button(rowb, text="Save to gun", command=lambda: (link.send("~camsave"), log("~camsave sent")),
               font=FB, bg="#238636", fg="white", relief="flat", padx=12, pady=6).pack(side="left", padx=8)
     tk.Button(rowb, text="Read from gun", command=lambda: link.send("~cam?"),
@@ -755,6 +795,10 @@ def main():
 
     def lens_tick():
         # keep the state line honest from the gun's own cam? replies
+        d = link.last.get("dead", None)
+        if d is not None:
+            dead_lbl.config(text=("off" if d == 0 else "%d units" % d),
+                            fg=(C_DIM if d == 0 else C_OK))
         if not lens_busy["on"] and "lens" in link.last:
             m = link.last.get("lens", 0)
             if m == 0:

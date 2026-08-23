@@ -96,8 +96,8 @@ def order_and_track(frames):
 # --------------------------------------------------------------------------
 # lens models: distorted px -> unit rays (this is what the fit compares)
 # --------------------------------------------------------------------------
-def rays_fisheye(pts, feq):
-    d = pts - (CX, CY)
+def rays_fisheye(pts, feq, cx=CX, cy=CY):
+    d = pts - (cx, cy)
     r = np.linalg.norm(d, axis=-1)
     th = np.clip(r / feq, 0, 1.45)
     s = np.where(r > 1e-9, np.sin(th) / np.maximum(r, 1e-9), 1.0 / feq)
@@ -107,10 +107,10 @@ def rays_fisheye(pts, feq):
     out[..., 2] = np.cos(th)
     return out
 
-def rays_poly(pts, k1, k2, fpx):
+def rays_poly(pts, k1, k2, fpx, cx=CX, cy=CY):
     """Mirror of the firmware: r_dn = r/FPX, 3 Newton steps invert
     r_u(1+k1 r_u^2+k2 r_u^4) = r_dn, ray = (dir * r_u, 1) normalized."""
-    d = pts - (CX, CY)
+    d = pts - (cx, cy)
     r = np.linalg.norm(d, axis=-1)
     rdn = r / fpx
     ru = rdn.copy()
@@ -203,30 +203,30 @@ def scan_then_refine(fun, lo, hi, n, tol, log=False):
     x = golden(fun, xs[i - 1], xs[i + 1], tol)
     return float(x), float(fun(x)), float(ident)
 
-def fit_fisheye(frames, feq0=None):
+def fit_fisheye(frames, feq0=None, cx=CX, cy=CY):
     frames = subsample(frames)
     # Cost in PIXELS (angular rms x feq): the raw angular cost is not
     # scale-invariant -- the same pixel error subtends a smaller angle at a
     # larger feq, so an unnormalised cost drifts to the bracket's top edge.
-    fun = lambda feq: bundle_rms(rays_fisheye(frames, feq)) * feq
+    fun = lambda feq: bundle_rms(rays_fisheye(frames, feq, cx, cy)) * feq
     # Data-bounded bracket, independent of the typed lens label. Lower bound:
     # no observed point may reach the 1.45 rad clip -- below that, clipped
     # points collapse onto a cone the bundle fits spuriously well, creating a
     # fake minimum at the bracket edge.
-    rmax = float(np.linalg.norm(frames - (CX, CY), axis=-1).max())
+    rmax = float(np.linalg.norm(frames - (cx, cy), axis=-1).max())
     lo = max(20.0, rmax / 1.40)
     hi = max(600.0, lo * 4.0)
     return scan_then_refine(fun, lo, hi, 17, 0.05, log=True)
 
-def fit_poly(frames, fpx, fit_k2=False):
+def fit_poly(frames, fpx, fit_k2=False, cx=CX, cy=CY):
     frames = subsample(frames)
-    fun1 = lambda k1: bundle_rms(rays_poly(frames, k1, 0.0, fpx))
+    fun1 = lambda k1: bundle_rms(rays_poly(frames, k1, 0.0, fpx, cx, cy))
     k1, r, ident = scan_then_refine(fun1, -0.8, 0.4, 13, 5e-4)
     if not fit_k2 or ident <= 0.0:
         return k1, 0.0, r, ident
-    fun2 = lambda k2: bundle_rms(rays_poly(frames, k1, k2, fpx))
+    fun2 = lambda k2: bundle_rms(rays_poly(frames, k1, k2, fpx, cx, cy))
     k2, _, _ = scan_then_refine(fun2, -0.3, 0.3, 7, 1e-3)
-    fun = lambda k1v: bundle_rms(rays_poly(frames, k1v, k2, fpx))
+    fun = lambda k1v: bundle_rms(rays_poly(frames, k1v, k2, fpx, cx, cy))
     k1 = golden(fun, k1 - 0.2, k1 + 0.2, 5e-4)
     return k1, k2, fun(k1), ident
 
@@ -305,6 +305,31 @@ def cmd_fit(a):
         emit("poly", a.fpx, k1=k1, k2=k2, rms_px=rms * a.fpx)
 
 # --------------------------------------------------------------------------
+# distortion-centre refinement (decentered clip-on lenses)
+# --------------------------------------------------------------------------
+def refine_center(frames, cost):
+    """cost(fr, dx, dy) -> pixel rms with the distortion centre at
+    (CX+dx, CY+dy), re-fitting the radial parameter internally -- the centre
+    and the radial term trade off along a valley, so a centre search with the
+    parameter FROZEN overshoots. Coordinate descent, two rounds, on a thinned
+    frame set (the centre needs far fewer frames than the parameter fit).
+    Returns (dx, dy, rms_px)."""
+    fr = subsample(frames, cap=48)
+    # cheap probe first: a centred lens must not pay for the full search.
+    # If no +/-8 px shift beats the centred cost by 3%, there is no offset
+    # worth chasing and the caller's acceptance gate would reject it anyway.
+    c0 = cost(fr, 0.0, 0.0)
+    probes = [cost(fr, 8.0, 0.0), cost(fr, -8.0, 0.0),
+              cost(fr, 0.0, 8.0), cost(fr, 0.0, -8.0)]
+    if min(probes) > 0.97 * c0:
+        return 0.0, 0.0, c0
+    dx = dy = 0.0
+    for _ in range(2):
+        dx = golden(lambda v: cost(fr, v, dy), -25.0, 25.0, 0.4)
+        dy = golden(lambda v: cost(fr, dx, v), -25.0, 25.0, 0.4)
+    return dx, dy, cost(fr, dx, dy)
+
+# --------------------------------------------------------------------------
 # programmatic entry point (gun_studio's Lens step drives this directly)
 # --------------------------------------------------------------------------
 def fit_from_frames(raw, fov):
@@ -313,7 +338,8 @@ def fit_from_frames(raw, fov):
        gates cmd_fit applies, so the GUI cannot bless a sweep the CLI would
        refuse. Both models are fitted and the lower-residual one wins."""
     out = dict(ok=False, why="", model=None, k1=0.0, k2=0.0,
-               fpx=fpx_for(fov), feq=0.0, rms_px=0.0, ident=0.0, coverage=0.0)
+               fpx=fpx_for(fov), feq=0.0, rms_px=0.0, ident=0.0, coverage=0.0,
+               lcx=0.0, lcy=0.0)
     raw = np.asarray(raw, float)
     if len(raw) < 30:
         out["why"] = "only %d usable 4-LED frames -- sweep longer" % len(raw)
@@ -363,7 +389,40 @@ def fit_from_frames(raw, fov):
     if fisheye_ok: cand.append(("fisheye", rms_f, id_f))
     if poly_ok:    cand.append(("poly", rms_p * fpx, id_p))
     model, rms_px, ident = min(cand, key=lambda c: c[1])
-    out.update(ok=True, model=model, rms_px=rms_px, ident=ident)
+    # Decentered-lens refinement: both models are radially symmetric, but a
+    # clip-on lens that is not coaxial has its distortion centre off the frame
+    # centre, which leaves a one-sided residual. Fit the centre with the model
+    # parameters fixed, then refit the parameters at the found centre. Accept
+    # only a clear improvement -- a marginal one is the search fitting noise.
+    lcx = lcy = 0.0
+    # Search cost: coarse on purpose (few frames, few bundle iterations, a
+    # loose inner re-fit) -- it only has to RANK candidate centres; the final
+    # parameters are refit at full precision afterwards.
+    if model == "fisheye":
+        def cost(fr, dx, dy):
+            f = golden(lambda v: bundle_rms(rays_fisheye(fr, v, CX + dx, CY + dy),
+                                            iters=6) * v,
+                       feq * 0.8, feq * 1.25, feq * 0.02)
+            return bundle_rms(rays_fisheye(fr, f, CX + dx, CY + dy), iters=6) * f
+    else:
+        def cost(fr, dx, dy):
+            a = golden(lambda v: bundle_rms(rays_poly(fr, v, k2, fpx, CX + dx, CY + dy),
+                                            iters=6),
+                       k1 - 0.15, k1 + 0.15, 5e-3)
+            return bundle_rms(rays_poly(fr, a, k2, fpx, CX + dx, CY + dy),
+                              iters=6) * fpx
+    dx, dy, rms_c = refine_center(frames, cost)
+    if rms_c < 0.95 * rms_px and max(abs(dx), abs(dy)) >= 0.5:
+        # full-precision refit of the radial parameters at the found centre
+        lcx, lcy = dx, dy
+        if model == "fisheye":
+            feq, rms_new, _ = fit_fisheye(frames, cx=CX + dx, cy=CY + dy)
+        else:
+            k1, k2, rms_p2, _ = fit_poly(frames, fpx, cx=CX + dx, cy=CY + dy)
+            rms_new = rms_p2 * fpx
+        rms_px = min(rms_new, rms_px)
+    out.update(ok=True, model=model, rms_px=rms_px, ident=ident,
+               lcx=lcx, lcy=lcy)
     if model == "fisheye":
         out["feq"] = feq
         out["fpx"] = feq          # centre-matched output pinhole
@@ -377,10 +436,15 @@ def tune_line(r):
     if r["model"] == "none":
         return "lens:0"
     assert r["fpx"] > 1.0, "refusing to emit a degenerate output focal"
+    # distortion-centre offset in tenths; always sent so a re-fit at zero
+    # clears any previously stored offset
+    cen = ",lcxu:%d,lcyu:%d" % (round(r.get("lcx", 0.0) * 10),
+                                round(r.get("lcy", 0.0) * 10))
     if r["model"] == "fisheye":
-        return "lens:2,lfeq:%d,lfpx:%d" % (round(r["feq"] * 10), round(r["fpx"] * 10))
-    return "lens:1,lk1u:%d,lk2u:%d,lfpx:%d" % (
-        round(r["k1"] * 1e6), round(r["k2"] * 1e6), round(r["fpx"] * 10))
+        return "lens:2,lfeq:%d,lfpx:%d%s" % (
+            round(r["feq"] * 10), round(r["fpx"] * 10), cen)
+    return "lens:1,lk1u:%d,lk2u:%d,lfpx:%d%s" % (
+        round(r["k1"] * 1e6), round(r["k2"] * 1e6), round(r["fpx"] * 10), cen)
 
 
 def spec_fisheye(fov):
@@ -501,6 +565,24 @@ def cmd_selftest(_a):
                          + _rng.normal(0, 0.5, _raw.shape), 160)
     print(f"frames-api: tiny-quad sweep refused ({not r4['ok']}): {r4['why'][:55]}")
     ok &= (not r4["ok"]) and "stand closer" in r4["why"]
+    # decentered lens: the centre must be recovered, and a CENTRED lens must
+    # not grow a phantom offset (the probe gate). Pinhole synth + forward
+    # distortion about a shifted centre = the poly model, decentered.
+    _rp = _synth("poly", n=260, k1=0.0, fpx=84.0, noise=0.0)
+    _c = np.array([CX + 3.0, CY - 2.0])
+    _v = _rp - _c
+    _rn = np.linalg.norm(_v, axis=-1, keepdims=True) / 84.0
+    _dec = _c + _v * (1.0 - 0.30 * _rn * _rn)
+    _dec = _dec + np.random.default_rng(11).normal(0, 0.3, _dec.shape)
+    r5 = fit_from_frames(_dec, 110)
+    print(f"frames-api: decentered lens -> lcx={r5['lcx']:.1f} lcy={r5['lcy']:.1f} "
+          f"(true +3.0, -2.0) k1={r5['k1']:.3f} rms={r5['rms_px']:.2f}px")
+    ok &= r5["ok"] and abs(r5["lcx"] - 3.0) < 2.0 and abs(r5["lcy"] + 2.0) < 2.0
+    ok &= "lcxu:" in tune_line(r5)
+    r6 = fit_from_frames(_synth("poly", n=260, k1=-0.30, fpx=84.0), 110)
+    print(f"frames-api: centred lens -> lcx={r6['lcx']:.1f} lcy={r6['lcy']:.1f} "
+          f"(must stay ~0)")
+    ok &= r6["ok"] and abs(r6["lcx"]) < 1.0 and abs(r6["lcy"]) < 1.0
     # the 180-deg degenerate: preset must never emit fpx=0
     sp = spec_fisheye(180)
     print(f"spec 180deg: feq={sp['feq']:.1f} fpx={sp['fpx']:.1f} (fpx=0 was the bug)")

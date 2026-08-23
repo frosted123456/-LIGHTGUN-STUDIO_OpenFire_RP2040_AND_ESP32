@@ -61,10 +61,13 @@
  
  // Sets up the environment
  void setup() {
-@@ -143,6 +197,17 @@
-     // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
-     startIrCamTimer(209);
+@@ -141,7 +195,18 @@ void setup() {
+     #endif // LED_ENABLE
  
+     // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
+-    startIrCamTimer(209);
++    startIrCamTimer(420);
++
 +#ifdef USE_AIM_PIPELINE
 +    aim_runtime_begin();
 +    wiicam_aim_begin();
@@ -75,11 +78,10 @@
 +    wiicam_set_reply_sink(aim_reply_sink);
 +    wiicam_set_line_sink(aim_line_sink);
 +#endif
-+
+ 
      FW_Common::OpenFIREper.source(OF_Prefs::profiles[OF_Prefs::currentProfile].adjX,
                                    OF_Prefs::profiles[OF_Prefs::currentProfile].adjY);
-     FW_Common::OpenFIREper.deinit(0);
-@@ -165,6 +230,14 @@
+@@ -165,6 +230,14 @@ void setup() {
          #endif // USES_DISPLAY
  
          while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
@@ -94,7 +96,7 @@
              // Check and process serial commands, in case user needs to change EEPROM settings.
              if(Serial.available())
                  OF_Serial::SerialProcessingDocked();
-@@ -210,7 +283,12 @@
+@@ -210,7 +283,12 @@ void setup() {
          // skip cali if we're prematurely set to run from the above loop
          // (i.e. cal'd from Desktop)
          if(FW_Common::gunMode != FW_Const::GunMode_Run)
@@ -107,7 +109,7 @@
      } else {
          // this will turn off the DotStar/RGB LED and ensure proper transition to Run
          FW_Common::SetMode(FW_Const::GunMode_Run);
-@@ -272,6 +350,12 @@
+@@ -272,6 +350,12 @@ void loop1()
          // All buttons' outputs except for the trigger are processed here.
          FW_Common::buttons.Poll(0);
  
@@ -120,7 +122,7 @@
          #ifdef USES_TEMP
              if(OF_Prefs::pins[OF_Const::tempPin] > -1)
                  OF_FFB::TemperatureUpdate();
-@@ -292,6 +376,9 @@
+@@ -292,6 +376,9 @@ void loop1()
              FW_Common::buttons.SendReports();
          }
  
@@ -130,7 +132,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -369,6 +456,9 @@
+@@ -369,6 +456,9 @@ void loop()
      }
  
      #ifdef MAMEHOOKER
@@ -140,7 +142,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
      #endif // MAMEHOOKER
  
-@@ -648,6 +738,10 @@
+@@ -648,6 +738,10 @@ void ExecRunMode()
      #endif // ARDUINO_ARCH_RP2040 && DUAL_CORE
  
      for(;;) {
@@ -151,7 +153,7 @@
          // Setting the state of our toggles, if used.
          // Only sets these values if the switches are mapped to valid pins.
          #ifdef USES_SWITCHES
-@@ -723,6 +817,11 @@
+@@ -723,6 +817,11 @@ void ExecRunMode()
  
          FW_Common::buttons.Poll(0);
  
@@ -163,7 +165,7 @@
          // For processing the trigger specifically.
          // (FW_Common::buttons.debounced is a binary variable intended to be read 1 bit at a time,
          // with the 0'th point == rightmost == decimal 1 == trigger, 3 = start, 4 = select)
-@@ -739,6 +838,9 @@
+@@ -739,6 +838,9 @@ void ExecRunMode()
          }
  
          // Run through serial receive buffer once this run, if it has contents.

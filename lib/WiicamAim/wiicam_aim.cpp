@@ -51,6 +51,7 @@ static float    s_lk1 = 0.0f, s_lk2 = 0.0f;
 // Un-mirrored by default; 'mirx' / 'miry' keys override for other modules.
 static uint8_t  s_mirx = 1, s_miry = 0;
 static float    s_lfpx = 184.7f, s_lfeq = 90.0f;
+static float    s_lcx = 0.0f, s_lcy = 0.0f;   // distortion-centre offset, px
 static uint64_t s_prev_us = 0;
 
 // Duplicate-report cache. The caller polls at loop rate but the wiicam only
@@ -71,10 +72,13 @@ void wiicam_aim_begin(void)
     if (aim_lead_load(&lead)) s_lead_ms = (float)lead;
     int smooth = 0;
     if (aim_smooth_load(&smooth)) aim_smooth_set(smooth);
+    int dead = 0;
+    if (aim_dead_load(&dead)) aim_dead_set(dead);
     aim_lens_t ls;
     if (aim_lens_load(&ls)) {
         s_lens = (uint8_t)ls.model;
         s_lk1 = ls.k1; s_lk2 = ls.k2; s_lfpx = ls.fpx; s_lfeq = ls.feq;
+        s_lcx = ls.cx; s_lcy = ls.cy;
     }
     s_prev_us = 0;
     s_cache_seen = 0xFFFFFFFFu;
@@ -85,7 +89,8 @@ void wiicam_aim_begin(void)
 static void lens_undistort(float* px, float* py)
 {
     if (!s_lens) return;
-    const float cx = WIICAM_NORM_W * 0.5f, cy = WIICAM_NORM_H * 0.5f;
+    const float cx = WIICAM_NORM_W * 0.5f + s_lcx;
+    const float cy = WIICAM_NORM_H * 0.5f + s_lcy;
     const float dx = *px - cx, dy = *py - cy;
     const float rd = sqrtf(dx*dx + dy*dy);
     if (rd < 1e-3f) return;
@@ -203,29 +208,34 @@ bool wiicam_cam_command(const char* line)
     if (!strncmp(line, "camsave", 7)) {
         aim_lead_store((int)s_lead_ms);
         aim_smooth_store(aim_smooth_get());
+        aim_dead_store(aim_dead_get());
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
-        aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq };
+        aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
+                          s_lcx, s_lcy };
         bool lens_ok = true;
         if (ls.model == 0) aim_lens_clear();
         else               lens_ok = aim_lens_store(&ls);
-        reply(lens_ok ? "CAM: saved lead=%dms smooth=%d lens=%d (sens lives in the OpenFIRE profile)\n"
-                      : "CAM: SAVE FAILED lead=%dms smooth=%d lens=%d\n",
-              (int)s_lead_ms, aim_smooth_get(), (int)s_lens);
+        reply(lens_ok ? "CAM: saved lead=%dms smooth=%d dead=%d lens=%d (sens lives in the OpenFIRE profile)\n"
+                      : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d lens=%d\n",
+              (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), (int)s_lens);
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
         aim_lens_clear();
         s_lens = 0; s_lead_ms = 0.0f;
+        s_lcx = 0.0f; s_lcy = 0.0f;
         reply("CAM: lens + lead cleared\n");
         return true;
     }
     if (!strncmp(line, "cam?", 4)) {
         reply("CAM: board=rp2040-wiicam sens=%d mirx=%d miry=%d lead=%d "
-              "smooth=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d res=%u dash=%u\n",
+              "smooth=%d dead=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d "
+              "lcxu=%d lcyu=%d res=%u dash=%u\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
-              (int)s_lead_ms, aim_smooth_get(),
+              (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
               (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
+              (int)(s_lcx*10.0f), (int)(s_lcy*10.0f),
               (unsigned)s_res, (unsigned)s_dash);
         return true;
     }
@@ -251,7 +261,16 @@ bool wiicam_cam_command(const char* line)
         else if (!strcmp(key, "lk2u")) { s_lk2 = (float)val * 1e-6f; }
         else if (!strcmp(key, "lfpx")) { if (val > 0) s_lfpx = (float)val / 10.0f; }
         else if (!strcmp(key, "lfeq")) { if (val > 0) s_lfeq = (float)val / 10.0f; }
+        else if (!strcmp(key, "lcxu")) { float v = (float)val / 10.0f;
+                                         if (v > 30.0f) v = 30.0f;
+                                         if (v < -30.0f) v = -30.0f;
+                                         s_lcx = v; }
+        else if (!strcmp(key, "lcyu")) { float v = (float)val / 10.0f;
+                                         if (v > 30.0f) v = 30.0f;
+                                         if (v < -30.0f) v = -30.0f;
+                                         s_lcy = v; }
         else if (!strcmp(key, "smooth")) { aim_smooth_set(val); }
+        else if (!strcmp(key, "dead"))   { aim_dead_set(val); }
         else if (!strcmp(key, "sens")) { if (s_sens_set && val >= 0 && val <= 2) s_sens_set(val); }
         else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); quad_reset(0); }
         else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); quad_reset(0); }
