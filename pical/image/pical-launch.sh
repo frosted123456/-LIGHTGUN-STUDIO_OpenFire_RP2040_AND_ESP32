@@ -21,6 +21,8 @@ log() { echo "$*" | tee -a "$LOG"; }
     echo "user:    $(id -un) ($(id -u))"
     echo "python:  $(python3 -V 2>&1)"
     echo "drm:     $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
+    echo "egl:     $(ls /usr/lib/*/libEGL.so.1 /usr/lib/*/dri/*_dri.so 2>/dev/null \
+                     | head -4 | tr '\n' ' ')"
     echo "serial:  $(ls /dev/ttyACM* /dev/ttyUSB* /dev/lightgun 2>/dev/null | tr '\n' ' ')"
 } > "$LOG" 2>&1
 
@@ -34,9 +36,10 @@ python3 -c "import pygame, numpy, serial" >> "$LOG" 2>&1 || {
     exit 1
 }
 
-# kmsdrm is the normal path on a Pi; the rest are fallbacks so a driver quirk
-# shows up as a working screen rather than a blank one.
-for DRV in kmsdrm fbcon directfb x11 ""; do
+# SDL2's video drivers are kmsdrm, wayland, x11, offscreen and dummy -- the
+# SDL1 names (fbcon, directfb) do not exist and only waste a retry. kmsdrm is
+# the normal path on a console-only Pi; the empty entry lets SDL choose.
+for DRV in kmsdrm wayland x11 ""; do
     if [ -n "$DRV" ]; then
         export SDL_VIDEODRIVER="$DRV"
         log "-- trying SDL video driver: $DRV"
@@ -56,4 +59,8 @@ done
 
 log "!! no SDL video driver worked. The full log is on this stick at"
 log "!! pical/last-run.log -- read it on any PC."
+if ! ls /usr/lib/*/libEGL.so.1 >/dev/null 2>&1; then
+    log "!! libEGL is missing: this image was built without the Mesa stack,"
+    log "!! which is what kmsdrm draws through. Rebuild with a newer image."
+fi
 exit 1

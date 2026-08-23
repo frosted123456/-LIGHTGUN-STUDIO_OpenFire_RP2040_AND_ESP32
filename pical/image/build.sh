@@ -203,8 +203,13 @@ cp /etc/resolv.conf /mnt/pical-root/etc/resolv.conf
 chroot /mnt/pical-root /bin/bash -eux <<'CHROOT'
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
+# SDL2's kmsdrm backend draws through EGL/GBM on Mesa. Those are
+# RECOMMENDED, not depended on, by the SDL package -- with
+# --no-install-recommends they are absent and pygame fails at set_mode with
+# "EGL not initialized", which looks like a pygame fault and is not one.
 apt-get install -y --no-install-recommends \
-    python3-pygame python3-numpy python3-serial
+    python3-pygame python3-numpy python3-serial \
+    libgl1-mesa-dri libegl1 libgles2 libgbm1 libdrm2
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 # A named account exists for diagnostics over SSH or a second console; the

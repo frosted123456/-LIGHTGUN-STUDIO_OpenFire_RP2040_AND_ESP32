@@ -1249,11 +1249,15 @@ class App:
 
 def run(stances=3, windowed=False, port=None):
     pygame.init()
-    pygame.mouse.set_visible(windowed)
     flags = 0 if windowed else pygame.FULLSCREEN
     size = (1280, 720) if windowed else (0, 0)
+    # set_mode FIRST: the mouse and caption calls need an initialised video
+    # system, and calling them earlier turns a real driver error into a
+    # misleading "video system not initialized".
     surf = pygame.display.set_mode(size, flags)
+    pygame.mouse.set_visible(windowed)
     pygame.display.set_caption("Lightgun calibration")
+    print("pical: SDL video driver in use: %s" % pygame.display.get_driver())
     app = App(surf, stances)
     if port is None:
         app.connect()
