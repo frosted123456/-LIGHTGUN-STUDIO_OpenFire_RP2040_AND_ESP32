@@ -1,19 +1,28 @@
 #!/bin/sh
 # Starts the calibration app on the console, and leaves evidence behind.
 #
-# Everything it prints is copied to the FAT boot partition, so when the TV
-# shows nothing useful the stick can be read on any PC. SDL is tried on each
-# video driver in turn rather than being forced onto one, because which of
-# them works depends on the Pi model and the display.
+# Two things make this less trivial than "the boot text already shows up".
+# The boot text is the kernel's framebuffer console, which is not something an
+# application can draw into. To put graphics on a console-only system an app
+# has to drive DRM/KMS itself -- pick the card, pick the connector, set a
+# mode, allocate buffers through GBM and render through EGL. A desktop
+# normally does all of that on the app's behalf, so the easy path is to run a
+# minimal X server and let it do that job. kmsdrm is tried after it.
+#
+# Every line is written to the FAT boot partition AND synced, because a stick
+# pulled out of a running Pi otherwise keeps an empty file: the writes are
+# still sitting in the page cache.
 APP=/boot/firmware/pical
 LOG="$APP/last-run.log"
 export SDL_AUDIODRIVER=dummy
 export PICAL_OUT="$APP/calib_out"
 export PYTHONUNBUFFERED=1
 
-log() { echo "$*" | tee -a "$LOG"; }
+log() {
+    echo "$*" | tee -a "$LOG"
+    sync
+}
 
-# A fresh log per boot, with enough context to place the failure.
 {
     echo "=== pical $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
     echo "model:   $(tr -d '\0' < /proc/device-tree/model 2>/dev/null)"
@@ -21,8 +30,8 @@ log() { echo "$*" | tee -a "$LOG"; }
     echo "user:    $(id -un) ($(id -u))"
     echo "python:  $(python3 -V 2>&1)"
     echo "drm:     $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
-    echo "egl:     $(ls /usr/lib/*/libEGL.so.1 /usr/lib/*/dri/*_dri.so 2>/dev/null \
-                     | head -4 | tr '\n' ' ')"
+    echo "egl:     $(ls /usr/lib/*/libEGL.so.1 2>/dev/null | tr '\n' ' ')"
+    echo "xorg:    $(command -v Xorg xinit 2>/dev/null | tr '\n' ' ')"
     echo "connectors:"
     for st in /sys/class/drm/card*-*/status; do
         [ -e "$st" ] || continue
@@ -30,6 +39,7 @@ log() { echo "$*" | tee -a "$LOG"; }
     done
     echo "serial:  $(ls /dev/ttyACM* /dev/ttyUSB* /dev/lightgun 2>/dev/null | tr '\n' ' ')"
 } > "$LOG" 2>&1
+sync
 
 if [ ! -f "$APP/pical.py" ]; then
     log "!! $APP/pical.py is missing -- the stick was not built correctly"
@@ -41,65 +51,63 @@ python3 -c "import pygame, numpy, serial" >> "$LOG" 2>&1 || {
     exit 1
 }
 
-# SDL2's video drivers are kmsdrm, wayland, x11, offscreen and dummy -- the
-# SDL1 names (fbcon, directfb) do not exist and only waste a retry. kmsdrm is
-# the normal path on a console-only Pi; the empty entry lets SDL choose.
-# The app picks the DRM card with a connected output by itself. If that
-# still draws nothing, walk the device indexes explicitly before giving up
-# on kmsdrm: on a Pi one card is the v3d render node with no screen on it.
-for IDX in "" 0 1 2; do
-    [ -n "$IDX" ] || continue
-    [ -e "/dev/dri/card$IDX" ] || continue
-    KMS_IDXS="${KMS_IDXS:-} $IDX"
-done
-
-try_run() {
+run_py() {
     python3 "$APP/pical.py" "$@" >> "$LOG" 2>&1
+    RC=$?
+    sync
+    return $RC
 }
 
-for DRV in kmsdrm wayland x11 ""; do
+# ---- 1: a minimal X server, the most reliable path on a Pi ---------------
+if command -v xinit >/dev/null 2>&1 && [ -z "${PICAL_NO_X:-}" ]; then
+    log "-- starting the X server"
+    SDL_VIDEODRIVER=x11 xinit /usr/bin/python3 "$APP/pical.py" "$@" \
+        -- :0 vt1 -keeptty -nocursor >> "$LOG" 2>&1
+    RC=$?
+    sync
+    if [ "$RC" = "0" ]; then
+        log "-- app exited normally (X11)"
+        exit 0
+    fi
+    log "-- X path failed (exit $RC); last lines:"
+    tail -n 8 "$LOG" | sed 's/^/     /'
+    sync
+fi
+
+# ---- 2: straight to the hardware through DRM/KMS -------------------------
+# One of a Pi's DRM cards is the v3d render node with no screen attached;
+# the app picks the connected one by itself, and these are the fallbacks.
+for IDX in auto 0 1 2; do
+    if [ "$IDX" = "auto" ]; then
+        unset SDL_KMSDRM_DEVICE_INDEX
+        log "-- kmsdrm, letting the app choose the card"
+    else
+        [ -e "/dev/dri/card$IDX" ] || continue
+        export SDL_KMSDRM_DEVICE_INDEX="$IDX"
+        log "-- kmsdrm, forcing device index $IDX"
+    fi
+    SDL_VIDEODRIVER=kmsdrm run_py "$@" && { log "-- app exited normally"; exit 0; }
+    log "   failed (exit $RC)"
+done
+unset SDL_KMSDRM_DEVICE_INDEX
+
+# ---- 3: whatever SDL can find on its own ---------------------------------
+for DRV in wayland ""; do
     if [ -n "$DRV" ]; then
         export SDL_VIDEODRIVER="$DRV"
         log "-- trying SDL video driver: $DRV"
     else
         unset SDL_VIDEODRIVER
-        log "-- trying SDL's own choice of video driver"
+        log "-- letting SDL choose"
     fi
-    if [ "$DRV" = "kmsdrm" ]; then
-        # first the card the app chose, then each one in turn
-        for IDX in auto $KMS_IDXS; do
-            if [ "$IDX" = "auto" ]; then
-                unset SDL_KMSDRM_DEVICE_INDEX
-                log "   kmsdrm: letting the app choose the card"
-            else
-                export SDL_KMSDRM_DEVICE_INDEX="$IDX"
-                log "   kmsdrm: forcing device index $IDX"
-            fi
-            try_run "$@"
-            rc=$?
-            if [ "$rc" = "0" ]; then
-                log "-- app exited normally"
-                exit 0
-            fi
-            log "   that index failed (exit $rc)"
-        done
-        unset SDL_KMSDRM_DEVICE_INDEX
-    else
-        try_run "$@"
-        rc=$?
-        if [ "$rc" = "0" ]; then
-            log "-- app exited normally"
-            exit 0
-        fi
-    fi
-    log "-- that driver failed (exit $rc); last lines:"
-    tail -n 6 "$LOG" | sed 's/^/     /'
+    run_py "$@" && { log "-- app exited normally"; exit 0; }
+    log "   failed (exit $RC)"
 done
 
-log "!! no SDL video driver worked. The full log is on this stick at"
+log "!! nothing could open a display. The full log is on this stick at"
 log "!! pical/last-run.log -- read it on any PC."
 if ! ls /usr/lib/*/libEGL.so.1 >/dev/null 2>&1; then
-    log "!! libEGL is missing: this image was built without the Mesa stack,"
-    log "!! which is what kmsdrm draws through. Rebuild with a newer image."
+    log "!! libEGL is missing: the image was built without the Mesa stack."
 fi
+sync
 exit 1

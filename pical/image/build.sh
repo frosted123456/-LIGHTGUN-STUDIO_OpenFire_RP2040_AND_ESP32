@@ -209,7 +209,19 @@ apt-get update
 # "EGL not initialized", which looks like a pygame fault and is not one.
 apt-get install -y --no-install-recommends \
     python3-pygame python3-numpy python3-serial \
-    libgl1-mesa-dri libegl1 libgles2 libgbm1 libdrm2
+    libgl1-mesa-dri libegl1 libgles2 libgbm1 libdrm2 \
+    xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev \
+    xinit x11-xserver-utils
+
+# A minimal X server is the reliable way to get graphics onto a console-only
+# Pi: it does the DRM mastering, mode setting and input handling that SDL's
+# kmsdrm backend otherwise has to get right by itself. Allow it to start
+# without a seat, since the app runs from the tty1 login.
+mkdir -p /etc/X11
+cat > /etc/X11/Xwrapper.config <<'XWRAP'
+allowed_users=anybody
+needs_root_rights=yes
+XWRAP
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 # A named account exists for diagnostics over SSH or a second console; the
@@ -293,6 +305,9 @@ if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
         2>/dev/null || die "tty1 autologin was not installed"
     grep -q pical-launch /mnt/pical-root/root/.bash_profile \
         || die "the console does not launch the app"
+    [ -x /mnt/pical-root/usr/bin/xinit ] || die "xinit did not install"
+    grep -q "allowed_users=anybody" /mnt/pical-root/etc/X11/Xwrapper.config \
+        || die "X is not allowed to start from the console"
 fi
 if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
     [ -d /mnt/pical-root/usr/lib/python3/dist-packages/pygame ] \
