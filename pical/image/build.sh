@@ -28,9 +28,11 @@ for t in wget xz losetup sfdisk parted resize2fs e2fsck chroot; do need "$t"; do
 [ "$(id -u)" = "0" ] || die "run me as root (sudo)"
 
 LOOP=""
+CHROOT_MOUNTED=0
 cleanup() {
     set +e
-    umount -R /mnt/pical-root 2>/dev/null
+    chroot_mounts_down /mnt/pical-root
+    umount -R /mnt/pical-root 2>/dev/null || umount -R -l /mnt/pical-root 2>/dev/null
     [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
 }
 trap cleanup EXIT
@@ -55,6 +57,23 @@ wait_part() {
         [ -b "$1" ] && return 0
     fi
     die "partition node $1 never appeared"
+}
+
+# The chroot's /sys is bind-mounted recursively, which drags in cgroup2. Those
+# submounts refuse a plain umount ("target is busy"), so they are made rslave
+# on the way in and detached lazily on the way out.
+chroot_mounts_up() {
+    mount -t proc /proc "$1/proc"
+    mount --rbind /sys "$1/sys";  mount --make-rslave "$1/sys"
+    mount --rbind /dev "$1/dev";  mount --make-rslave "$1/dev"
+    CHROOT_MOUNTED=1
+}
+chroot_mounts_down() {
+    [ "${CHROOT_MOUNTED:-0}" = "1" ] || return 0
+    umount -R -l "$1/dev"  2>/dev/null || true
+    umount -R -l "$1/sys"  2>/dev/null || true
+    umount -R -l "$1/proc" 2>/dev/null || true
+    CHROOT_MOUNTED=0
 }
 
 attach() {
@@ -136,9 +155,7 @@ say "SKIPPING the chroot package install (PICAL_SKIP_CHROOT=1)"
 else
 say "installing python3-pygame, numpy and pyserial into the image"
 cp /usr/bin/qemu-aarch64-static /mnt/pical-root/usr/bin/ 2>/dev/null || true
-mount -t proc /proc /mnt/pical-root/proc
-mount --rbind /sys  /mnt/pical-root/sys
-mount --rbind /dev  /mnt/pical-root/dev
+chroot_mounts_up /mnt/pical-root
 cp /etc/resolv.conf /mnt/pical-root/etc/resolv.conf
 
 chroot /mnt/pical-root /bin/bash -eux <<'CHROOT'
@@ -154,11 +171,12 @@ systemctl disable getty@tty1.service || true
 CHROOT
 
 rm -f /mnt/pical-root/usr/bin/qemu-aarch64-static
+chroot_mounts_down /mnt/pical-root
 fi
 
 # ------------------------------------------------------------------ shrink
 sync
-umount -R /mnt/pical-root
+umount -R /mnt/pical-root 2>/dev/null || umount -R -l /mnt/pical-root
 e2fsck -pf "${LOOP}p2" || true
 say "shrinking the filesystem back to its contents"
 MINB="$(resize2fs -P "${LOOP}p2" | awk '{print $NF}')"
