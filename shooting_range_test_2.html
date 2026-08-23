@@ -1,0 +1,676 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Lightgun Range</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 system-ui,sans-serif; background:#0d0f12; color:#ddd;
+         height:100vh; display:flex; flex-direction:column; overflow:hidden; user-select:none;
+         cursor:none; }
+  #bar { padding:8px 14px; background:#15181d; border-bottom:1px solid #2a2f37;
+         display:flex; gap:20px; align-items:baseline; flex-wrap:wrap; min-height:52px; }
+  .v { font-size:22px; font-weight:700; color:#fff; font-variant-numeric:tabular-nums; }
+  .v.good { color:#6fe38a; } .v.mid { color:#f0c674; } .v.bad { color:#e07a5f; }
+  .l { font-size:10px; color:#8a919c; text-transform:uppercase; letter-spacing:.07em; }
+  .grp { display:flex; gap:20px; padding-right:20px; border-right:1px solid #2a2f37; }
+  .grp:last-child { border-right:none; }
+  .grp.sys .v { font-size:16px; color:#7f8894; }
+  #bar, #ctl { cursor:default; }
+  #ctl { padding:6px 14px; background:#101317; display:flex; gap:6px; align-items:center;
+         font-size:12px; color:#9aa2ad; flex-wrap:wrap; }
+  button { background:#1d232b; color:#cfd6df; border:1px solid #333b46; border-radius:5px;
+           padding:5px 12px; font:12px system-ui; cursor:pointer; }
+  button:hover { border-color:#4a5563; }
+  button.on { background:#0f4d5c; border-color:#1c8aa8; color:#fff; }
+  .sep { width:1px; height:20px; background:#2a2f37; margin:0 6px; }
+  canvas { flex:1; touch-action:none; display:block; }
+  #hint { position:fixed; bottom:14px; left:50%; transform:translateX(-50%);
+          color:#7a8290; font-size:13px; pointer-events:none; text-align:center;
+          background:rgba(13,15,18,.75); padding:6px 16px; border-radius:20px; }
+  #card { position:fixed; inset:0; display:none; align-items:center; justify-content:center;
+          background:rgba(8,9,11,.82); pointer-events:none; }
+  #cardIn { background:#15181d; border:1px solid #2a2f37; border-radius:12px; padding:26px 34px;
+            min-width:340px; text-align:center; }
+  #cardIn h2 { margin:0 0 4px; font-size:15px; color:#8a919c; font-weight:600;
+               text-transform:uppercase; letter-spacing:.1em; }
+  #grade { font-size:64px; font-weight:800; line-height:1; margin:10px 0 14px; }
+  .row { display:flex; justify-content:space-between; gap:26px; padding:5px 0;
+         border-top:1px solid #232830; font-variant-numeric:tabular-nums; }
+  .row span:first-child { color:#8a919c; }
+  .row span:last-child { color:#fff; font-weight:600; }
+  #cardFoot { margin-top:14px; color:#6a727e; font-size:11px; }
+</style>
+</head>
+<body>
+<div id="bar"></div>
+<div id="ctl">
+  <button id="mRange" class="on">Range</button>
+  <button id="mSweep">Sweep</button>
+  <button id="mTrack">Track</button>
+  <button id="mSteady">Steady</button>
+  <button id="mRush">Rush</button>
+  <div class="sep"></div>
+  <button id="spdBtn">Speed: Fast</button>
+  <button id="szBtn">Large</button>
+  <button id="trailBtn" class="on">Trail: on</button>
+  <button id="soundBtn" class="on">Sound: on</button>
+  <button id="resetBtn">Reset</button>
+  <span style="margin-left:auto">F11 fullscreen &nbsp;·&nbsp; trigger = shoot &nbsp;·&nbsp; SPACE = restart run</span>
+</div>
+<canvas id="cv"></canvas>
+<div id="hint">shoot anywhere to begin</div>
+<div id="card"><div id="cardIn">
+  <h2 id="cardTitle">run complete</h2>
+  <div id="grade">A</div>
+  <div id="cardRows"></div>
+  <div id="cardFoot">SPACE or shoot to run again</div>
+</div></div>
+
+<script>
+'use strict';
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+function fit(){ const r = cv.getBoundingClientRect(); cv.width = r.width; cv.height = r.height; }
+addEventListener('resize', fit);
+function rect(){ return cv.getBoundingClientRect(); }
+
+// ---------------------------------------------------------------------------
+// CURSOR SAMPLING
+// Everything this page measures is derived from the cursor stream, never from
+// where a shot landed. That is the whole point: a shaky trigger finger must not
+// change what the numbers say about the gun.
+// ---------------------------------------------------------------------------
+const SR = { x:0, y:0, has:false };      // latest cursor, canvas coords
+let samples = [];                        // {x,y,t} recent history, ~2s
+let trailPts = [];
+let cevs = 0, lastT = 0, dts = [], gapCount = 0;
+let dispRate = 0, dispDtMax = 0, dispGaps = 0;
+
+function onSample(x, y, t) {
+  const b = rect();
+  SR.x = x - b.left; SR.y = y - b.top; SR.has = true;
+  samples.push({ x:SR.x, y:SR.y, t });
+  if (samples.length > 4000) samples.splice(0, samples.length - 4000);
+  if (trail) trailPts.push({ x:SR.x, y:SR.y, t });
+  cevs++;
+  if (lastT) { const dt = t - lastT; if (dt > 0.05) dts.push(dt); if (dt > 25) gapCount++; }
+  lastT = t;
+}
+// pointerrawupdate delivers un-coalesced samples where the browser supports it,
+// so the trail shows the real update rate instead of one point per frame.
+if ('onpointerrawupdate' in window) {
+  document.addEventListener('pointerrawupdate', e => {
+    for (const c of (e.getCoalescedEvents ? e.getCoalescedEvents() : [e])) onSample(c.clientX, c.clientY, c.timeStamp);
+  });
+} else {
+  document.addEventListener('pointermove', e => {
+    for (const c of (e.getCoalescedEvents ? e.getCoalescedEvents() : [e])) onSample(c.clientX, c.clientY, c.timeStamp);
+  });
+}
+setInterval(() => {
+  dispRate = cevs; dispDtMax = dts.length ? Math.max(...dts) : 0; dispGaps = gapCount;
+  cevs = 0; dts = []; gapCount = 0;
+}, 1000);
+
+// ---------------------------------------------------------------------------
+// SOUND
+// ---------------------------------------------------------------------------
+let sound = true, AC = null;
+function beep(freq, dur, type='square', gain=0.06) {
+  if (!sound) return;
+  try {
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(gain, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + dur);
+  } catch(e) {}
+}
+
+// ---------------------------------------------------------------------------
+// MODES
+// ---------------------------------------------------------------------------
+const SIZES = { Medium: 46, Large: 72, Huge: 104 };
+// px/s. Fast is the default because a slow crosser hides exactly the lag this
+// is built to expose.
+const SPEEDS = { Slow: 340, Fast: 780, Insane: 1400 };
+let speedName = 'Fast';
+function SPD() { return SPEEDS[speedName]; }
+let sizeName = 'Large';
+let mode = 'range';
+let trail = true;
+let started = false;
+let holes = [], pops = [];
+
+const M = {};                            // per-mode state, reset by startRun()
+
+function R() { return SIZES[sizeName]; }
+function avg(a) { return a.length ? a.reduce((x,y)=>x+y,0)/a.length : 0; }
+
+function startRun() {
+  $('card').style.display = 'none';
+  holes = []; pops = []; trailPts = []; samples = [];
+  M.t0 = performance.now();
+  M.done = false;
+  if (mode === 'range')  startRange();
+  if (mode === 'sweep')  startSweep();
+  if (mode === 'track')  startTrack();
+  if (mode === 'steady') startSteady();
+  if (mode === 'rush')   startRush();
+  layoutBar();
+}
+
+// ---- RANGE: the fun one. Targets pop, you shoot them. ----------------------
+// Score rewards ACQUISITION SPEED, not ring precision, so a wobbly hand costs
+// you nothing as long as you get on target quickly.
+function startRange() {
+  M.target = null; M.score = 0; M.shots = 0; M.hits = 0;
+  M.acq = []; M.best = Infinity; M.combo = 0; M.bestCombo = 0;
+  M.left = 15;
+  spawnRange();
+  $('hint').textContent = '15 targets — get on target fast, ring does not matter';
+}
+function spawnRange() {
+  const r = R(), b = rect(), m = r + 24;
+  M.target = { x: m + Math.random()*(b.width - 2*m), y: m + Math.random()*(b.height - 2*m),
+               r, born: performance.now(), entered: 0 };
+}
+
+// ---- SWEEP: the snappiness test. -------------------------------------------
+// Two big targets, far apart. Shoot one, the other lights up, and the clock
+// runs on the CURSOR: how long to cross, how far it overshoots, how long to
+// settle. Where the shot lands is irrelevant to every number here.
+function startSweep() {
+  M.side = 0; M.swings = []; M.left = 10;
+  M.phase = 'wait';                        // wait | crossing
+  M.tStart = 0; M.over = 0; M.firstTouch = 0; M.settleAt = 0; M.dir = null;
+  placeSweep();
+  $('hint').textContent = '10 swings — shoot the lit target, then swing to the other';
+}
+function placeSweep() {
+  const b = rect(), r = R() * 1.15, pad = r + 40;
+  M.a = { x: pad, y: b.height*0.5, r };
+  M.b = { x: b.width - pad, y: b.height*0.5, r };
+}
+function sweepTarget() { return M.side === 0 ? M.a : M.b; }
+
+// ---- TRACK: pure following. No trigger at all. ------------------------------
+function startTrack() {
+  M.onFrames = 0; M.frames = 0; M.lags = []; M.worst = 0;
+  M.dur = 20000;
+  placeTrack();
+  $('hint').textContent = '20 seconds — just keep the cursor inside the ring, no shooting';
+}
+function placeTrack() {
+  const b = rect();
+  M.tk = { x: b.width*0.5, y: b.height*0.5, r: R()*1.1, ph1: Math.random()*6.28, ph2: Math.random()*6.28 };
+}
+
+// ---- STEADY: the noise floor. -----------------------------------------------
+// Reports two numbers on purpose. SWAY is everything -- your hand included.
+// JITTER is deviation from a 5-sample moving average, so slow hand motion falls
+// out of it and what is left is mostly the gun. A tremor moves SWAY, not JITTER.
+function startSteady() {
+  M.dot = null; M.cap = null; M.armed = 0; M.result = null;
+  placeSteady();
+  $('hint').textContent = 'hold the cursor on the dot — capture starts on its own';
+}
+function placeSteady() {
+  const b = rect();
+  M.dot = { x: b.width*0.5, y: b.height*0.5, r: 34 };
+}
+
+// ---- RUSH: fast crossers, and the only mode that measures LATENCY ----------
+// A target sprinting across the screen is where lag becomes visible: if the
+// cursor is behind the truth, every shot lands behind the target.
+//
+// The metric is the shot's offset from centre PROJECTED ON THE DIRECTION OF
+// TRAVEL, kept signed. That matters. Random error from a shaky hand is
+// symmetric, so it averages to zero over a run. Latency is not symmetric --
+// it puts the shot behind whichever way the target is going. Directions are
+// randomised precisely so a personal aiming bias ("I always pull left")
+// cancels too, while lag accumulates.
+//
+// Divide the mean lead error by the target speed and the answer is in
+// milliseconds: end-to-end latency, measured with the gun itself.
+function startRush() {
+  M.targets = []; M.hits = 0; M.shots = 0; M.escaped = 0;
+  M.leads = []; M.left = 18; M.spawned = 0; M.nextAt = 0;
+  $('hint').textContent = '18 crossers — shoot them before they leave. Negative lead = shooting behind.';
+}
+function spawnRush(now) {
+  const b = rect(), r = R() * 0.95, sp = SPD();
+  const horiz = Math.random() < 0.72;
+  const dirPos = Math.random() < 0.5;          // randomised so aim bias cancels
+  let x, y, vx, vy;
+  if (horiz) {
+    y = r + 40 + Math.random() * (b.height - 2*r - 80);
+    x = dirPos ? -r : b.width + r; vx = (dirPos ? 1 : -1) * sp; vy = 0;
+  } else {
+    x = r + 40 + Math.random() * (b.width - 2*r - 80);
+    y = dirPos ? -r : b.height + r; vy = (dirPos ? 1 : -1) * sp; vx = 0;
+  }
+  M.targets.push({ x, y, r, vx, vy, born: now });
+  M.spawned++;
+}
+function tickRush(now, dt) {
+  const b = rect();
+  if (M.spawned < M.left && now >= M.nextAt) {
+    spawnRush(now);
+    M.nextAt = now + Math.max(260, 900 - SPD()*0.35);
+  }
+  for (const t of M.targets) { t.x += t.vx*dt; t.y += t.vy*dt; }
+  const before = M.targets.length;
+  M.targets = M.targets.filter(t => t.x > -t.r*2 && t.x < b.width + t.r*2 &&
+                                    t.y > -t.r*2 && t.y < b.height + t.r*2);
+  M.escaped += before - M.targets.length;
+  for (const t of M.targets) {
+    // A motion streak, so you can see which way it is going and how fast.
+    const L = Math.hypot(t.vx, t.vy) || 1;
+    ctx.strokeStyle = 'rgba(224,69,69,.22)'; ctx.lineWidth = t.r*1.5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(t.x, t.y);
+    ctx.lineTo(t.x - t.vx/L*t.r*2.2, t.y - t.vy/L*t.r*2.2); ctx.stroke();
+    ring(t, now, true);
+  }
+  const lead = avg(M.leads);
+  setF('hit', `${M.hits}/${M.shots}`);
+  setF('lead', M.leads.length ? (lead>0?'+':'') + lead.toFixed(0)+' px' : '–',
+       M.leads.length ? (Math.abs(lead)<12?'good':Math.abs(lead)<30?'mid':'bad') : '');
+  setF('lat', M.leads.length ? (-lead / SPD() * 1000).toFixed(1)+' ms' : '–');
+  setF('left', Math.max(0, M.left - M.hits - M.escaped));
+  if (M.spawned >= M.left && M.targets.length === 0) finishRun();
+}
+
+// ---------------------------------------------------------------------------
+// SHOOTING
+// ---------------------------------------------------------------------------
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  const b = rect(), x = e.clientX - b.left, y = e.clientY - b.top;
+  if (y < 0) return;
+  if (!started) { started = true; startRun(); $('hint').textContent = ''; return; }
+  if (M.done) { startRun(); return; }
+  const now = performance.now();
+
+  if (mode === 'range') {
+    if (!M.target) return;
+    M.shots++;
+    const d = Math.hypot(x - M.target.x, y - M.target.y);
+    if (d <= M.target.r) {
+      M.hits++; M.combo++; if (M.combo > M.bestCombo) M.bestCombo = M.combo;
+      // Acquisition time = spawn -> cursor first inside the ring. Not shot time,
+      // so hesitating on the trigger does not pollute it.
+      const acq = (M.target.entered || now) - M.target.born;
+      M.acq.push(acq); if (acq < M.best) M.best = acq;
+      M.score += 100 + Math.max(0, Math.round((600 - acq) / 4)) + M.combo * 10;
+      holes.push({ x, y, t:now, hit:true });
+      pops.push({ x, y, t:now, txt:`${acq.toFixed(0)}ms  x${M.combo}`, col:'#6fe38a' });
+      beep(760 + M.combo*30, .09, 'square');
+      if (--M.left <= 0) return finishRun();
+      spawnRange();
+    } else {
+      M.combo = 0;
+      holes.push({ x, y, t:now, hit:false });
+      pops.push({ x, y, t:now, txt:'miss', col:'#e07a5f' });
+      beep(140, .12, 'sawtooth', .05);
+    }
+  }
+
+  else if (mode === 'rush') {
+    M.shots++;
+    let best = null, bd = 1e9;
+    for (const t of M.targets) { const d = Math.hypot(x-t.x, y-t.y); if (d < bd) { bd = d; best = t; } }
+    if (best && bd <= best.r) {
+      M.hits++;
+      const L = Math.hypot(best.vx, best.vy) || 1;
+      const lead = (x - best.x)*(best.vx/L) + (y - best.y)*(best.vy/L);
+      M.leads.push(lead);
+      pops.push({ x, y, t:now, txt:(lead>0?'+':'')+lead.toFixed(0)+' px', col: lead < -15 ? '#e0a05f' : '#6fe38a' });
+      holes.push({ x, y, t:now, hit:true });
+      M.targets = M.targets.filter(t => t !== best);
+      beep(820, .07, 'square');
+    } else {
+      holes.push({ x, y, t:now, hit:false });
+      pops.push({ x, y, t:now, txt:'miss', col:'#e07a5f' });
+      beep(140, .1, 'sawtooth', .05);
+    }
+  }
+
+  else if (mode === 'sweep') {
+    const t = sweepTarget();
+    if (Math.hypot(x - t.x, y - t.y) > t.r) { beep(140,.1,'sawtooth',.04); return; }
+    // Close the swing that ended here, then launch the next.
+    if (M.phase === 'crossing' && M.firstTouch) {
+      M.swings.push({ travel: M.firstTouch - M.tStart, over: Math.max(0, M.over),
+                      settle: (M.settledAt || now) - M.firstTouch });
+      beep(900, .09);
+      if (M.swings.length >= M.left) return finishRun();
+    } else beep(700, .07);
+    const prev = t; M.side ^= 1; const next = sweepTarget();
+    const dx = next.x - prev.x, dy = next.y - prev.y, L = Math.hypot(dx,dy) || 1;
+    M.dir = { x: dx/L, y: dy/L };
+    M.phase = 'crossing';
+    M.tStart = now; M.over = 0; M.firstTouch = 0; M.settleAt = 0; M.settledAt = 0;
+    holes.push({ x, y, t:now, hit:true });
+  }
+});
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); started = true; startRun(); }
+});
+
+// ---------------------------------------------------------------------------
+// RUN END + GRADE
+// ---------------------------------------------------------------------------
+function gradeOf(score) { return score >= 90 ? ['S','#8be9fd'] : score >= 75 ? ['A','#6fe38a']
+                               : score >= 55 ? ['B','#f0c674'] : score >= 35 ? ['C','#e0a05f'] : ['D','#e07a5f']; }
+function finishRun() {
+  M.done = true;
+  let rows = [], score = 0, title = '';
+  if (mode === 'range') {
+    const a = avg(M.acq);
+    score = Math.max(0, Math.min(100, 130 - a/6)) * 0.6 + (M.hits/Math.max(1,M.shots))*100*0.4;
+    title = 'range';
+    rows = [['score', M.score], ['avg acquire', a.toFixed(0)+' ms'],
+            ['best acquire', (M.best<Infinity?M.best.toFixed(0):'–')+' ms'],
+            ['hits', `${M.hits}/${M.shots}`], ['best combo', M.bestCombo]];
+  } else if (mode === 'sweep') {
+    const tr = avg(M.swings.map(s=>s.travel)), ov = avg(M.swings.map(s=>s.over)),
+          se = avg(M.swings.map(s=>s.settle));
+    score = Math.max(0, 100 - ov*1.6 - se/8);
+    title = 'sweep';
+    rows = [['swings', M.swings.length], ['avg travel', tr.toFixed(0)+' ms'],
+            ['avg overshoot', ov.toFixed(1)+' px'], ['avg settle', se.toFixed(0)+' ms'],
+            ['best swing', Math.min(...M.swings.map(s=>s.travel)).toFixed(0)+' ms']];
+  } else if (mode === 'track') {
+    const pct = 100*M.onFrames/Math.max(1,M.frames), lag = avg(M.lags);
+    score = pct*0.7 + Math.max(0, 100 - lag*1.2)*0.3;
+    title = 'track';
+    rows = [['time on target', pct.toFixed(1)+' %'], ['mean lag', lag.toFixed(1)+' px'],
+            ['worst lag', M.worst.toFixed(0)+' px']];
+  } else if (mode === 'rush') {
+    const lead = avg(M.leads), lat = -lead / SPD() * 1000;
+    score = Math.max(0, 100 - Math.abs(lead)*1.8) * 0.6 + (M.hits/Math.max(1,M.shots))*100*0.4;
+    title = 'rush @ ' + speedName.toLowerCase() + ' (' + SPD() + ' px/s)';
+    rows = [['hits', `${M.hits}/${M.shots}`], ['escaped', M.escaped],
+            ['mean lead error', (lead>0?'+':'')+lead.toFixed(1)+' px'],
+            ['implied latency', lat.toFixed(1)+' ms'],
+            ['spread', (M.leads.length>1 ? Math.sqrt(avg(M.leads.map(l=>(l-lead)**2))).toFixed(1) : '–')+' px'],
+            ['measurable up to', (R()*0.95/SPD()*1000).toFixed(0)+' ms']];
+  } else if (mode === 'steady') {
+    const r = M.result;
+    score = Math.max(0, 100 - r.jitter*22);
+    title = 'steady';
+    rows = [['jitter (gun)', r.jitter.toFixed(2)+' px rms'],
+            ['sway (you + gun)', r.sway.toFixed(1)+' px rms'],
+            ['peak excursion', r.peak.toFixed(1)+' px'], ['samples', r.n]];
+  }
+  const [g, col] = gradeOf(score);
+  $('cardTitle').textContent = title + ' complete';
+  $('grade').textContent = g; $('grade').style.color = col;
+  $('cardRows').innerHTML = rows.map(([k,v]) => `<div class="row"><span>${k}</span><span>${v}</span></div>`).join('');
+  $('card').style.display = 'flex';
+  beep(1200, .1, 'triangle'); setTimeout(()=>beep(1600,.14,'triangle'), 110);
+}
+
+// ---------------------------------------------------------------------------
+// TOP BAR
+// ---------------------------------------------------------------------------
+const BARS = {
+  range:  [['score','score'],['acq','last acquire'],['combo','combo'],['left','left']],
+  sweep:  [['travel','last travel'],['over','overshoot'],['settle','settle'],['left','swings left']],
+  track:  [['pct','on target'],['lag','lag now'],['left','time left']],
+  steady: [['jitter','jitter (gun)'],['sway','sway (you+gun)'],['left','capture']],
+  rush:   [['hit','hits'],['lead','lead error'],['lat','implied latency'],['left','left']],
+};
+function layoutBar() {
+  const cells = BARS[mode].map(([id,l]) => `<span><div class="v" id="f_${id}">–</div><div class="l">${l}</div></span>`).join('');
+  $('bar').innerHTML = `<div class="grp">${cells}</div>` +
+    `<div class="grp sys"><span><div class="v" id="f_rate">0</div><div class="l">HID rate /s</div></span>` +
+    `<span><div class="v" id="f_dt">–</div><div class="l">worst dt (ms)</div></span>` +
+    `<span><div class="v" id="f_gap">0</div><div class="l">gaps &gt;25ms</div></span></div>`;
+}
+function setF(id, txt, cls) { const e = $('f_'+id); if (!e) return; e.textContent = txt; e.className = 'v' + (cls?' '+cls:''); }
+
+// ---------------------------------------------------------------------------
+// CONTROLS
+// ---------------------------------------------------------------------------
+function setMode(m, btn) {
+  mode = m;
+  for (const id of ['mRange','mSweep','mTrack','mSteady','mRush']) $(id).classList.remove('on');
+  btn.classList.add('on');
+  started = true; startRun();
+}
+$('mRange').onclick  = e => setMode('range',  e.target);
+$('mSweep').onclick  = e => setMode('sweep',  e.target);
+$('mTrack').onclick  = e => setMode('track',  e.target);
+$('mSteady').onclick = e => setMode('steady', e.target);
+$('mRush').onclick   = e => setMode('rush',   e.target);
+$('spdBtn').onclick = e => {
+  const n = Object.keys(SPEEDS);
+  speedName = n[(n.indexOf(speedName)+1) % n.length];
+  e.target.textContent = 'Speed: ' + speedName;
+  if (started) startRun();
+};
+$('szBtn').onclick = e => {
+  const n = Object.keys(SIZES);
+  sizeName = n[(n.indexOf(sizeName)+1) % n.length];
+  e.target.textContent = sizeName;
+  if (started) startRun();
+};
+$('trailBtn').onclick = e => { trail = !trail; trailPts = [];
+  e.target.textContent = 'Trail: ' + (trail?'on':'off'); e.target.classList.toggle('on', trail); };
+$('soundBtn').onclick = e => { sound = !sound;
+  e.target.textContent = 'Sound: ' + (sound?'on':'off'); e.target.classList.toggle('on', sound); };
+$('resetBtn').onclick = () => { started = true; startRun(); };
+
+// ---------------------------------------------------------------------------
+// DRAWING
+// ---------------------------------------------------------------------------
+function ring(t, now, lit) {
+  const grow = Math.min(1, (now - (t.born||0)) / 140);
+  const R2 = t.r * (0.6 + 0.4*grow);
+  const cols = lit ? [[1,'#e04545'],[.72,'#f5f0e8'],[.45,'#e04545'],[.2,'#f5f0e8']]
+                   : [[1,'#3a4048'],[.72,'#4a525c'],[.45,'#3a4048'],[.2,'#4a525c']];
+  for (const [f,c] of cols) { ctx.beginPath(); ctx.arc(t.x,t.y,R2*f,0,6.283); ctx.fillStyle=c; ctx.fill(); }
+  ctx.beginPath(); ctx.arc(t.x,t.y,R2*.07,0,6.283); ctx.fillStyle='#1a1c20'; ctx.fill();
+}
+function drawTrail(now) {
+  if (!trail) return;
+  trailPts = trailPts.filter(p => now - p.t < 900);
+  if (trailPts.length < 2) return;
+  // Speed-coloured ribbon: it turns hot where the cursor is moving fast, so a
+  // swing reads as a comet and any lag shows up as a tail that lingers.
+  for (let i = 1; i < trailPts.length; i++) {
+    const p = trailPts[i-1], q = trailPts[i];
+    const dt = Math.max(1, q.t - p.t), v = Math.hypot(q.x-p.x, q.y-p.y) / dt;
+    const age = 1 - (now - q.t)/900;
+    if (age <= 0) continue;
+    const hot = Math.min(1, v/2.2);
+    ctx.strokeStyle = `rgba(${Math.round(80+175*hot)},${Math.round(200-60*hot)},255,${age*0.75})`;
+    ctx.lineWidth = 1 + 3*age; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(q.x,q.y); ctx.stroke();
+  }
+}
+function drawCursor() {
+  if (!SR.has) return;
+  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(SR.x, SR.y, 9, 0, 6.283); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(SR.x-16,SR.y); ctx.lineTo(SR.x-4,SR.y); ctx.moveTo(SR.x+4,SR.y); ctx.lineTo(SR.x+16,SR.y);
+  ctx.moveTo(SR.x,SR.y-16); ctx.lineTo(SR.x,SR.y-4); ctx.moveTo(SR.x,SR.y+4); ctx.lineTo(SR.x,SR.y+16);
+  ctx.stroke();
+}
+
+// ---------------------------------------------------------------------------
+// MAIN LOOP
+// ---------------------------------------------------------------------------
+let fitted = false, lastFrame = performance.now();
+function frame(now) {
+  if (!fitted) { fit(); fitted = true; layoutBar(); }
+  const dt = Math.min(.05, (now - lastFrame)/1000); lastFrame = now;
+  ctx.fillStyle = '#0d0f12'; ctx.fillRect(0,0,cv.width,cv.height);
+
+  if (started && !M.done) {
+    if (mode === 'range')  tickRange(now);
+    if (mode === 'sweep')  tickSweep(now);
+    if (mode === 'track')  tickTrack(now, dt);
+    if (mode === 'steady') tickSteady(now);
+    if (mode === 'rush')   tickRush(now, dt);
+  }
+
+  drawTrail(now);
+  holes = holes.filter(h => now - h.t < 9000);
+  for (const h of holes) {
+    const a = Math.min(1, 2 - (now-h.t)/4500);
+    ctx.strokeStyle = h.hit ? `rgba(120,220,150,${a})` : `rgba(224,122,95,${a})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(h.x,h.y,4,0,6.283); ctx.stroke();
+  }
+  pops = pops.filter(p => now - p.t < 800);
+  for (const p of pops) {
+    const k = (now-p.t)/800;
+    ctx.globalAlpha = 1-k; ctx.fillStyle = p.col; ctx.font = '700 15px system-ui';
+    ctx.fillText(p.txt, p.x+14, p.y-14-k*26); ctx.globalAlpha = 1;
+  }
+  drawCursor();
+
+  setF('rate', dispRate); setF('dt', dispDtMax?dispDtMax.toFixed(1):'–'); setF('gap', dispGaps);
+  requestAnimationFrame(frame);
+}
+
+function tickRange(now) {
+  const t = M.target; if (!t) return;
+  if (!t.entered && SR.has && Math.hypot(SR.x-t.x, SR.y-t.y) <= t.r) t.entered = now;
+  ring(t, now, true);
+  setF('score', M.score);
+  const a = M.acq.length ? M.acq[M.acq.length-1] : null;
+  setF('acq', a?a.toFixed(0)+' ms':'–', a==null?'':(a<300?'good':a<600?'mid':'bad'));
+  setF('combo', 'x'+M.combo); setF('left', M.left);
+}
+
+function tickSweep(now) {
+  const t = sweepTarget(), o = M.side === 0 ? M.b : M.a;
+  ring(o, now, false); ring(t, now, true);
+  if (M.phase === 'crossing' && SR.has) {
+    const d = Math.hypot(SR.x-t.x, SR.y-t.y);
+    if (!M.firstTouch && d <= t.r) M.firstTouch = now;
+    if (M.firstTouch && M.dir) {
+      // Overshoot: how far PAST the centre the cursor gets, measured along the
+      // swing direction. Distance-from-centre would not do -- that is ~= the
+      // ring radius at the moment of arrival for every swing, so it reads the
+      // same number whatever the gun does. Projecting on the approach vector
+      // isolates the sail-past a gun running too much lead produces.
+      const proj = (SR.x - t.x)*M.dir.x + (SR.y - t.y)*M.dir.y;
+      if (proj > M.over) M.over = proj;
+      // Settled means STAYED inside, not touched once: a cursor still ringing
+      // in and out is not settled.
+      if (d < t.r*0.35) { if (!M.settleAt) M.settleAt = now; }
+      else M.settleAt = 0;
+      if (M.settleAt && now - M.settleAt >= 120 && !M.settledAt) M.settledAt = M.settleAt;
+    }
+  }
+  const l = M.swings[M.swings.length-1];
+  setF('travel', l?l.travel.toFixed(0)+' ms':'–');
+  setF('over', l?l.over.toFixed(0)+' px':'–', l? (l.over<t.r*.5?'good':l.over<t.r?'mid':'bad'):'');
+  setF('settle', l?l.settle.toFixed(0)+' ms':'–');
+  setF('left', Math.max(0, M.left - M.swings.length));
+}
+
+function tickTrack(now, dt) {
+  const el = now - M.t0;
+  if (el >= M.dur) return finishRun();
+  const b = rect(), k = el/1000;
+  // Two out-of-phase sines: smooth, predictable enough to follow, never repeats
+  // the same path twice within a run.
+  M.tk.x = b.width*0.5  + Math.sin(k*0.55 + M.tk.ph1) * b.width*0.34
+                        + Math.sin(k*1.31 + M.tk.ph2) * b.width*0.08;
+  M.tk.y = b.height*0.5 + Math.cos(k*0.77 + M.tk.ph2) * b.height*0.30
+                        + Math.sin(k*1.7  + M.tk.ph1) * b.height*0.06;
+  const d = SR.has ? Math.hypot(SR.x-M.tk.x, SR.y-M.tk.y) : 9e9;
+  const on = d <= M.tk.r;
+  M.frames++; if (on) { M.onFrames++; M.lags.push(d); if (d > M.worst) M.worst = d; }
+  ctx.beginPath(); ctx.arc(M.tk.x, M.tk.y, M.tk.r, 0, 6.283);
+  ctx.strokeStyle = on ? '#6fe38a' : '#e04545'; ctx.lineWidth = 4; ctx.stroke();
+  ctx.beginPath(); ctx.arc(M.tk.x, M.tk.y, 5, 0, 6.283);
+  ctx.fillStyle = on ? '#6fe38a' : '#e04545'; ctx.fill();
+  if (on) { ctx.strokeStyle = 'rgba(111,227,138,.35)'; ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.moveTo(SR.x,SR.y); ctx.lineTo(M.tk.x,M.tk.y); ctx.stroke(); }
+  const pct = 100*M.onFrames/Math.max(1,M.frames);
+  setF('pct', pct.toFixed(1)+' %', pct>90?'good':pct>70?'mid':'bad');
+  setF('lag', on ? d.toFixed(0)+' px' : 'off');
+  setF('left', ((M.dur-el)/1000).toFixed(1)+' s');
+}
+
+const STEADY_MS = 5000;
+function tickSteady(now) {
+  const d = M.dot, on = SR.has && Math.hypot(SR.x-d.x, SR.y-d.y) <= d.r;
+  if (!M.cap) {
+    if (on) { if (!M.armed) M.armed = now; else if (now - M.armed > 600) { M.cap = { t0: now, pts: [] }; beep(600,.08); } }
+    else M.armed = 0;
+  } else {
+    if (SR.has) M.cap.pts.push({ x:SR.x, y:SR.y });
+    if (now - M.cap.t0 >= STEADY_MS) { M.result = analyseSteady(M.cap.pts); return finishRun(); }
+  }
+  ctx.beginPath(); ctx.arc(d.x,d.y,d.r,0,6.283);
+  ctx.strokeStyle = M.cap ? '#6fe38a' : on ? '#f0c674' : '#4a525c';
+  ctx.lineWidth = 3; ctx.stroke();
+  ctx.beginPath(); ctx.arc(d.x,d.y,4,0,6.283); ctx.fillStyle='#f5f0e8'; ctx.fill();
+  if (M.cap) {
+    const p = Math.min(1, (now-M.cap.t0)/STEADY_MS);
+    ctx.beginPath(); ctx.arc(d.x,d.y,d.r+14,-1.5708,-1.5708+6.283*p);
+    ctx.strokeStyle='#6fe38a'; ctx.lineWidth=4; ctx.stroke();
+    drawCloud(M.cap.pts, rect().width*0.5, rect().height*0.5 + d.r + 150);
+    const r = analyseSteady(M.cap.pts);
+    setF('jitter', r.jitter.toFixed(2)+' px', r.jitter<1?'good':r.jitter<2.5?'mid':'bad');
+    setF('sway', r.sway.toFixed(1)+' px');
+    setF('left', ((STEADY_MS-(now-M.cap.t0))/1000).toFixed(1)+' s');
+  } else {
+    setF('jitter','–'); setF('sway','–'); setF('left', on?'arming…':'get on the dot');
+  }
+}
+// SWAY is spread about the mean -- your hand is most of it. JITTER is spread
+// about a 5-sample moving average, which removes anything slow enough for a
+// hand to do, so what survives is the sensor and the pipeline.
+function analyseSteady(pts) {
+  const n = pts.length;
+  if (n < 8) return { jitter:0, sway:0, peak:0, n };
+  const mx = avg(pts.map(p=>p.x)), my = avg(pts.map(p=>p.y));
+  let s2 = 0, peak = 0;
+  for (const p of pts) { const d2 = (p.x-mx)**2 + (p.y-my)**2; s2 += d2; peak = Math.max(peak, Math.sqrt(d2)); }
+  let j2 = 0, jn = 0;
+  for (let i = 2; i < n-2; i++) {
+    let sx = 0, sy = 0;
+    for (let k = -2; k <= 2; k++) { sx += pts[i+k].x; sy += pts[i+k].y; }
+    j2 += (pts[i].x - sx/5)**2 + (pts[i].y - sy/5)**2; jn++;
+  }
+  return { jitter: Math.sqrt(j2/Math.max(1,jn)), sway: Math.sqrt(s2/n), peak, n };
+}
+function drawCloud(pts, cx, cy) {
+  if (pts.length < 4) return;
+  const mx = avg(pts.map(p=>p.x)), my = avg(pts.map(p=>p.y));
+  // Scale to fill the box: a 0.3 px cloud at a fixed 10x is an invisible dot,
+  // and the whole point of this panel is that you can SEE the noise.
+  let ext = 0.5;
+  for (const p of pts) ext = Math.max(ext, Math.abs(p.x-mx), Math.abs(p.y-my));
+  const mag = Math.max(2, Math.min(200, Math.round(80/ext)));
+  ctx.strokeStyle = '#232830'; ctx.lineWidth = 1;
+  ctx.strokeRect(cx-90, cy-90, 180, 180);
+  ctx.fillStyle = '#5a6270'; ctx.font = '10px system-ui';
+  ctx.fillText(mag+'x magnified  ·  box = \u00b1'+(88/mag).toFixed(1)+' px', cx-88, cy-96);
+  for (const p of pts) {
+    const x = cx + (p.x-mx)*mag, y = cy + (p.y-my)*mag;
+    if (Math.abs(x-cx) > 88 || Math.abs(y-cy) > 88) continue;
+    ctx.fillStyle = 'rgba(120,200,255,.5)';
+    ctx.beginPath(); ctx.arc(x,y,1.4,0,6.283); ctx.fill();
+  }
+  ctx.strokeStyle = '#e04545';
+  ctx.beginPath(); ctx.moveTo(cx-6,cy); ctx.lineTo(cx+6,cy); ctx.moveTo(cx,cy-6); ctx.lineTo(cx,cy+6); ctx.stroke();
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
