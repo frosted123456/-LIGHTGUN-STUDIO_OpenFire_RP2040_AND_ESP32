@@ -54,6 +54,7 @@
   <button id="spdBtn">Speed: Fast</button>
   <button id="szBtn">Large</button>
   <button id="trailBtn" class="on">Trail: on</button>
+  <button id="curBtn" class="on">Cursor: on</button>
   <button id="soundBtn" class="on">Sound: on</button>
   <button id="resetBtn">Reset</button>
   <span style="margin-left:auto">F11 fullscreen &nbsp;·&nbsp; trigger = shoot &nbsp;·&nbsp; SPACE = restart run</span>
@@ -69,7 +70,13 @@
 
 <script>
 'use strict';
-const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+// desynchronized: Chrome's low-latency canvas path. A default 2d context is
+// queued through the compositor and paints 1-2 vsync frames behind the OS
+// cursor; this removes most of that gap. alpha:false because the page paints
+// its full background every frame anyway.
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d', { alpha: false, desynchronized: true })
+         || cv.getContext('2d');
 const $ = id => document.getElementById(id);
 function fit(){ const r = cv.getBoundingClientRect(); cv.width = r.width; cv.height = r.height; }
 addEventListener('resize', fit);
@@ -460,6 +467,11 @@ $('szBtn').onclick = e => {
   e.target.textContent = sizeName;
   if (started) startRun();
 };
+$('curBtn').onclick = e => {
+  curMode = curMode === 'on' ? 'dim' : (curMode === 'dim' ? 'off' : 'on');
+  e.target.textContent = 'Cursor: ' + curMode;
+  e.target.classList.toggle('on', curMode !== 'off');
+};
 $('trailBtn').onclick = e => { trail = !trail; trailPts = [];
   e.target.textContent = 'Trail: ' + (trail?'on':'off'); e.target.classList.toggle('on', trail); };
 $('soundBtn').onclick = e => { sound = !sound;
@@ -483,8 +495,12 @@ function drawTrail(now) {
   if (trailPts.length < 2) return;
   // Speed-coloured ribbon: it turns hot where the cursor is moving fast, so a
   // swing reads as a comet and any lag shows up as a tail that lingers.
-  for (let i = 1; i < trailPts.length; i++) {
-    const p = trailPts[i-1], q = trailPts[i];
+  // A 250 Hz gun fills the 900 ms window with ~220 points; stroking every
+  // segment individually blows the frame budget and the whole page stutters,
+  // which reads as cursor lag. Stride down to ~120 drawn segments.
+  const stride = Math.max(1, Math.ceil(trailPts.length / 120));
+  for (let i = stride; i < trailPts.length; i += stride) {
+    const p = trailPts[i-stride], q = trailPts[i];
     const dt = Math.max(1, q.t - p.t), v = Math.hypot(q.x-p.x, q.y-p.y) / dt;
     const age = 1 - (now - q.t)/900;
     if (age <= 0) continue;
@@ -494,13 +510,20 @@ function drawTrail(now) {
     ctx.beginPath(); ctx.moveTo(p.x,p.y); ctx.lineTo(q.x,q.y); ctx.stroke();
   }
 }
+// Reticle visibility: on / dim / off. Purely cosmetic -- every measurement
+// reads the event stream, so aiming by iron sights with the reticle off
+// changes nothing in the numbers.
+let curMode = 'on';
 function drawCursor() {
-  if (!SR.has) return;
-  ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
-  ctx.beginPath(); ctx.arc(SR.x, SR.y, 9, 0, 6.283); ctx.stroke();
+  if (!SR.has || curMode === 'off') return;
+  const dim = curMode === 'dim';
+  ctx.strokeStyle = dim ? 'rgba(255,255,255,0.28)' : '#ffffff';
+  ctx.lineWidth = dim ? 1 : 1.5;
+  const r = dim ? 5 : 9, a = dim ? 9 : 16, b = dim ? 3 : 4;
+  ctx.beginPath(); ctx.arc(SR.x, SR.y, r, 0, 6.283); ctx.stroke();
   ctx.beginPath();
-  ctx.moveTo(SR.x-16,SR.y); ctx.lineTo(SR.x-4,SR.y); ctx.moveTo(SR.x+4,SR.y); ctx.lineTo(SR.x+16,SR.y);
-  ctx.moveTo(SR.x,SR.y-16); ctx.lineTo(SR.x,SR.y-4); ctx.moveTo(SR.x,SR.y+4); ctx.lineTo(SR.x,SR.y+16);
+  ctx.moveTo(SR.x-a,SR.y); ctx.lineTo(SR.x-b,SR.y); ctx.moveTo(SR.x+b,SR.y); ctx.lineTo(SR.x+a,SR.y);
+  ctx.moveTo(SR.x,SR.y-a); ctx.lineTo(SR.x,SR.y-b); ctx.moveTo(SR.x,SR.y+b); ctx.lineTo(SR.x,SR.y+a);
   ctx.stroke();
 }
 
