@@ -1,0 +1,106 @@
+name: pical
+
+# Two jobs. `test` runs the app's headless suite on every push, so a broken
+# app is caught in a minute. `image` builds the bootable USB/SD image: on a
+# tag it is attached to the release, otherwise it is uploaded as an artifact
+# so a build can be tested without cutting a release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths:
+      - 'pical/**'
+      - 'tools/aim_calib.py'
+      - 'tools/aim_fit.py'
+      - 'hostcheck/pical_render_test.py'
+      - '.github/workflows/pical-image.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: install deps
+        run: python -m pip install --quiet pygame numpy pyserial
+      - name: headless render + end-to-end calibration
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+        run: python hostcheck/pical_render_test.py
+
+  # Packaging faults that still produce a file are caught here in seconds,
+  # without downloading a 500 MB base image.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            parted fdisk dosfstools e2fsprogs
+      - name: build against a synthetic base image
+        run: sudo bash pical/image/smoke.sh
+
+  image:
+    needs: [test, smoke]
+    runs-on: ubuntu-latest
+    # The release step attaches the image to the tag; new repositories give
+    # GITHUB_TOKEN read-only access, which would fail that upload.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: free up disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          df -h /
+
+      - name: install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user-static binfmt-support parted e2fsprogs xz-utils \
+            rsync wget
+
+      - name: build the image
+        run: sudo -E bash pical/image/build.sh
+        env:
+          OUT: ${{ github.workspace }}/pical.img
+
+      - name: name the artifact
+        id: name
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "file=pical-${GITHUB_REF_NAME}.img.xz" >> "$GITHUB_OUTPUT"
+          else
+            echo "file=pical-${GITHUB_SHA::7}.img.xz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: rename
+        run: mv pical.img.xz "${{ steps.name.outputs.file }}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pical-image
+          path: ${{ steps.name.outputs.file }}
+          retention-days: 14
+
+      - name: attach to the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.name.outputs.file }}
+          body: |
+            Lightgun calibration stick.
+
+            Flash `${{ steps.name.outputs.file }}` to a USB stick or SD card
+            with Raspberry Pi Imager (or balenaEtcher / Rufus), plug it and the
+            gun into a Pi 3 / 4 / 5 / Zero 2 W, and power on. The calibration
+            screen comes up on the TV by itself.

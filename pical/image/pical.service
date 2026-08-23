@@ -1,0 +1,17 @@
+[Unit]
+Description=Lightgun calibration
+After=systemd-udev-settle.service dev-dri-card0.device
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pical-launch
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+TTYPath=/dev/tty1
+StandardInput=tty-force
+
+[Install]
+WantedBy=multi-user.target

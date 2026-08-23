@@ -311,3 +311,39 @@ else
     echo "verify tool: SKIPPED (needs xvfb-run and xdotool)"
 fi
 
+
+# pical, the pygame calibration app: every view renders and a whole
+# calibration completes, headless on SDL's dummy driver. Needs pygame, not
+# tkinter, so it picks its own interpreter rather than reusing OV_PY.
+PICAL_PY=""
+for c in python3 python3.12 python3.11 python; do
+    command -v $c >/dev/null 2>&1 || continue
+    if $c -c "import pygame, numpy, serial" >/dev/null 2>&1; then PICAL_PY=$c; break; fi
+done
+if [ -n "$PICAL_PY" ]; then
+    if timeout 300 "$PICAL_PY" hostcheck/pical_render_test.py > /tmp/ov_pical.out 2>&1 \
+       && grep -q "pical: ALL PASS" /tmp/ov_pical.out; then
+        echo "pical renders + calibrates end to end: OK"
+    else
+        tail -20 /tmp/ov_pical.out 2>/dev/null
+        echo "pical: FAILED"; exit 1
+    fi
+else
+    echo "pical: SKIPPED (pip install pygame)"
+fi
+
+# The pical image build, against a synthetic base: no network, no ARM chroot.
+# Catches packaging faults that still "build successfully" -- the parted
+# shrink-refusal that produced an unbootable table is the reason this exists.
+if [ "$(id -u)" = "0" ] && command -v sfdisk >/dev/null 2>&1 \
+   && command -v parted >/dev/null 2>&1 && [ -e /dev/loop-control ]; then
+    if timeout 300 bash pical/image/smoke.sh > /tmp/ov_smoke.out 2>&1 \
+       && grep -q "pical image smoke: OK" /tmp/ov_smoke.out; then
+        echo "pical image builds and verifies: OK"
+    else
+        tail -15 /tmp/ov_smoke.out 2>/dev/null
+        echo "pical image build: FAILED"; exit 1
+    fi
+else
+    echo "pical image build: SKIPPED (needs root, sfdisk, parted, loop devices)"
+fi

@@ -14,3 +14,7 @@ __pycache__/
 # Local tool output.
 tools/aim_fit_cli
 tools/calib_out/
+pical/calib_out/
+.pical-build/
+pical*.img
+pical*.img.xz

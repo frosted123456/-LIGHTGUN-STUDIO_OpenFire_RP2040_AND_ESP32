@@ -505,4 +505,35 @@ All are prefixed `~` on the native USB port.
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only) |
 | `~camsave` | Persist camera settings, lead, smoothing, dead-band and lens |
 
+## Calibrating without a PC
+
+Studio needs Windows. Moving the gun to another TV — a Pi cabinet, a friend's
+living room — normally means carrying a computer to it, so the same
+calibration also runs from the TV itself.
+
+**`pical`** (in `pical/`) is a pygame front end over the same capture, fit and
+serial dialect the desktop tools use. It is not a second implementation: the
+maths comes from `tools/aim_calib.py` and `tools/aim_fit.py`, so all front
+ends stay in step.
+
+| | What you need |
+|---|---|
+| **USB stick** | download `pical-*.img.xz` from Releases, write it with Raspberry Pi Imager (or balenaEtcher / Rufus), plug the stick and the gun into a Pi 3/4/5/Zero 2 W and power on |
+| **On a PC** | `python pical/pical.py` — fullscreen, or `--windowed` |
+| **Batocera** | copy `pical/` into `roms/ports` — *experimental, untested* |
+
+The stick touches nothing on the machine: your own SD card stays as it is, no
+network is needed, and the calibration screen comes up by itself. You aim with
+your **iron sights**, so a gun whose aim is completely offset still calibrates
+— the shots are read over serial, not from the cursor. A game controller, a
+mouse or a keyboard drives the menus.
+
+The app sits on the stick's FAT partition, so a newer version can be dropped
+on from any PC without rebuilding the image, and every session is logged
+beside it. `pical/README.md` has the details, including the Pi 3B USB-boot
+caveat and how to build the image yourself.
+
+Studio stays the fuller tool: camera tuning, lens fitting, fine tune and
+verify. `pical` covers the aim calibration only.
+
 See `NOTICE.md` for third-party code and licences.
