@@ -59,21 +59,43 @@ wait_part() {
     die "partition node $1 never appeared"
 }
 
-# The chroot's /sys is bind-mounted recursively, which drags in cgroup2. Those
-# submounts refuse a plain umount ("target is busy"), so they are made rslave
-# on the way in and detached lazily on the way out.
+# Chroot mounts, made explicitly rather than with --rbind. A recursive bind of
+# /sys drags the host's cgroup2 hierarchy in, which then refuses to unmount
+# ("target is busy"); detaching it lazily instead leaves the root filesystem
+# pinned, so the shrink that follows finds the device still in use. A fresh
+# sysfs and a NON-recursive /dev bind avoid the whole problem.
 chroot_mounts_up() {
-    mount -t proc /proc "$1/proc"
-    mount --rbind /sys "$1/sys";  mount --make-rslave "$1/sys"
-    mount --rbind /dev "$1/dev";  mount --make-rslave "$1/dev"
+    mount -t proc  proc   "$1/proc"
+    mount -t sysfs sysfs  "$1/sys"
+    mount --bind   /dev   "$1/dev"
+    mkdir -p "$1/dev/pts"
+    mount -t devpts devpts "$1/dev/pts" 2>/dev/null || true
     CHROOT_MOUNTED=1
 }
 chroot_mounts_down() {
     [ "${CHROOT_MOUNTED:-0}" = "1" ] || return 0
-    umount -R -l "$1/dev"  2>/dev/null || true
-    umount -R -l "$1/sys"  2>/dev/null || true
-    umount -R -l "$1/proc" 2>/dev/null || true
+    local m
+    for m in dev/pts dev sys proc; do
+        umount "$1/$m" 2>/dev/null || umount -l "$1/$m" 2>/dev/null || true
+    done
     CHROOT_MOUNTED=0
+}
+
+# Unmounts the image root and PROVES it: e2fsck on a still-mounted filesystem
+# refuses, and the shrink after it would then run on stale geometry.
+umount_root() {
+    local i
+    for i in $(seq 1 20); do
+        mountpoint -q "$1" || return 0
+        sync
+        umount -R "$1" 2>/dev/null && continue
+        command -v fuser >/dev/null 2>&1 && fuser -k -M -m "$1" 2>/dev/null || true
+        sleep 0.5
+    done
+    if mountpoint -q "$1"; then
+        die "$1 is still mounted; something holds it open"
+    fi
+    return 0
 }
 
 attach() {
@@ -176,7 +198,12 @@ fi
 
 # ------------------------------------------------------------------ shrink
 sync
-umount -R /mnt/pical-root 2>/dev/null || umount -R -l /mnt/pical-root
+umount_root /mnt/pical-root
+# The shrink is the one step that silently corrupts if it runs against a
+# filesystem the kernel still has open.
+if mountpoint -q /mnt/pical-root; then
+    die "root still mounted before the shrink"
+fi
 e2fsck -pf "${LOOP}p2" || true
 say "shrinking the filesystem back to its contents"
 MINB="$(resize2fs -P "${LOOP}p2" | awk '{print $NF}')"
@@ -207,7 +234,7 @@ fi
 mount "${LOOP}p1" /mnt/pical-root/boot/firmware
 [ -f /mnt/pical-root/boot/firmware/pical/pical.py ] || die "app missing from FAT"
 [ -f /mnt/pical-root/boot/firmware/pical/tools/aim_calib.py ] || die "tools missing"
-umount -R /mnt/pical-root
+umount_root /mnt/pical-root
 detach
 say "image verified"
 
