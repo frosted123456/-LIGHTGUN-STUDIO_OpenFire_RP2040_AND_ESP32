@@ -141,6 +141,13 @@ cp --sparse=always "$WORK/base.img" "$WORK/work.img"
 say "growing the root filesystem by ${GROW_MB} MB"
 truncate -s "+${GROW_MB}M" "$WORK/work.img"
 attach
+# RaspiOS enables the ext4 "orphan_file" feature. Resizing such a filesystem
+# with a different e2fsprogs -- here, and again when the Pi expands it on
+# first boot -- leaves the orphan inode list inconsistent, and the SECOND
+# boot then fails with "ext4_init_orphan_info" and drops to initramfs. The
+# feature is a performance optimisation; the image does not need it.
+tune2fs -O ^orphan_file "${LOOP}p2" >/dev/null 2>&1 || true
+e2fsck -pf "${LOOP}p2" >/dev/null 2>&1 || true
 START="$(part2_start)"
 [ -n "$START" ] || die "could not read partition 2 from the base image"
 TOTAL=$(( $(stat -c %s "$WORK/work.img") / SEC ))
@@ -164,12 +171,22 @@ done
 install -m 0644 "$REPO/pical/image/README-STICK.txt" "$APP/README.txt"
 
 # ------------------------------------------------------------- system pieces
-install -m 0644 "$REPO/pical/image/pical.service" \
-        /mnt/pical-root/etc/systemd/system/pical.service
 install -m 0644 "$REPO/pical/image/99-lightgun.rules" \
         /mnt/pical-root/etc/udev/rules.d/99-lightgun.rules
 install -m 0755 "$REPO/pical/image/pical-launch.sh" \
         /mnt/pical-root/usr/local/bin/pical-launch
+
+# RaspiOS runs a first-boot init that asks for a username and password and
+# resizes the root filesystem. This is an appliance: it must come up on the
+# calibration screen with no questions, and the resize is what corrupted the
+# filesystem on the second boot. Remove it from the kernel command line.
+CMDLINE=/mnt/pical-root/boot/firmware/cmdline.txt
+if [ -f "$CMDLINE" ]; then
+    sed -i -e 's| init=/usr/lib/raspberrypi-sys-mods/firstboot||g' \
+           -e 's| systemd.run[^ ]*||g' -e 's| systemd.run_success_action=[^ ]*||g' \
+           -e 's| systemd.unit=kernel-command-line[^ ]*||g' "$CMDLINE"
+    say "cmdline: $(cat "$CMDLINE")"
+fi
 
 # -------------------------------------------------------- packages via chroot
 if [ "${PICAL_SKIP_CHROOT:-0}" = "1" ]; then
@@ -187,9 +204,43 @@ apt-get install -y --no-install-recommends \
     python3-pygame python3-numpy python3-serial
 apt-get clean
 rm -rf /var/lib/apt/lists/*
-systemctl enable pical.service
-# Nothing else should own the console or the framebuffer.
-systemctl disable getty@tty1.service || true
+# A named account exists for diagnostics over SSH or a second console; the
+# app itself runs as root from tty1.
+if ! id pical >/dev/null 2>&1; then
+    useradd -m -s /bin/bash pical
+fi
+echo 'pical:pical123' | chpasswd
+usermod -aG sudo,dialout,video,input,render pical 2>/dev/null ||     usermod -aG sudo,dialout,video,input pical
+
+# tty1 logs straight in as root and runs the app. "systemctl disable" does
+# not stop a console getty -- getty.target pulls the instance in on its own --
+# so the instance is overridden rather than fought with.
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'UNIT'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+UNIT
+
+# The first-boot user wizard must never appear.
+systemctl disable userconfig.service 2>/dev/null || true
+systemctl mask    userconfig.service 2>/dev/null || true
+systemctl disable pical.service 2>/dev/null || true
+rm -f /etc/systemd/system/pical.service
+systemctl set-default multi-user.target
+
+# tty1 is the appliance console. Any other console -- SSH, tty2 via
+# Ctrl+Alt+F2 -- gets an ordinary shell, and dropping a file called
+# NOAUTOSTART next to the app on the FAT partition disables the autostart
+# from any PC, without reflashing.
+cat > /root/.bash_profile <<'PROFILE'
+if [ "$(tty)" = "/dev/tty1" ] && [ ! -f /boot/firmware/pical/NOAUTOSTART ]; then
+    /usr/local/bin/pical-launch
+    echo
+    echo "The calibration app exited. Type 'pical-launch' to start it again,"
+    echo "or 'poweroff' to shut down cleanly before pulling the power."
+fi
+PROFILE
 CHROOT
 
 rm -f /mnt/pical-root/usr/bin/qemu-aarch64-static
@@ -222,10 +273,15 @@ parted -sm "$LOOP" unit s print >/dev/null || die "partition table is unreadable
 e2fsck -pf "${LOOP}p2" || die "root filesystem is not clean"
 mount "${LOOP}p2" /mnt/pical-root
 [ -x /mnt/pical-root/usr/local/bin/pical-launch ] || die "launcher missing"
-[ -f /mnt/pical-root/etc/systemd/system/pical.service ] || die "service missing"
+if [ -f /mnt/pical-root/boot/firmware/cmdline.txt ]; then
+    grep -q "firstboot" /mnt/pical-root/boot/firmware/cmdline.txt \
+        && die "the first-boot wizard is still on the kernel command line"
+fi
 if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
-    [ -L /mnt/pical-root/etc/systemd/system/multi-user.target.wants/pical.service ] \
-        || die "pical.service is not enabled"
+    [ -f /mnt/pical-root/etc/systemd/system/getty@tty1.service.d/autologin.conf ] \
+        || die "tty1 autologin was not installed"
+    grep -q pical-launch /mnt/pical-root/root/.bash_profile \
+        || die "the console does not launch the app"
 fi
 if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
     [ -d /mnt/pical-root/usr/lib/python3/dist-packages/pygame ] \

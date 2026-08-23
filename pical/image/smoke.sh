@@ -25,7 +25,10 @@ if grep -qw vfat /proc/filesystems 2>/dev/null && command -v mkfs.vfat >/dev/nul
 else
     mkfs.ext2 -q -F "$L1"
 fi
-mkfs.ext4 -q -F "$L2"
+# orphan_file matches what RaspiOS ships. Without it the synthetic base is
+# easier than the real one and the test misses the corruption class that
+# dropped a real Pi into initramfs on its second boot.
+mkfs.ext4 -q -F -O orphan_file "$L2" 2>/dev/null || mkfs.ext4 -q -F "$L2"
 mkdir -p /mnt/pical-smoke
 mount "$L2" /mnt/pical-smoke
 mkdir -p /mnt/pical-smoke/etc/systemd/system/multi-user.target.wants \
