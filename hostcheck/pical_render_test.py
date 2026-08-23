@@ -235,6 +235,27 @@ def main():
     app.view.draw(sc)
     ck(True, "no-data screen renders")
 
+    # ---- DRM device choice -----------------------------------------------
+    # A Pi has two DRM cards; one is the v3d render node with no screen on
+    # it. Choosing that one draws nothing and reports no error at all.
+    import builtins
+    import glob as globmod
+    import io
+    fake = {"/dev/dri/card*": ["/dev/dri/card0", "/dev/dri/card1"],
+            "/sys/class/drm/card0-*/status": [],
+            "/sys/class/drm/card1-*/status": ["/sys/class/drm/card1-HDMI-A-1/status"]}
+    real_glob, real_open = globmod.glob, builtins.open
+    globmod.glob = lambda p: fake.get(p, [])
+    builtins.open = lambda p, *a, **k: (io.StringIO("connected\n")
+                                        if "card1-HDMI" in str(p)
+                                        else real_open(p, *a, **k))
+    os.environ.pop("SDL_KMSDRM_DEVICE_INDEX", None)
+    picked = pical.pick_drm_device()
+    idx = os.environ.pop("SDL_KMSDRM_DEVICE_INDEX", None)
+    globmod.glob, builtins.open = real_glob, real_open
+    ck(idx == "1", "picks the connected card, not the render node (got %s)" % idx)
+    ck(picked and "card1" in picked, "and names the device it chose")
+
     pygame.quit()
     print("\npical: %s (%d failures)" % ("ALL PASS" if not FAILS else "FAILED",
                                          len(FAILS)))

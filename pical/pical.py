@@ -1247,7 +1247,41 @@ class App:
         self.draw()
 
 
+def pick_drm_device():
+    """Point SDL at the DRM card that actually drives a screen.
+
+    SDL's kmsdrm backend takes the first /dev/dri/card* it finds. On a Pi
+    running vc4-kms-v3d there are two: one is the v3d render node with no
+    connectors at all. Picking that one succeeds, draws nothing, and leaves
+    the TV black with no error anywhere -- so choose by which card has a
+    connector reporting "connected".
+    """
+    if os.environ.get("SDL_KMSDRM_DEVICE_INDEX"):
+        return None                       # an explicit choice wins
+    import glob
+    cards = sorted(glob.glob("/dev/dri/card*"))
+    if len(cards) < 2:
+        return None                       # nothing to disambiguate
+    for i, dev in enumerate(cards):
+        name = os.path.basename(dev)
+        for st in sorted(glob.glob("/sys/class/drm/%s-*/status" % name)):
+            try:
+                with open(st) as fh:
+                    if fh.read().strip() != "connected":
+                        continue
+            except OSError:
+                continue
+            os.environ["SDL_KMSDRM_DEVICE_INDEX"] = str(i)
+            return "%s (index %d), connector %s" % (
+                dev, i, os.path.basename(os.path.dirname(st)))
+    return None
+
+
 def run(stances=3, windowed=False, port=None):
+    if not windowed:
+        picked = pick_drm_device()
+        if picked:
+            print("pical: display device %s" % picked)
     pygame.init()
     flags = 0 if windowed else pygame.FULLSCREEN
     size = (1280, 720) if windowed else (0, 0)
