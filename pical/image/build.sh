@@ -165,7 +165,10 @@ say "installing the app onto the FAT boot partition"
 APP=/mnt/pical-root/boot/firmware/pical
 mkdir -p "$APP/tools" "$APP/calib_out"
 install -m 0644 "$REPO/pical/pical.py" "$APP/pical.py"
-for f in aim_calib.py aim_fit.py; do
+# Everything pical imports, and everything those import in turn. A missing
+# module here is an app that crashes on the TV with no way to fix it.
+for f in aim_calib.py aim_fit.py calib_lens.py aim_finetune.py \
+         aim_verify.py gun_studio.py; do
     install -m 0644 "$REPO/tools/$f" "$APP/tools/$f"
 done
 install -m 0644 "$REPO/pical/image/README-STICK.txt" "$APP/README.txt"
@@ -221,6 +224,8 @@ cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<'UNIT'
 ExecStart=
 ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
 UNIT
+# Do not rely on the generator having pulled the instance in.
+systemctl enable getty@tty1.service 2>/dev/null || true
 
 # The first-boot user wizard must never appear.
 systemctl disable userconfig.service 2>/dev/null || true
@@ -278,8 +283,9 @@ if [ -f /mnt/pical-root/boot/firmware/cmdline.txt ]; then
         && die "the first-boot wizard is still on the kernel command line"
 fi
 if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
-    [ -f /mnt/pical-root/etc/systemd/system/getty@tty1.service.d/autologin.conf ] \
-        || die "tty1 autologin was not installed"
+    grep -q "autologin root" \
+        /mnt/pical-root/etc/systemd/system/getty@tty1.service.d/autologin.conf \
+        2>/dev/null || die "tty1 autologin was not installed"
     grep -q pical-launch /mnt/pical-root/root/.bash_profile \
         || die "the console does not launch the app"
 fi
@@ -289,7 +295,10 @@ if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
 fi
 mount "${LOOP}p1" /mnt/pical-root/boot/firmware
 [ -f /mnt/pical-root/boot/firmware/pical/pical.py ] || die "app missing from FAT"
-[ -f /mnt/pical-root/boot/firmware/pical/tools/aim_calib.py ] || die "tools missing"
+for f in aim_calib.py aim_fit.py calib_lens.py aim_finetune.py \
+         aim_verify.py gun_studio.py; do
+    [ -f "/mnt/pical-root/boot/firmware/pical/tools/$f" ] || die "tools/$f missing"
+done
 umount_root /mnt/pical-root
 detach
 say "image verified"

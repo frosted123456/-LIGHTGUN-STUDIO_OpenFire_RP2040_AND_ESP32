@@ -84,6 +84,11 @@ class Link:
         self.partial_t = 0.0      # wall clock of the last <4-LED frame
         self.partial_n = 0        # running count of <4-LED frames
         self.full_t = 0.0         # wall clock of the last 4-LED frame
+        # Optional consumers, so another front end can drive a capture session
+        # from this same stream. Unused by Studio.
+        self.gun_t = 0.0          # the gun's own clock, from the last frame
+        self.sink = None          # called with (quad, gun_time_s)
+        self.trig_sink = None     # called on a trigger marker
 
     def connect(self, port=None):
         self.port = port or find_gun()
@@ -152,12 +157,15 @@ class Link:
                             k, v = tok.split("=", 1)
                             if k == "board":
                                 self.last["board"] = v
-                            elif k in CAM_KEYS or k in LENS_KEYS or k in ("sens", "dead"):
+                            elif k in CAM_KEYS or k in LENS_KEYS \
+                                    or k in ("sens", "dead", "lead", "smooth"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
             if is_trigger(line):
                 self.last["trig"] = self.last.get("trig", 0) + 1
+                if self.trig_sink:
+                    self.trig_sink()
                 continue
             pq = parse_q(line)
             if pq is None:
@@ -175,7 +183,10 @@ class Link:
             q, gt = pq
             self.frames += 1
             self.full_t = time.time()
+            self.gun_t = gt
             self.hist.append((gt, q))
+            if self.sink:
+                self.sink(q, gt)
         cut = self.hist[-1][0] - 2.0 if self.hist else 0
         self.hist = [h for h in self.hist if h[0] >= cut][-400:]
 

@@ -511,10 +511,11 @@ Studio needs Windows. Moving the gun to another TV — a Pi cabinet, a friend's
 living room — normally means carrying a computer to it, so the same
 calibration also runs from the TV itself.
 
-**`pical`** (in `pical/`) is a pygame front end over the same capture, fit and
-serial dialect the desktop tools use. It is not a second implementation: the
-maths comes from `tools/aim_calib.py` and `tools/aim_fit.py`, so all front
-ends stay in step.
+**`pical`** (in `pical/`) runs every Studio step except step 1: camera tuning,
+lens/FOV, aim calibration, fine tune and verify. Step 1 is the OpenFIRE app,
+which is Windows-only and only has to be done once. It is not a second
+implementation — the capture session, the fits, the auto-tune and the serial
+link all come from `tools/`, so both front ends stay in step.
 
 | | What you need |
 |---|---|

@@ -1,12 +1,20 @@
-# pical — calibrate without a PC
+# pical — Studio on the TV, without a PC
 
 Moving the gun to another TV normally means carrying a computer to it. `pical`
-is the same calibration, driven from the TV itself: a pygame app over the same
-capture, fit and serial dialect the desktop tools use.
+runs the Studio steps that do not need Windows, from the TV itself:
+
+| Step | In pical | Notes |
+|---|---|---|
+| 1 buttons & pins | no | the OpenFIRE app is Windows-only; do this once on a PC |
+| 2 camera tuning | yes | sliders and auto-tune, or the wiicam's sensitivity |
+| 3 lens / FOV | yes | preset, 20 s measured sweep, dead-band |
+| 4 aim calibration | yes | five dots at two or three distances |
+| 5 fine tune | yes | iron sights, then smoothing, then lead |
+| 6 verify | yes | nine shots, pipeline error vs the OS cursor |
 
 There is no second implementation of anything. `pical.py` is a view; the
-capture state machine and the fit come from `tools/aim_calib.py` and
-`tools/aim_fit.py`, so a change to the maths reaches every front end at once.
+capture session, the fits, the auto-tune and the serial link all come from
+`tools/`, so a change to the maths reaches Studio and pical together.
 
 ## Three ways to run it
 
@@ -32,6 +40,9 @@ session is logged to `pical/calib_out/` on that same partition.
 
 ## Running it
 
+The menu lists the steps in order. Run them in that order the first time: aim
+error scales with blob noise, and a lens change invalidates the calibration.
+
 1. Aim at each dot with your **iron sights**. The cursor is irrelevant here —
    the gun is read over serial, so an aim that is completely off still
    calibrates.
@@ -51,8 +62,9 @@ python pical/pical.py                   # fullscreen, same as the stick
 python pical/pical.py --stances 2       # two distances instead of three
 ```
 
-Studio remains the fuller tool on Windows: camera tuning, lens fitting, fine
-tune and verify. `pical` covers step 4 only.
+Studio remains the place for step 1 (buttons and pins, through the OpenFIRE
+app) and is the more comfortable environment for a long tuning session.
+Every step after that one is available in both.
 
 ## Building the image
 
