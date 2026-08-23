@@ -25,8 +25,8 @@ for p in ps:
     else:
         g = ""
     print("%-8s %-34s %-10s %s" % (p.device, (p.description or "")[:34], vp, g))
-print("\nESP32-S3 native USB is VID 303A. CH340 is VID 1A86. An OpenFIRE gun
-(either board) enumerates as VID F143.")
+print("\nESP32-S3 native USB is VID 303A. CH340 is VID 1A86. An OpenFIRE gun")
+print("(either board) enumerates as VID F143.")
 print("If only the CH340 appears, the native USB CDC is not enumerating -- check")
 print("that the build has ARDUINO_USB_CDC_ON_BOOT=1 and that you are using the")
 print("USB socket wired to the chip's native pins, not the UART bridge.")

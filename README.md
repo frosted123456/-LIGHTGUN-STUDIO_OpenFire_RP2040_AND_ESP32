@@ -19,6 +19,7 @@ iron sights; and a **verify** step that measures the result instead of assuming
 it. Studio detects which gun is plugged in and adapts.
 
 Please test. You get extremely accurate aim with snappy aim. No springy effect when fine tunning is properly performed. Give me your feedback!
+Note Lightgun studio use a preview at a lower refresh rate (for preview purpose obviously). Actual refresh rate is define by the cam used.   
 
 ---
 
@@ -245,28 +246,43 @@ Default fits most rigs — and the noise floor is still measured, with limits
 scaled for this sensor.
 
 **3 — Lens / FOV** *(skip on both stock lenses)*. The stock 66° OV2640 lens and
-the wiicam's 33° lens need nothing here. If you fitted a wide or fisheye lens,
-the LED quad reaches the pipeline bent, the homography assumes a pinhole, and
-the calibration has nowhere to put a radially-varying error — so it must be
-corrected upstream, in the firmware, and this step configures that. Two ways:
-**Preset from FOV** (type the lens listing's field of view; good first
-approximation for fisheye lenses) or **Measure** — a guided 20-second sweep:
-stand at a respectable distance — whatever keeps all four LEDs in view with the
-quad still a good size (Measure warns if it is too small) — feet planted, and
-slowly pan/tilt/roll so the LEDs travel out to the image edges. On the wiicam,
-raise the sensitivity first: at least **High** for a very large FOV like a
-fisheye, and go up a level whenever the preview is choppy during the sweep —
-that choppiness is LEDs dropping below the sensor threshold, and Measure counts
-the dropouts and says so. It fits both distortion
-models, applies the better one, and refuses honestly when the sweep did not
-cover enough of the frame to pin the answer. **Save to gun** persists it; it reloads at every boot.
-Know the trade: a wide lens lets you stand closer, but the shorter focal
-magnifies every noise source on screen. Applying or changing a lens correction
-invalidates the aim calibration — redo step 4, then step 5, after every change
-here.
+the wiicam's 33° lens need nothing here. A wide or fisheye lens bends the LED
+quad before it reaches the pipeline; the homography assumes a pinhole and the
+calibration has nowhere to put a radially-varying error, so it must be
+corrected upstream in the firmware — this step configures that.
+
+- **Preset from FOV** — type the lens listing's field of view. A good first
+  approximation for fisheye lenses; Measure beats it.
+- **Measure** — a guided 20-second sweep. Stand at a respectable distance —
+  whatever keeps all four LEDs in view with the quad still a good size
+  (Measure warns if it is too small) — feet planted, and slowly pan/tilt/roll
+  so the LEDs travel out to the image edges and corners.
+- **Wiicam: raise the sensitivity first.** At least **High** for a very large
+  FOV like a fisheye, and go up a level whenever the preview is choppy during
+  the sweep — that choppiness is LEDs dropping below the sensor threshold, and
+  Measure counts the dropouts and says so.
+- Measure fits both distortion models, applies the better one, and refuses
+  honestly when the sweep did not cover enough of the frame to pin the answer.
+- **Save to gun** persists it; it reloads at every boot.
+- **A decentered lens leaves a one-sided error.** Both distortion models are
+  radially symmetric about the frame centre — the standard assumption, and
+  exactly what a clip-on lens that is not perfectly coaxial breaks. A small
+  decenter puts the true distortion centre off to one side, and the residual
+  shows up as an offset that grows toward that edge. To verify, re-sweep with
+  good coverage close to that edge: if the offset survives a clean sweep it is
+  mechanical, and re-sweeping only measures it more precisely. Re-seat the
+  lens as centred as possible; the fine tune absorbs part of what remains.
+  (Fitting the distortion centre itself is a possible future extension — not
+  currently implemented.)
+- Know the trade: a wide lens lets you stand closer, but the shorter focal
+  magnifies every noise source on screen.
+- **Applying or changing a lens correction invalidates the aim calibration** —
+  redo step 4, then step 5, after every change here.
 
 **4 — Aim calibration** *(both boards)*. Five dots at each of two or three distances. Aim, pull
-the trigger four times per dot. Stepping back between rounds is **required** —
+the trigger four times per dot. Note the live preview refreshes slower than the
+gun actually tracks — the display is rate-limited for the serial link and the
+GUI; the gun itself runs at full frame rate and every shot uses full-rate data. Stepping back between rounds is **required** —
 at one distance the boresight and the screen mapping cannot be separated, and
 the fit will refuse. It ends by sending the calibration to the gun and reading
 it back to confirm.
