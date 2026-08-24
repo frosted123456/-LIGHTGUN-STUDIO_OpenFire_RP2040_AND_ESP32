@@ -460,6 +460,12 @@ class Lens(RowScreen):
         self.n_full0 = self.n_part0 = 0
         self.report = []           # the sweep's own report, shown until dismissed
         self.report_ok = False
+        self.fitting = False       # the fit runs off the main loop
+        self.fit_result = None
+        self.fit_id = 0
+        self.fit_t0 = 0.0
+        self.snap = None
+        self.path = ""
         self.build()
 
     # ---- what the gun is holding right now -------------------------------
@@ -521,7 +527,7 @@ class Lens(RowScreen):
     def hide_cursor(self):
         # The sweep turns the resolver off, so the cursor is the firmware's
         # stock aim wandering around -- not this pipeline's, and not useful.
-        return self.sweeping
+        return self.sweeping or self.fitting
 
     # ---- the 20 s sweep --------------------------------------------------
     def measure(self):
@@ -596,17 +602,45 @@ class Lens(RowScreen):
             return ""
 
     def finish(self):
+        """Hand the gun back, then start the fit on a worker thread.
+
+        The fit is tens of seconds of numpy on a Pi. Running it inline froze
+        the screen with no explanation, which reads as a crash; running it on
+        a thread keeps the screen alive. The thread only computes -- every
+        serial write still happens on the main loop, so there is never a
+        second writer on the port.
+        """
         self.sweeping = False
         link = self.app.link
         link.send("~cam=res:2,dashhz:60")
         link.pointer(self.want_hid)
-        snap = np.array(self.frames) if self.frames else np.zeros((0, 4, 2))
-        path = self.save_sweep(snap)
-        try:
-            r = calib_lens.fit_from_frames(snap, self.fov)
-        except Exception as e:
-            r = dict(ok=False, why="the fitter crashed: %r" % e, model=None,
-                     rms_px=0.0, coverage=0.0)
+        self.snap = np.array(self.frames) if self.frames else np.zeros((0, 4, 2))
+        self.path = self.save_sweep(self.snap)
+        self.fitting = True
+        self.fit_result = None
+        self.fit_t0 = time.time()
+        self.fit_id += 1
+        me, snap, fov = self.fit_id, self.snap, self.fov
+
+        def work():
+            try:
+                r = calib_lens.fit_from_frames(snap, fov)
+            except Exception as e:
+                r = dict(ok=False, why="the fitter crashed: %r" % e, model=None,
+                         rms_px=0.0, coverage=0.0)
+            if me == self.fit_id:          # a single assignment; no lock needed
+                self.fit_result = r
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def collect_fit(self):
+        r = self.fit_result
+        if r is None:
+            return
+        self.fitting = False
+        self.fit_result = None
+        link = self.app.link
+        snap, path = self.snap, self.path
 
         rep = ["%d frames kept   |   coverage %.0f%% (needs %d%%)   |   "
                "quad span %.0f px (needs %.0f)"
@@ -635,6 +669,10 @@ class Lens(RowScreen):
                         "Correction set to OFF."]
             else:
                 line = "Fitted %s, %.2f px rms." % (r["model"], r["rms_px"])
+                if r.get("fpx", 0) > 1.0:
+                    line += ("  Measured field of view %.0f deg."
+                             % (2.0 * math.degrees(math.atan(
+                                 FRAME_W / 2.0 / r["fpx"]))))
                 if r.get("lcx") or r.get("lcy"):
                     line += ("  Decentred lens: centre offset %+.1f, %+.1f px, "
                              "compensated." % (r["lcx"], r["lcy"]))
@@ -655,6 +693,13 @@ class Lens(RowScreen):
             for a in acts:
                 if a in ("select", "back", "click", "trigger"):
                     self.report = []
+            return
+        if self.fitting:
+            self.collect_fit()
+            for a in acts:
+                if a == "back":
+                    self.fitting = False
+                    self.fit_id += 1        # orphan the worker's result
             return
         if self.sweeping:
             # Collect here rather than in draw(): the frames keep arriving
@@ -716,9 +761,25 @@ class Lens(RowScreen):
                               trail=self.trail, label="COVERAGE")
         sc.text(sc.w / 2, sc.h * 0.94, "Esc abandons the sweep", sc.f_xs, C_DIM)
 
+    def draw_fitting(self, sc):
+        n = len(self.snap) if self.snap is not None else 0
+        sc.text(sc.w / 2, sc.h * 0.34, "FITTING", sc.f_xl, C_WARN)
+        sc.text(sc.w / 2, sc.h * 0.45, "%d frames, %.0f s elapsed"
+                % (n, time.time() - self.fit_t0), sc.f_m, C_FG)
+        sc.lines(sc.w / 2, sc.h * 0.56, [
+            "Searching for the lens model that explains the sweep.",
+            "This takes up to two minutes on a Pi. The gun is yours again.",
+        ], sc.f_s, C_DIM)
+        sc.bar(sc.w * 0.30, sc.h * 0.68, sc.w * 0.4, sc.h * 0.012,
+               (time.time() * 0.5) % 1.0, C_WARN)
+        sc.text(sc.w / 2, sc.h * 0.90, "Esc abandons the fit", sc.f_xs, C_DIM)
+
     def draw(self, sc):
         if self.report:
             self.draw_report(sc)
+            return
+        if self.fitting:
+            self.draw_fitting(sc)
             return
         if self.sweeping:
             self.draw_sweep(sc)
@@ -830,7 +891,11 @@ class FineTune:
         self.t = tuner
         self.recent = []
         self.sel = 0
-        self.controls = ["nudge", "smooth", "lead"]
+        # One row per adjustable thing, so up/down always MOVES and left/right
+        # always ADJUSTS -- the same rule as every other screen. The sight
+        # offset used to own all four arrows, which left no way to reach
+        # smoothing or lead with a d-pad at all.
+        self.controls = ["dx", "dy", "smooth", "lead"]
 
     def send_preview(self):
         self.app.link.send("~" + aimcal_line(self.t.preview())
@@ -844,20 +909,16 @@ class FineTune:
                 self.app.link.send("~cam=lead:%d,smooth:%d" % (t.lead0, t.smooth0))
                 self.app.to_menu()
             elif a == "up":
-                if self.controls[self.sel] == "nudge":
-                    t.nudge(0, -1); self.send_preview()
-                else:
-                    self.sel = (self.sel - 1) % len(self.controls)
+                self.sel = (self.sel - 1) % len(self.controls)
             elif a == "down":
-                if self.controls[self.sel] == "nudge":
-                    t.nudge(0, +1); self.send_preview()
-                else:
-                    self.sel = (self.sel + 1) % len(self.controls)
+                self.sel = (self.sel + 1) % len(self.controls)
             elif a in ("left", "right"):
                 d = -1 if a == "left" else +1
                 k = self.controls[self.sel]
-                if k == "nudge":
+                if k == "dx":
                     t.nudge(d, 0); self.send_preview()
+                elif k == "dy":
+                    t.nudge(0, d); self.send_preview()
                 elif k == "lead":
                     t.nudge_lead(d)
                     self.app.link.send("~cam=lead:%d" % t.lead)
@@ -933,30 +994,40 @@ class FineTune:
         # dropping out, the offsets measured on this screen are meaningless.
         w = sc.w * 0.15
         app.draw_preview(sc, sc.w * 0.02, sc.h * 0.14, w, w * FRAME_H / FRAME_W)
-        sc.lines(sc.w / 2, sc.h * 0.60, [
-            "Shoot the ring with your IRON SIGHTS, or just nudge until the",
-            "cursor sits on your notch. Align first, then smoothing, then lead.",
-        ], sc.f_s, C_DIM)
+        sc.text(sc.w / 2, sc.h * 0.585,
+                "Shoot the ring with your IRON SIGHTS, or move the cursor onto "
+                "your notch.", sc.f_s, C_DIM)
+        sc.text(sc.w / 2, sc.h * 0.615,
+                "Align first, then smoothing, then lead.", sc.f_s, C_DIM)
 
         d = t.off[t.stage] if t.stage < 2 else np.zeros(2)
         rows = [
-            ("Nudge (arrows)", "%+.0f, %+.0f px" % (d[0] * 1920.0, d[1] * 1200.0)),
+            ("Sight  left / right", "%+.0f px" % (d[0] * 1920.0)),
+            ("Sight  up / down", "%+.0f px" % (d[1] * 1200.0)),
             ("Smoothing", "%d / %d" % (t.smooth, SMOOTH_MAX)),
             ("Lead", "%d ms" % t.lead),
         ]
-        y = sc.h * 0.70
+        y = sc.h * 0.655
+        dy = sc.h * 0.055
         for i, (label, val) in enumerate(rows):
             on = (i == self.sel)
             col = C_FG if on else C_DIM
-            sc.text(sc.w * 0.30, y, ("> " if on else "  ") + label, sc.f_m, col,
-                    centre=False)
-            sc.text(sc.w * 0.72, y, ("< %s >" % val) if on else val, sc.f_m,
+            if on:
+                pygame.draw.rect(sc.s, (22, 28, 36),
+                                 (int(sc.w * 0.27), int(y - dy * 0.36),
+                                  int(sc.w * 0.50), int(dy * 0.72)))
+            sc.text(sc.w * 0.30, y, label, sc.f_m, col, centre=False)
+            sc.text(sc.w * 0.62, y, ("< %s >" % val) if on else val, sc.f_m,
                     C_OK if on else C_DIM, centre=False)
-            y += sc.h * 0.06
-        hint = ("select moves between controls; left/right adjusts",
+            y += dy
+        hint = ("left / right moves the cursor across, relative to your sights",
+                "left / right moves the cursor up and down",
                 "raise until jitter settles, stop when it feels floaty",
                 "raise while the cursor trails, stop when reversals overshoot")
-        sc.text(sc.w / 2, sc.h * 0.90, hint[self.sel], sc.f_xs, C_DIM)
+        sc.text(sc.w / 2, sc.h * 0.885, hint[self.sel], sc.f_xs, C_DIM)
+        sc.text(sc.w / 2, sc.h * 0.915,
+                "up / down picks a row   |   left / right changes it   |   "
+                "any pad button steps through", sc.f_xs, C_DIM)
 
         sp = t.spread()
         extra = "measured here" if t.measured[t.stage] else "not measured here yet"

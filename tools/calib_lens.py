@@ -218,6 +218,49 @@ def fit_fisheye(frames, feq0=None, cx=CX, cy=CY):
     hi = max(600.0, lo * 4.0)
     return scan_then_refine(fun, lo, hi, 17, 0.05, log=True)
 
+def probe_poly(tiny, fpx):
+    """Is k1 pinned down at this focal? Cheap enough to ask many times.
+
+    Few frames, few bundle iterations and a coarse grid: this only has to
+    rank focals and spot the ones where k1 runs to its bracket edge, never to
+    produce a parameter. Returns (identifiability, residual in px).
+    """
+    ks = np.linspace(-0.8, 0.4, 9)
+    vals = [bundle_rms(rays_poly(tiny, k, 0.0, fpx), iters=8) for k in ks]
+    i = int(np.argmin(vals))
+    if i == 0 or i == len(ks) - 1:
+        return 0.0, float("inf")           # pegged: this focal cannot be right
+    ident = (min(vals[0], vals[-1]) - vals[i]) / max(vals[i], 1e-12)
+    return ident, vals[i] * fpx
+
+def fit_focal_poly(frames, fpx_seed):
+    """Fit the pinhole focal alongside k1, instead of trusting the typed FOV.
+
+    The polynomial model is fitted AT a focal length, and taking that focal
+    from the number on the lens box makes the whole result hostage to it: a
+    focal that is out by 3x leaves no k1 that can explain the sweep, k1 pegs
+    at its bracket edge, and every model -- pinhole included -- is refused.
+    A sweep that reaches the frame edges constrains the focal by itself.
+
+    Candidate focals are ranked on a cheap subsample (few frames, few bundle
+    iterations, a coarse k1 grid), because this only has to RANK them. Focals
+    where k1 pegs or is barely pinned are discarded rather than scored: focal
+    and distortion trade off against each other, so the residual alone drifts
+    down that valley to an arbitrary point on it. The winner is refitted at
+    full precision by the caller.
+
+    Returns the chosen focal in px, or the seed if nothing was identifiable.
+    """
+    tiny = subsample(frames, 80)
+    best = None
+    for fpx in np.geomspace(60.0, 1500.0, 11):
+        ident, score = probe_poly(tiny, fpx)
+        if ident < 0.30:
+            continue
+        if best is None or score < best[0]:
+            best = (score, float(fpx))
+    return best[1] if best else float(fpx_seed)
+
 def fit_poly(frames, fpx, fit_k2=False, cx=CX, cy=CY):
     frames = subsample(frames)
     fun1 = lambda k1: bundle_rms(rays_poly(frames, k1, 0.0, fpx, cx, cy))
@@ -365,21 +408,30 @@ def fit_from_frames(raw, fov):
                       "re-sweep" % span)
         return out
     fpx = out["fpx"]
+    # Does the typed field of view give a focal the sweep can be fitted at?
+    # A typed FOV that is out by 3x -- the default left in place, or the
+    # wrong number on the lens box -- leaves no k1 that can explain the data:
+    # k1 pegs at its bracket edge and every model is refused for what is
+    # really a bad input. Ask cheaply first, and only go looking if it fails,
+    # so a working FOV keeps producing exactly the fit it always did.
+    if probe_poly(subsample(frames, 80), fpx)[0] < 0.30:
+        fpx = fit_focal_poly(frames, fpx)
     feq, rms_f, id_f = fit_fisheye(frames)
     k1, k2, rms_p, id_p = fit_poly(frames, fpx)
     fisheye_ok = id_f >= 0.30
     poly_ok = id_p >= 0.30
+    # Third verdict, weighed against every outcome and not only against
+    # failure: no measurable distortion means pinhole, and a correction
+    # fitted to noise is worse than none. Distortion displacement grows with
+    # the cube of the field angle, so a mild wide converter on a narrow-FOV
+    # sensor is sub-noise. Relative test, with an absolute cap against
+    # garbage sweeps.
+    rms_pin = bundle_rms(rays_poly(subsample(frames), 0.0, 0.0, fpx)) * fpx
+    rms_best = min(rms_f, rms_p * fpx)
+    if rms_pin <= max(1.0, 1.15 * rms_best) and rms_pin <= 3.0:
+        out.update(ok=True, model="none", rms_px=rms_pin, ident=0.0)
+        return out
     if not fisheye_ok and not poly_ok:
-        # Third verdict: no measurable distortion means pinhole, not failure.
-        # Distortion displacement grows with the cube of the field angle, so a
-        # mild wide converter on a narrow-FOV sensor is sub-noise -- the right
-        # correction is none. Relative test: pinhole wins when neither model
-        # beats it meaningfully, with an absolute cap against garbage sweeps.
-        rms_pin = bundle_rms(rays_poly(frames, 0.0, 0.0, fpx)) * fpx
-        rms_best = min(rms_f, rms_p * fpx)
-        if rms_pin <= max(1.0, 1.15 * rms_best) and rms_pin <= 3.0:
-            out.update(ok=True, model="none", rms_px=rms_pin, ident=0.0)
-            return out
         out["why"] = ("the sweep is inconsistent with every model, pinhole "
                       "included (%.2f px rms) -- LEDs unstable at the frame "
                       "edges, or the lens is not radially symmetric" % rms_pin)
@@ -389,6 +441,8 @@ def fit_from_frames(raw, fov):
     if fisheye_ok: cand.append(("fisheye", rms_f, id_f))
     if poly_ok:    cand.append(("poly", rms_p * fpx, id_p))
     model, rms_px, ident = min(cand, key=lambda c: c[1])
+    if model == "poly":
+        out["fpx"] = fpx               # the fitted focal, not the typed one
     # Decentered-lens refinement: both models are radially symmetric, but a
     # clip-on lens that is not coaxial has its distortion centre off the frame
     # centre, which leaves a one-sided residual. Fit the centre with the model
@@ -548,6 +602,30 @@ def cmd_selftest(_a):
     print(f"frames-api: same sweep, FOV typed as 60 -> feq={r2['feq']:.1f} "
           f"(must still recover)")
     ok &= r2["ok"] and abs(r2["feq"] - 85.9) / 85.9 < 0.02
+    # a typed FOV that is WILDLY wrong must not sink a good sweep: the focal
+    # is a fitted parameter, and 160 deg (fpx 69) against a true 210 px focal
+    # is the case that refused every model on the Pi, where 160 is the default
+    r7 = fit_from_frames(_synth("poly", n=900, k1=-0.40, fpx=210.0, noise=0.3),
+                         160)
+    # fpx and k1 are NOT separately identifiable, and they do not need to be:
+    # a longer focal with more barrel distortion gives the SAME ray field
+    # scaled by a constant gain, and the aim calibration solves for that scale
+    # anyway. So the test is the SHAPE of the mapping -- field angle against
+    # radius, best single gain divided out -- not the two numbers.
+    def _theta(k1, fpx, rr):
+        pts = np.repeat(np.stack([CX + rr, np.full_like(rr, CY)], -1)
+                        .reshape(-1, 1, 2), 4, axis=1)
+        return np.degrees(np.arccos(np.clip(
+            rays_poly(pts, k1, 0.0, fpx)[:, 0, 2], -1, 1)))
+    _rr = np.linspace(1.0, 100.0, 60)
+    _ta, _tb = _theta(-0.40, 210.0, _rr), _theta(r7["k1"], r7["fpx"], _rr)
+    _g = float((_ta * _tb).sum() / (_ta * _ta).sum())
+    _shape = float(np.abs(_tb - _g * _ta).max() / max(_tb.max(), 1e-9))
+    print(f"frames-api: FOV typed 160 on a 210px lens -> model={r7['model']} "
+          f"fpx={r7['fpx']:.0f} k1={r7['k1']:.3f} rms={r7['rms_px']:.2f}px "
+          f"ok={r7['ok']}; mapping matches to {_shape*100:.2f}% of field "
+          f"(gain {_g:.2f}, absorbed by the calibration)")
+    ok &= r7["ok"] and r7["model"] == "poly" and _shape < 0.02
     # a MILD lens (distortion below the noise floor) must come back as a
     # pinhole verdict, not a refusal -- the 0.67x converter case
     r3 = fit_from_frames(_synth("poly", n=1500, k1=-0.008, fpx=405.1,

@@ -154,7 +154,16 @@ def main():
     n_before = len(app.link.src.ser.written)
     lens2.t0 = 0.0                        # the 20 s are up, with no frames
     lens2.handle([], (0, 0))              # collection runs off handle, not draw
-    ck(not lens2.sweeping and lens2.report, "a starved sweep produces a report")
+    ck(not lens2.sweeping and lens2.fitting,
+       "the fit starts without blocking the loop")
+    lens2.draw(sc)
+    ck(True, "the fitting screen renders while the worker runs")
+    for _ in range(400):                  # the worker refuses this in ms
+        if lens2.fit_result is not None:
+            break
+        time.sleep(0.01)
+    lens2.handle([], (0, 0))
+    ck(not lens2.fitting and lens2.report, "a starved sweep produces a report")
     ck(not lens2.report_ok and any("REFUSED" in l for l in lens2.report),
        "the report says it was refused, and why")
     ck(any(b"lens:2" in w for w in app.link.src.ser.written[n_before:]),
@@ -211,17 +220,30 @@ def main():
        "it seeds lead and smoothing from the gun, not from defaults")
     app.step([], t + 1)
     ck(True, "fine-tune screen renders")
-    ft.sel = 2                             # lead
+    ck(ft.controls == ["dx", "dy", "smooth", "lead"],
+       "every adjustable thing has its own row")
+    ft.sel = 0
+    app.step([key(pygame.K_DOWN)], t + 1.5)
+    ck(ft.sel == 1, "up/down moves between rows even on the sight-offset row")
+    ft.sel = 3                             # lead
     app.step([key(pygame.K_RIGHT)], t + 2)
     ck(ft.t.lead == 20 + pical.LEAD_STEP, "lead adjusts from the seeded value")
-    ft.sel = 1                             # smoothing
+    ft.sel = 2                             # smoothing
     app.step([key(pygame.K_RIGHT)], t + 3)
     ck(ft.t.smooth == 8 and "LEAD" in app.toast,
        "changing smoothing warns that lead must be re-checked")
-    ft.sel = 0                             # nudge
+    ft.sel = 0                             # sight, left/right
     before = ft.t.off[0].copy()
     app.step([key(pygame.K_LEFT)], t + 4)
-    ck(ft.t.off[0][0] < before[0], "arrows nudge the sight offset")
+    ck(ft.t.off[0][0] < before[0], "left/right nudges the sight across")
+    ft.sel = 1                             # sight, up/down
+    before = ft.t.off[0].copy()
+    app.step([key(pygame.K_RIGHT)], t + 4.5)
+    ck(ft.t.off[0][1] > before[1] and ft.t.off[0][0] == before[0],
+       "the second row nudges the sight vertically, and only vertically")
+    ft.sel = 0
+    app.step([key(pygame.K_RETURN)], t + 4.7)
+    ck(ft.sel == 1, "a pad button (select) also steps through the rows")
 
     # ---- 6 verify --------------------------------------------------------
     app.to_menu()

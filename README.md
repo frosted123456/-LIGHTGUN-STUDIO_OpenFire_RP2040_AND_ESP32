@@ -269,6 +269,15 @@ corrected upstream in the firmware — this step configures that.
   Measure counts the dropouts and says so.
 - Measure fits both distortion models, applies the better one, and refuses
   honestly when the sweep did not cover enough of the frame to pin the answer.
+- **The typed FOV cannot sink a Measure.** The focal length is a fitted
+  parameter, not a number taken on trust: Measure checks whether the typed
+  field of view gives a focal the sweep can be fitted at, and looks for one
+  that works if it does not. It reports the field of view it measured, which
+  is often the honest answer for a lens whose box says otherwise. Note that
+  focal length and distortion strength are not separately identifiable — a
+  longer focal with more barrel gives the same mapping scaled by a constant —
+  so the fitted numbers may not match the lens spec even when the correction
+  is right. The calibration absorbs that scale.
 - **Save to gun** persists it; it reloads at every boot.
 - **A decentered lens leaves a one-sided error — and Measure now fits it.**
   A clip-on lens that is not perfectly coaxial has its distortion centre off

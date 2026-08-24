@@ -57,8 +57,9 @@ session is logged to `pical/calib_out/` on that same partition.
 ## Step 3, lens / FOV
 
 - **Field of view** is what the lens is sold as. `Apply preset from FOV` uses
-  it directly. `Measure` uses it only as a starting point and then fits the
-  real distortion, which beats a preset.
+  it directly. `Measure` uses it only as a starting point: if that focal does
+  not fit the sweep it finds one that does, and reports the field of view it
+  measured. A wrong number in this box no longer costs you the fit.
 - Preset and Measure both apply the correction **live**. Nothing is permanent
   until `Save to gun`, which writes whatever is live at that moment — the row
   shows which correction that is.
@@ -68,6 +69,25 @@ session is logged to `pical/calib_out/` on that same partition.
 - A refused sweep prints the numbers, the reason and what to change, and puts
   the correction you had back. Every sweep is saved to `calib_out/` whether it
   passes or not.
+- Fitting takes up to two minutes on a Pi. It runs in the background, so the
+  screen keeps updating and Esc still works.
+
+## Step 5, fine tune
+
+Four rows, driven like every other screen: **up/down** picks a row,
+**left/right** changes it, and any controller button steps through the rows.
+The sight offset has one row per axis so that up and down are never taken
+away from moving between rows.
+
+| Row | What it does |
+|---|---|
+| Sight left / right | moves the cursor across, relative to your iron sights |
+| Sight up / down | the same, vertically |
+| Smoothing | raise until jitter settles; stop when it feels floaty |
+| Lead | raise while the cursor trails; stop when reversals overshoot |
+
+Do them in that order — smoothing changes the latency that lead is
+compensating for, and the screen says so when you change it.
 
 ## Running it
 
