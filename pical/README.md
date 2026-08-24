@@ -3,6 +3,9 @@
 Moving the gun to another TV normally means carrying a computer to it. `pical`
 runs the Studio steps that do not need Windows, from the TV itself:
 
+Everything from **step 2 of the main README's setup section** onwards is here.
+Only step 1 is missing, and only because the app it needs runs on Windows.
+
 | Step | In pical | Notes |
 |---|---|---|
 | 1 buttons & pins | no | the OpenFIRE app is Windows-only; do this once on a PC |
@@ -26,7 +29,9 @@ capture session, the fits, the auto-tune and the serial link all come from
 
 ## The USB stick
 
-Download `pical-*.img.xz` from the repository's Releases page and write it with
+[**Download the latest image**](https://github.com/frosted123456/-LIGHTGUN-STUDIO_OpenFire_RP2040_AND_ESP32/releases/download/latest/pical-latest.img.xz)
+— that link always points at the newest build of `main` and never changes.
+Tagged versions are on the repository's Releases page. Write it with
 **Raspberry Pi Imager** (it reads `.xz` directly), balenaEtcher, or Rufus.
 Plug the stick and the gun into the Pi and power it on: the calibration screen
 comes up by itself, with no network and nothing installed on the machine.
@@ -95,8 +100,11 @@ Every step after that one is available in both.
 ## Building the image
 
 CI does it: `.github/workflows/pical-image.yml` runs `image/build.sh` on every
-push that touches this folder, and attaches the image to the release when a
-`v*` tag is pushed. To build one by hand on any Linux box with root:
+push that touches this folder. A push to `main` replaces the image on the
+rolling `latest` prerelease, so the download link above is always current; a
+`v*` tag cuts a proper release instead. Either way the Actions run page ends
+with a clickable download link. To build one by hand on any Linux box with
+root:
 
 ```
 sudo bash pical/image/build.sh          # writes pical.img.xz

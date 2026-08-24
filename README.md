@@ -511,15 +511,20 @@ Studio needs Windows. Moving the gun to another TV — a Pi cabinet, a friend's
 living room — normally means carrying a computer to it, so the same
 calibration also runs from the TV itself.
 
-**`pical`** (in `pical/`) runs every Studio step except step 1: camera tuning,
-lens/FOV, aim calibration, fine tune and verify. Step 1 is the OpenFIRE app,
-which is Windows-only and only has to be done once. It is not a second
-implementation — the capture session, the fits, the auto-tune and the serial
-link all come from `tools/`, so both front ends stay in step.
+**`pical`** (in `pical/`) runs every step of *3. Set it up* from **step 2**
+onwards: camera tuning, lens/FOV, aim calibration, fine tune and verify. Only
+step 1 — buttons and pins, in the OpenFIRE desktop app — is missing, because
+that app is Windows-only, and it only has to be done once when the gun is
+first built. Follow section 3 above as written; it applies unchanged, the
+screens simply live on the TV instead of in a Windows window.
+
+It is not a second implementation — the capture session, the fits, the
+auto-tune and the serial link all come from `tools/`, so both front ends stay
+in step.
 
 | | What you need |
 |---|---|
-| **USB stick** | download `pical-*.img.xz` from Releases, write it with Raspberry Pi Imager (or balenaEtcher / Rufus), plug the stick and the gun into a Pi 3/4/5/Zero 2 W and power on |
+| **USB stick** | [**download the latest image**](https://github.com/frosted123456/-LIGHTGUN-STUDIO_OpenFire_RP2040_AND_ESP32/releases/download/latest/pical-latest.img.xz) (or pick a version from Releases), write it with Raspberry Pi Imager (or balenaEtcher / Rufus), plug the stick and the gun into a Pi 3/4/5/Zero 2 W and power on |
 | **On a PC** | `python pical/pical.py` — fullscreen, or `--windowed` |
 | **Batocera** | copy `pical/` into `roms/ports` — *experimental, untested* |
 
@@ -534,7 +539,11 @@ on from any PC without rebuilding the image, and every session is logged
 beside it. `pical/README.md` has the details, including the Pi 3B USB-boot
 caveat and how to build the image yourself.
 
-Studio stays the fuller tool: camera tuning, lens fitting, fine tune and
-verify. `pical` covers the aim calibration only.
+On the TV you get the same camera view Studio shows — the four LEDs, the quad
+and the frame centre — on the camera, lens and fine-tune screens, and the gun's
+cursor is drawn by the app, since a Pi console has no desktop to draw one.
+
+Studio remains the more comfortable place for a long tuning session, and it is
+the only place step 1 can be done. Everything else is available in both.
 
 See `NOTICE.md` for third-party code and licences.

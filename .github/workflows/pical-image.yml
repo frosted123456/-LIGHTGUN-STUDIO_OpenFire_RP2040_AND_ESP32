@@ -83,7 +83,13 @@ jobs:
           fi
 
       - name: rename
-        run: mv pical.img.xz "${{ steps.name.outputs.file }}"
+        run: |
+          mv pical.img.xz "${{ steps.name.outputs.file }}"
+          # A fixed name as well, so the rolling release below always has the
+          # same download URL -- a link that changes every build is not a link.
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            cp "${{ steps.name.outputs.file }}" pical-latest.img.xz
+          fi
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -91,6 +97,29 @@ jobs:
           name: pical-image
           path: ${{ steps.name.outputs.file }}
           retention-days: 14
+
+      # Every push to main replaces the assets on a fixed `latest` prerelease,
+      # so there is one permanent URL for the newest build. It is marked as a
+      # prerelease and make_latest is off, so it never displaces a real
+      # tagged version in the Releases list.
+      - name: publish the rolling build
+        if: github.ref_type != 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: pical - latest build
+          prerelease: true
+          make_latest: 'false'
+          files: pical-latest.img.xz
+          body: |
+            Automatic build of `main`, replaced on every push
+            (${{ github.sha }}).
+
+            Permanent download link:
+            https://github.com/${{ github.repository }}/releases/download/latest/pical-latest.img.xz
+
+            Write it to a USB stick or SD card with Raspberry Pi Imager
+            (or balenaEtcher / Rufus), plug it and the gun into a Pi, power on.
 
       - name: attach to the release
         if: github.ref_type == 'tag'
@@ -104,3 +133,17 @@ jobs:
             with Raspberry Pi Imager (or balenaEtcher / Rufus), plug it and the
             gun into a Pi 3 / 4 / 5 / Zero 2 W, and power on. The calibration
             screen comes up on the TV by itself.
+
+      # The Actions run page itself gets a clickable download link, so a build
+      # never has to be hunted for.
+      - name: print the download link
+        run: |
+          {
+            echo "### Download"
+            echo ""
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "[${{ steps.name.outputs.file }}](https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/${{ steps.name.outputs.file }})"
+            else
+              echo "[pical-latest.img.xz](https://github.com/${{ github.repository }}/releases/download/latest/pical-latest.img.xz)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
