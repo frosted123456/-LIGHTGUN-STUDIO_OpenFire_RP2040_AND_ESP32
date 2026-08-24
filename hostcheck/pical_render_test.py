@@ -8,6 +8,7 @@ fed on a synthetic gun clock so a full multi-stance run takes seconds.
 import os
 import queue
 import sys
+import time
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
@@ -134,6 +135,36 @@ def main():
     ck(True, "lens sweep screen renders")
     lens.sweeping = False
 
+    # The gates the sweep screen draws live must be the gates the fitter
+    # actually applies, or the coverage ring is a lie.
+    csrc = open(os.path.join(ROOT, "tools", "calib_lens.py")).read()
+    ck(("cov < %.2f" % pical.COV_GATE) in csrc
+       and ("span < %.1f" % pical.SPAN_GATE) in csrc,
+       "the drawn sweep gates match calib_lens")
+
+    lens2 = pical.Lens(app)
+    app.open(lens2)
+    app.link.last["lens"] = 2
+    ck(lens2.live_name() == "fisheye" and "fisheye" in lens2.save_hint(),
+       "Save names the correction that is live, so it is clear what it writes")
+    lens2.measure()
+    ck(lens2.sweeping, "Measure starts a sweep")
+    app.step([], 2.2)
+    ck(True, "sweep screen renders with the live coverage map")
+    n_before = len(app.link.src.ser.written)
+    lens2.t0 = 0.0                        # the 20 s are up, with no frames
+    lens2.handle([], (0, 0))              # collection runs off handle, not draw
+    ck(not lens2.sweeping and lens2.report, "a starved sweep produces a report")
+    ck(not lens2.report_ok and any("REFUSED" in l for l in lens2.report),
+       "the report says it was refused, and why")
+    ck(any(b"lens:2" in w for w in app.link.src.ser.written[n_before:]),
+       "the previous correction is restored after a refusal")
+    lens2.draw(sc)
+    ck(True, "sweep report renders")
+    lens2.handle(["select"], (0, 0))
+    ck(not lens2.report, "any button dismisses the report")
+    app.link.last.pop("lens", None)
+
     # ---- 4 aim calibration, end to end ----------------------------------
     app.to_menu()
     attach(app)
@@ -234,6 +265,54 @@ def main():
     ck(app.no_data(), "a silent port is detected as no-data")
     app.view.draw(sc)
     ck(True, "no-data screen renders")
+
+    # ---- the camera view and the drawn cursor ----------------------------
+    def lit(s):
+        a = pygame.surfarray.array3d(s)
+        return int((a.sum(axis=2) > 60).sum())
+
+    surf.fill(pical.C_BG)
+    app.link.hist = []
+    app.draw_preview(sc, 100, 100, 320, 235)
+    ck(lit(surf) > 0, "the camera view says so when no four-LED frame arrives")
+
+    surf.fill(pical.C_BG)
+    app.link.hist = [(1.0, np.asarray(quad, float))]
+    app.link.full_t = time.time()
+    empty = lit(surf)
+    cov = pygame.Surface((240, 176))
+    cov.fill((0, 0, 0)); cov.set_colorkey((0, 0, 0))
+    for i in range(200):
+        cov.set_at((i, i % 176), (36, 84, 144))
+    app.draw_preview(sc, 100, 100, 320, 235, rings=True, trail=cov)
+    ck(lit(surf) > empty + 200, "the camera view draws the LEDs, quad and rings")
+
+    real_pos = pygame.mouse.get_pos
+    pygame.mouse.get_pos = lambda: (640, 360)
+    app.view = pical.Menu(app)            # a screen that wants the cursor shown
+    surf.fill(pical.C_BG); app._mseen = False; app.link.hid_on = True
+    app.draw_cursor(sc); off = lit(surf)
+    surf.fill(pical.C_BG); app._mseen = True
+    app.draw_cursor(sc); on = lit(surf)
+    surf.fill(pical.C_BG); app.link.hid_on = False
+    app.draw_cursor(sc); frozen = lit(surf)
+    pygame.mouse.get_pos = real_pos
+    app.link.hid_on = True
+    ck(off == 0, "no cursor is drawn until the pointer has actually moved")
+    ck(on > 50, "the gun's cursor is drawn once it moves")
+    ck(frozen == 0, "and not while the pointer is frozen")
+
+    pygame.mouse.get_pos = lambda: (640, 360)
+    keep = app.view
+    app.view = pical.Lens(app)
+    app.view.sweeping = True
+    surf.fill(pical.C_BG); app.draw_cursor(sc)
+    ck(lit(surf) == 0, "the cursor is hidden during a lens sweep")
+    app.view.sweeping = False
+    surf.fill(pical.C_BG); app.draw_cursor(sc)
+    ck(lit(surf) > 50, "and comes back when the sweep ends")
+    pygame.mouse.get_pos = real_pos
+    app.view = keep
 
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on

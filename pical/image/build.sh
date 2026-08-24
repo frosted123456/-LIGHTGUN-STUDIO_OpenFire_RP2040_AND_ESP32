@@ -210,14 +210,28 @@ apt-get update
 apt-get install -y --no-install-recommends \
     python3-pygame python3-numpy python3-serial \
     libgl1-mesa-dri libegl1 libgles2 libgbm1 libdrm2 \
-    xserver-xorg-core xserver-xorg-legacy xserver-xorg-video-fbdev \
-    xinit x11-xserver-utils
+    xserver-xorg-core xserver-xorg-legacy xinit x11-xserver-utils
 
-# A minimal X server is the reliable way to get graphics onto a console-only
-# Pi: it does the DRM mastering, mode setting and input handling that SDL's
-# kmsdrm backend otherwise has to get right by itself. Allow it to start
-# without a seat, since the app runs from the tty1 login.
-mkdir -p /etc/X11
+# X is the FALLBACK, not the main path: SDL's kmsdrm backend drives the
+# display directly once it is pointed at the right DRM card. X is kept for
+# the case where that fails on some other Pi.
+#
+# Both backends trip over the same thing: the kernel hands /dev/dri/card0 and
+# card1 to vc4 (the display) and v3d (the 3D core) in an arbitrary order, so
+# picking card0 blindly draws to a device with no screen on it. pical picks by
+# connector status; X needs telling, and fbdev is NOT the answer -- Xorg
+# falling back to it is what produces "Cannot run in framebuffer mode. Please
+# specify busIDs for all framebuffer devices".
+mkdir -p /etc/X11/xorg.conf.d
+cat > /etc/X11/xorg.conf.d/99-vc4.conf <<'VC4'
+Section "OutputClass"
+  Identifier  "vc4"
+  MatchDriver "vc4"
+  Driver      "modesetting"
+  Option      "PrimaryGPU" "true"
+EndSection
+VC4
+# Allow X to start without a seat, since the app runs from the tty1 login.
 cat > /etc/X11/Xwrapper.config <<'XWRAP'
 allowed_users=anybody
 needs_root_rights=yes
@@ -308,6 +322,9 @@ if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
     [ -x /mnt/pical-root/usr/bin/xinit ] || die "xinit did not install"
     grep -q "allowed_users=anybody" /mnt/pical-root/etc/X11/Xwrapper.config \
         || die "X is not allowed to start from the console"
+    grep -q 'MatchDriver "vc4"' \
+        /mnt/pical-root/etc/X11/xorg.conf.d/99-vc4.conf \
+        || die "the X fallback has no vc4 output class and would pick the wrong card"
 fi
 if [ "${PICAL_SKIP_CHROOT:-0}" != "1" ]; then
     [ -d /mnt/pical-root/usr/lib/python3/dist-packages/pygame ] \

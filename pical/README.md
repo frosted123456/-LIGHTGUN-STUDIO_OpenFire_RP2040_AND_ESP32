@@ -38,6 +38,32 @@ The app lives on the stick's FAT partition, so a newer `pical.py` can be
 dropped on from Windows, macOS or Linux without rebuilding the image. Every
 session is logged to `pical/calib_out/` on that same partition.
 
+## What is on the screen
+
+- **Camera view** — the sensor's own picture: the four LEDs, the quad joining
+  them, a trail of recent positions and the frame centre. Every number in the
+  app comes from those four dots, so a jumping or dropping-out quad explains a
+  bad result before you measure anything. It is on the camera, lens and
+  fine-tune screens.
+- **Cursor** — the gun's pointer, drawn by the app. The Pi has no desktop to
+  draw one, so pical draws it. It is deliberately hidden during a lens sweep
+  and during dot capture, where the pointer is not the pipeline's own aim.
+
+## Step 3, lens / FOV
+
+- **Field of view** is what the lens is sold as. `Apply preset from FOV` uses
+  it directly. `Measure` uses it only as a starting point and then fits the
+  real distortion, which beats a preset.
+- Preset and Measure both apply the correction **live**. Nothing is permanent
+  until `Save to gun`, which writes whatever is live at that moment — the row
+  shows which correction that is.
+- The sweep screen shows the three gates the fit will apply — frames,
+  coverage, quad span — while you sweep, plus a coverage map with a ring at
+  the coverage gate. Push the LEDs past that ring or the fit will refuse.
+- A refused sweep prints the numbers, the reason and what to change, and puts
+  the correction you had back. Every sweep is saved to `calib_out/` whether it
+  passes or not.
+
 ## Running it
 
 The menu lists the steps in order. Run them in that order the first time: aim

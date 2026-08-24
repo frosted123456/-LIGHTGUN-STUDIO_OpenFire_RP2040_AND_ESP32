@@ -18,6 +18,7 @@ controller, a mouse or a keyboard.
 import math
 import os
 import sys
+import textwrap
 import threading
 import time
 
@@ -35,12 +36,20 @@ from aim_calib import (CaptureSession, aimcal_line, install_over_serial,
                        make_plan, FRAME_W, FRAME_H)
 from aim_finetune import LEAD_MAX, LEAD_STEP, SHOT_FRAMES, SMOOTH_MAX, TARGET, Tuner
 from aim_verify import GRID_3x3
-from gun_studio import CAM_KEYS, CAM_RANGE, Link, auto_tune, sigma_gates
+from gun_studio import (CAM_KEYS, CAM_RANGE, LENS_KEYS, Link, auto_tune,
+                        sigma_gates)
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
 NO_DATA_S = 5.0
 LENS_SWEEP_S = 20.0
 VERIFY_FRAMES = 12
+
+# The two gates a lens sweep has to pass, mirrored here so the screen can draw
+# them while the sweep is running instead of only reporting them afterwards.
+# hostcheck/pical_render_test.py asserts these still match calib_lens.
+COV_GATE = 0.55           # fraction of the frame half-extent the LEDs must reach
+SPAN_GATE = 25.0          # px, smallest quad that carries usable distortion
+CX, CY = calib_lens.CX, calib_lens.CY
 
 C_BG = (10, 12, 16)
 C_FG = (230, 237, 243)
@@ -50,6 +59,11 @@ C_WARN = (216, 161, 58)
 C_BAD = (210, 75, 75)
 C_RING = (224, 122, 95)
 C_SEL = (31, 111, 235)
+
+
+def wrap(text, width=72):
+    """A refusal reason is a sentence, not a caption: show all of it."""
+    return textwrap.wrap(str(text), width) or [""]
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +252,14 @@ class Row:
         except Exception:
             return None
 
+    def tip(self):
+        """A hint may be a callable, so a row can explain what it will do to
+        the state the gun is in right now rather than in general."""
+        try:
+            return self.hint() if callable(self.hint) else self.hint
+        except Exception:
+            return ""
+
     def nudge(self, d):
         if self.kind != "spin" or self.set is None:
             return
@@ -253,6 +275,7 @@ class RowScreen:
 
     title = ""
     subtitle = ""
+    preview = False           # show the sensor view beside the rows
 
     def __init__(self, app):
         self.app = app
@@ -284,6 +307,10 @@ class RowScreen:
                         break
 
     def draw_rows(self, sc, y0):
+        # With the camera view on the right the rows move into a narrower
+        # left-hand column; without it they keep the full width.
+        bx, bw = (0.04, 0.58) if self.preview else (0.14, 0.72)
+        lx, vx = bx + 0.03, bx + bw - 0.09
         y = y0
         dy = sc.h * 0.072
         for i, r in enumerate(self.rows):
@@ -291,20 +318,26 @@ class RowScreen:
             col = C_FG if on else C_DIM
             if on:
                 pygame.draw.rect(sc.s, (22, 28, 36),
-                                 (int(sc.w * 0.14), int(y - dy * 0.36),
-                                  int(sc.w * 0.72), int(dy * 0.72)))
-            rect = sc.text(sc.w * 0.17, y, r.label, sc.f_m, col, centre=False)
-            r.rect = pygame.Rect(int(sc.w * 0.14), int(y - dy * 0.36),
-                                 int(sc.w * 0.72), int(dy * 0.72))
+                                 (int(sc.w * bx), int(y - dy * 0.36),
+                                  int(sc.w * bw), int(dy * 0.72)))
+            sc.text(sc.w * lx, y, r.label, sc.f_m, col, centre=False)
+            r.rect = pygame.Rect(int(sc.w * bx), int(y - dy * 0.36),
+                                 int(sc.w * bw), int(dy * 0.72))
             if r.kind == "spin":
                 v = r.value()
                 txt = "--" if v is None else (r.fmt % v)
-                sc.text(sc.w * 0.83, y, ("< %s >" % txt) if on else txt,
+                sc.text(sc.w * vx, y, ("< %s >" % txt) if on else txt,
                         sc.f_m, C_OK if on else C_DIM)
+            elif r.get is not None:
+                v = r.value()
+                if v is not None:
+                    sc.text(sc.w * vx, y, str(v), sc.f_s,
+                            C_OK if on else C_DIM)
             y += dy
-        if self.rows and self.rows[self.sel].hint:
-            sc.text(sc.w / 2, sc.h * 0.90, self.rows[self.sel].hint,
-                    sc.f_s, C_DIM)
+        if self.rows:
+            tip = self.rows[self.sel].tip()
+            if tip:
+                sc.text(sc.w / 2, sc.h * 0.90, tip, sc.f_s, C_DIM)
         return y
 
     def draw(self, sc):
@@ -312,6 +345,10 @@ class RowScreen:
         if self.subtitle:
             sc.text(sc.w / 2, sc.h * 0.155, self.subtitle, sc.f_s, C_DIM)
         self.draw_rows(sc, sc.h * 0.27)
+        if self.preview:
+            w = sc.w * 0.30
+            self.app.draw_preview(sc, sc.w * 0.66, sc.h * 0.28,
+                                  w, w * FRAME_H / FRAME_W)
         sc.text(sc.w / 2, sc.h * 0.96, "Esc goes back", sc.f_xs, C_DIM)
 
 
@@ -320,6 +357,7 @@ class RowScreen:
 # ---------------------------------------------------------------------------
 class Camera(RowScreen):
     title = "CAMERA TUNING"
+    preview = True
 
     def __init__(self, app):
         RowScreen.__init__(self, app)
@@ -406,6 +444,7 @@ class Camera(RowScreen):
 class Lens(RowScreen):
     title = "LENS / FOV"
     subtitle = "skip this on a stock lens"
+    preview = True
 
     def __init__(self, app):
         RowScreen.__init__(self, app)
@@ -414,8 +453,26 @@ class Lens(RowScreen):
         self.t0 = 0.0
         self.frames = []
         self.seen = set()
+        self.trail = None          # coverage map, painted as the sweep runs
+        self.max_r = 0.0           # furthest any LED has been from frame centre
         self.want_hid = True
+        self.prev_lens = {}
+        self.n_full0 = self.n_part0 = 0
+        self.report = []           # the sweep's own report, shown until dismissed
+        self.report_ok = False
         self.build()
+
+    # ---- what the gun is holding right now -------------------------------
+    def live_name(self):
+        m = self.app.link.last.get("lens", None)
+        if m is None:
+            return "?"
+        return "OFF" if m == 0 else ("polynomial" if m == 1 else "fisheye")
+
+    def save_hint(self):
+        return ("writes the correction currently live on the gun (%s) into its "
+                "memory -- Preset and Measure both apply live first"
+                % self.live_name())
 
     def build(self):
         link = self.app.link
@@ -423,11 +480,13 @@ class Lens(RowScreen):
             Row("Lens field of view", "spin",
                 get=lambda: self.fov, set=lambda v: setattr(self, "fov", v),
                 lo=20, hi=200, step=5, fmt="%d deg",
-                hint="what the lens is sold as; Measure beats a preset"),
-            Row("Preset from FOV", act=self.preset,
-                hint="a first approximation for a fisheye"),
-            Row("Measure (20 s sweep)", act=self.measure,
-                hint="stand back far enough to keep all four LEDs in view"),
+                hint="what the lens is sold as. Preset uses it; Measure only "
+                     "uses it as a starting point"),
+            Row("Apply preset from FOV", act=self.preset,
+                hint="applies a textbook fisheye for that FOV, live on the gun"),
+            Row("Measure this lens (20 s sweep)", act=self.measure,
+                hint="measures the real distortion and applies it, live. "
+                     "Beats a preset"),
             Row("Stock lens (correction off)", act=self.off,
                 hint="restores the uncorrected pipeline"),
             Row("Dead-band", "spin",
@@ -435,17 +494,18 @@ class Lens(RowScreen):
                 set=lambda v: link.send("~cam=dead:%d" % v),
                 lo=0, hi=128, step=8,
                 hint="0 is off; 16-32 calms rest shimmer on a wide lens"),
-            Row("Save to gun", act=self.save, hint="keeps it across power cycles"),
+            Row("Save to gun (make permanent)", act=self.save,
+                get=self.live_name, hint=self.save_hint),
             Row("Back", act=self.app.to_menu),
         ]
 
     def save(self):
         self.app.link.send("~camsave")
-        self.app.toast_now("saved to the gun")
+        self.app.toast_now("saved %s to the gun" % self.live_name())
 
     def off(self):
         self.app.link.send("~cam=lens:0")
-        self.app.toast_now("correction off")
+        self.app.toast_now("correction off -- press Save to keep it")
 
     def preset(self):
         if self.fov <= 75:
@@ -454,8 +514,16 @@ class Lens(RowScreen):
             return
         r = calib_lens.spec_fisheye(self.fov)
         self.app.link.send("~cam=" + calib_lens.tune_line(dict(r, model="fisheye")))
-        self.app.toast_now("fisheye preset applied (feq %.1f)" % r["feq"])
+        self.app.toast_now("fisheye preset applied live (feq %.1f) -- press Save "
+                           "to keep it" % r["feq"])
 
+    @property
+    def hide_cursor(self):
+        # The sweep turns the resolver off, so the cursor is the firmware's
+        # stock aim wandering around -- not this pipeline's, and not useful.
+        return self.sweeping
+
+    # ---- the 20 s sweep --------------------------------------------------
     def measure(self):
         link = self.app.link
         if not link.src:
@@ -464,77 +532,202 @@ class Lens(RowScreen):
         self.sweeping = True
         self.frames = []
         self.seen = set()
+        self.trail = pygame.Surface((int(FRAME_W), int(FRAME_H)))
+        self.trail.fill((0, 0, 0))
+        self.trail.set_colorkey((0, 0, 0))
+        self.max_r = 0.0
         self.t0 = time.time()
         self.want_hid = link.hid_on
+        # Snapshot the live correction BEFORE the sweep turns it off, so a
+        # refusal can put it back instead of leaving the gun uncorrected.
+        self.prev_lens = {k: link.last.get(k, 0) for k in LENS_KEYS}
+        self.n_full0, self.n_part0 = link.frames, link.partial_n
         # The resolver is off for the sweep, so the firmware falls back to the
         # stock aim and would fling the cursor around the screen.
         link.pointer(False, remember=False)
         link.send("~cam=res:0,lens:0,dashhz:0")
 
+    def spans(self):
+        if not self.frames:
+            return 0.0
+        a = np.array(self.frames[-300:])
+        return float(np.median(np.linalg.norm(a.max(axis=1) - a.min(axis=1),
+                                              axis=1)))
+
+    def coverage(self):
+        return self.max_r / min(CX, CY)
+
     def collect(self):
         for gt, q in self.app.link.hist:
-            if gt not in self.seen:
-                self.seen.add(gt)
-                self.frames.append(np.asarray(q, float))
+            if gt in self.seen:
+                continue
+            self.seen.add(gt)
+            a = np.asarray(q, float)
+            self.frames.append(a)
+            r = float(np.linalg.norm(a - (CX, CY), axis=-1).max())
+            if r > self.max_r:
+                self.max_r = r
+            if self.trail is not None:
+                for pt in a:
+                    px, py = int(pt[0]), int(pt[1])
+                    if 0 <= px < FRAME_W and 0 <= py < FRAME_H:
+                        self.trail.set_at((px, py), (36, 84, 144))
         if (time.time() - self.t0) < LENS_SWEEP_S:
             return
+        self.finish()
+
+    def save_sweep(self, snap):
+        """Keep every sweep, pass or fail, in the format calib_lens reads.
+        A refusal with no data behind it cannot be diagnosed later."""
+        if not len(snap):
+            return ""
+        try:
+            os.makedirs(OUT_DIR, exist_ok=True)
+            path = os.path.join(OUT_DIR,
+                                time.strftime("lenssweep-%Y%m%d-%H%M%S.log"))
+            with open(path, "w") as fh:
+                for i, q in enumerate(snap):
+                    fh.write("Q,%d,4," % (i * 7) +
+                             ",".join("%d,%d" % (round(pt[0] * 10),
+                                                 round(pt[1] * 10))
+                                      for pt in q) + "\n")
+            return path
+        except Exception:
+            return ""
+
+    def finish(self):
         self.sweeping = False
         link = self.app.link
         link.send("~cam=res:2,dashhz:60")
         link.pointer(self.want_hid)
         snap = np.array(self.frames) if self.frames else np.zeros((0, 4, 2))
+        path = self.save_sweep(snap)
         try:
             r = calib_lens.fit_from_frames(snap, self.fov)
         except Exception as e:
-            self.app.toast_now("the fit crashed: %s" % e)
-            return
-        if not r["ok"]:
-            self.app.toast_now("REFUSED: %s" % r["why"][:70])
-            return
-        link.send("~cam=" + calib_lens.tune_line(r))
-        if r["model"] == "none":
-            self.app.toast_now("no correction needed: this lens is a pinhole "
-                               "at this accuracy")
-        else:
-            msg = "fitted %s, %.2f px rms" % (r["model"], r["rms_px"])
-            if r.get("lcx") or r.get("lcy"):
-                msg += "  (decentred %+.1f,%+.1f px)" % (r["lcx"], r["lcy"])
-            self.app.toast_now(msg + " -- now redo Calibrate")
+            r = dict(ok=False, why="the fitter crashed: %r" % e, model=None,
+                     rms_px=0.0, coverage=0.0)
 
+        rep = ["%d frames kept   |   coverage %.0f%% (needs %d%%)   |   "
+               "quad span %.0f px (needs %.0f)"
+               % (len(snap), self.coverage() * 100, COV_GATE * 100,
+                  self.spans(), SPAN_GATE)]
+        fulls = link.frames - self.n_full0
+        parts = link.partial_n - self.n_part0
+        if parts > fulls:
+            rep += ["", "DROPOUTS: %d of %d frames were missing LEDs. A wide "
+                        "lens dims the LEDs off-axis until the sensor stops "
+                        "seeing them." % (parts, parts + fulls),
+                    "Raise sensitivity (step 2), add LED power, or stand "
+                    "closer, then sweep again."]
+        self.report_ok = bool(r["ok"])
+        if not r["ok"]:
+            rep += [""] + wrap("REFUSED: " + r["why"])
+            if self.prev_lens.get("lens"):
+                link.send("~cam=" + ",".join("%s:%d" % (k, self.prev_lens[k])
+                                             for k in LENS_KEYS))
+                rep += ["", "The correction you had before has been put back."]
+        else:
+            link.send("~cam=" + calib_lens.tune_line(r))
+            if r["model"] == "none":
+                rep += ["", "No correction needed: this lens shows no "
+                            "measurable distortion on this sensor.",
+                        "Correction set to OFF."]
+            else:
+                line = "Fitted %s, %.2f px rms." % (r["model"], r["rms_px"])
+                if r.get("lcx") or r.get("lcy"):
+                    line += ("  Decentred lens: centre offset %+.1f, %+.1f px, "
+                             "compensated." % (r["lcx"], r["lcy"]))
+                rep += ["", line]
+                if r["rms_px"] > 1.0:
+                    rep += ["The residual is high -- consider sweeping again, "
+                            "more slowly."]
+                rep += ["", "Applied live. Press Save to keep it.",
+                        "Then REDO Calibrate (step 4): the aim calibration was "
+                        "made under the old lens mapping."]
+        if path:
+            rep += ["", "sweep saved: %s" % os.path.basename(path)]
+        self.report = rep
+
+    # ---- input -----------------------------------------------------------
     def handle(self, acts, mouse):
+        if self.report:
+            for a in acts:
+                if a in ("select", "back", "click", "trigger"):
+                    self.report = []
+            return
         if self.sweeping:
+            # Collect here rather than in draw(): the frames keep arriving
+            # whether or not the last frame rendered, and a slow screen must
+            # not cost the fit its data.
+            self.collect()
             for a in acts:
                 if a == "back":
                     self.sweeping = False
                     self.app.link.send("~cam=res:2,dashhz:60")
                     self.app.link.pointer(self.want_hid)
+                    if self.prev_lens.get("lens"):
+                        self.app.link.send("~cam=" + ",".join(
+                            "%s:%d" % (k, self.prev_lens[k]) for k in LENS_KEYS))
             return
         RowScreen.handle(self, acts, mouse)
 
+    # ---- drawing ---------------------------------------------------------
+    def draw_report(self, sc):
+        sc.text(sc.w / 2, sc.h * 0.10, "SWEEP RESULT", sc.f_l,
+                C_OK if self.report_ok else C_BAD)
+        sc.lines(sc.w / 2, sc.h * 0.22, self.report, sc.f_s, C_FG)
+        sc.text(sc.w / 2, sc.h * 0.94, "any button continues", sc.f_xs, C_DIM)
+
+    def draw_sweep(self, sc):
+        left = max(0.0, LENS_SWEEP_S - (time.time() - self.t0))
+        sc.text(sc.w / 2, sc.h * 0.08, "SWEEPING", sc.f_xl, C_WARN)
+        sc.bar(sc.w * 0.25, sc.h * 0.15, sc.w * 0.5, sc.h * 0.018,
+               1.0 - left / LENS_SWEEP_S, C_WARN)
+        sc.lines(sc.w * 0.26, sc.h * 0.26, [
+            "Pan, tilt and roll slowly so the LEDs travel",
+            "over the WHOLE image -- push them out past",
+            "the orange ring, into the corners.",
+            "Keep all four in view; feet planted.",
+        ], sc.f_s, C_DIM)
+        # The three numbers the fit will be judged on, live, with the gate
+        # each one has to pass -- so a refusal is never the first news.
+        cov, span = self.coverage(), self.spans()
+        n = len(self.frames)
+        rows = [("%2.0f s left" % left, C_FG),
+                ("frames %d / 30 needed" % n, C_OK if n >= 30 else C_WARN),
+                ("coverage %3.0f%% / %d%%" % (cov * 100, COV_GATE * 100),
+                 C_OK if cov >= COV_GATE else C_WARN),
+                ("quad span %3.0f px / %.0f" % (span, SPAN_GATE),
+                 C_OK if span >= SPAN_GATE else C_WARN)]
+        link = self.app.link
+        parts = link.partial_n - self.n_part0
+        fulls = link.frames - self.n_full0
+        if parts:
+            rows.append(("dropouts %d of %d" % (parts, parts + fulls),
+                         C_BAD if parts > fulls else C_WARN))
+        y = sc.h * 0.50
+        for txt, col in rows:
+            sc.text(sc.w * 0.08, y, txt, sc.f_m, col, centre=False)
+            y += sc.h * 0.055
+        w = sc.w * 0.40
+        self.app.draw_preview(sc, sc.w * 0.55, sc.h * 0.30, w,
+                              w * FRAME_H / FRAME_W, rings=True,
+                              trail=self.trail, label="COVERAGE")
+        sc.text(sc.w / 2, sc.h * 0.94, "Esc abandons the sweep", sc.f_xs, C_DIM)
+
     def draw(self, sc):
+        if self.report:
+            self.draw_report(sc)
+            return
         if self.sweeping:
-            self.collect()
-            left = max(0.0, LENS_SWEEP_S - (time.time() - self.t0))
-            sc.text(sc.w / 2, sc.h * 0.16, "SWEEPING", sc.f_xl, C_WARN)
-            sc.text(sc.w / 2, sc.h * 0.28, "%2.0f s left, %d frames"
-                    % (left, len(self.frames)), sc.f_m, C_FG)
-            sc.bar(sc.w * 0.25, sc.h * 0.34, sc.w * 0.5, sc.h * 0.02,
-                   1.0 - left / LENS_SWEEP_S, C_WARN)
-            sc.lines(sc.w / 2, sc.h * 0.46, [
-                "Pan, tilt and roll slowly so the LEDs travel over the",
-                "WHOLE image -- push them out to the edges and corners.",
-                "Keep all four in view; feet planted.",
-            ], sc.f_s, C_DIM)
-            self.app.draw_noise(sc, sc.h * 0.78)
-            sc.text(sc.w / 2, sc.h * 0.92, "Esc abandons the sweep", sc.f_xs, C_DIM)
+            self.draw_sweep(sc)
             return
         RowScreen.draw(self, sc)
-        link = self.app.link
-        m = link.last.get("lens", None)
+        m = self.app.link.last.get("lens", None)
         if m is not None:
-            cur = ("correction OFF" if m == 0 else
-                   "polynomial" if m == 1 else "fisheye")
-            sc.text(sc.w / 2, sc.h * 0.79, "on the gun now: %s" % cur,
+            sc.text(sc.w * 0.33, sc.h * 0.81,
+                    "live on the gun now: %s" % self.live_name(),
                     sc.f_s, C_DIM if m == 0 else C_OK)
 
 
@@ -542,6 +735,8 @@ class Lens(RowScreen):
 # 4 -- aim calibration
 # ---------------------------------------------------------------------------
 class Calib:
+    hide_cursor = True        # aim with the iron sights; the cursor is noise here
+
     def __init__(self, app, session):
         self.app = app
         self.session = session
@@ -734,6 +929,10 @@ class FineTune:
 
         sc.text(sc.w / 2, sc.h * 0.06,
                 "FINE TUNE -- station %d of 2" % (t.stage + 1), sc.f_m, C_FG)
+        # A small sensor view here too: if the quad is drifting or an LED is
+        # dropping out, the offsets measured on this screen are meaningless.
+        w = sc.w * 0.15
+        app.draw_preview(sc, sc.w * 0.02, sc.h * 0.14, w, w * FRAME_H / FRAME_W)
         sc.lines(sc.w / 2, sc.h * 0.60, [
             "Shoot the ring with your IRON SIGHTS, or just nudge until the",
             "cursor sits on your notch. Align first, then smoothing, then lead.",
@@ -1028,6 +1227,11 @@ class App:
         self.toast_t = 0.0
         self.log_lines = []
         self.t_open = 0.0
+        # Pointer tracking: draw our own cursor only once the mouse has
+        # actually moved, so a gun that is not driving HID does not leave a
+        # crosshair parked in the corner pretending to be an aim point.
+        self._mpos = None
+        self._mseen = False
         self.view = Menu(self)
 
     # ---- plumbing --------------------------------------------------------
@@ -1186,6 +1390,91 @@ class App:
                 centre=False)
         sc.text(sc.w * 0.98, sc.h * 0.975, "Esc", sc.f_xs, C_DIM, centre=False)
 
+    def draw_preview(self, sc, x, y, w, h, rings=False, trail=None,
+                     label="CAMERA VIEW"):
+        """What the sensor sees: the four LEDs, in sensor coordinates.
+
+        Every number in this app is derived from these four dots, so showing
+        them turns tuning from guesswork into something you can watch. The
+        trail of quad centres makes instability visible; the rings mark the
+        radius a lens sweep has to push the LEDs past.
+        """
+        link = self.link
+        pad = 4
+        xi, yi, wi, hi = int(x), int(y), int(w), int(h)
+        pygame.draw.rect(sc.s, (16, 20, 26), (xi, yi, wi, hi))
+        pygame.draw.rect(sc.s, (48, 54, 61), (xi, yi, wi, hi), 1)
+        sc.text(x + w / 2, y - sc.h * 0.026, label, sc.f_xs, C_DIM)
+        kx = (w - 2 * pad) / FRAME_W
+        ky = (h - 2 * pad) / FRAME_H
+
+        def to_px(p):
+            return (x + pad + p[0] * kx, y + pad + p[1] * ky)
+
+        ccx, ccy = to_px((CX, CY))
+        if rings:
+            # The coverage gate, drawn. The fit refuses a sweep whose LEDs
+            # never reached this circle, so put the circle on the screen
+            # instead of only mentioning it in the refusal.
+            for frac, col in ((COV_GATE, C_WARN), (1.0, (44, 50, 58))):
+                rx, ry = frac * min(CX, CY) * kx, frac * min(CX, CY) * ky
+                pygame.draw.ellipse(sc.s, col,
+                                    pygame.Rect(int(ccx - rx), int(ccy - ry),
+                                                int(2 * rx), int(2 * ry)), 1)
+        if trail is not None:
+            # The coverage map is painted once, point by point, as the sweep
+            # runs, then blitted scaled -- redrawing thousands of pixels every
+            # frame would cost more than the sweep can afford on a Pi.
+            sc.s.blit(pygame.transform.scale(
+                trail, (int(w - 2 * pad), int(h - 2 * pad))), (xi + pad, yi + pad))
+
+        now = time.time()
+        dropping = (now - link.partial_t) < 1.0 and (now - link.full_t) > 0.5
+        if not link.hist:
+            msg = ("seeing LEDs, but not all four" if dropping
+                   else "no four-LED frames")
+            sc.text(x + w / 2, y + h / 2 - sc.h * 0.015, msg, sc.f_s,
+                    C_WARN if dropping else C_BAD)
+            if dropping:
+                sc.text(x + w / 2, y + h / 2 + sc.h * 0.015,
+                        "background IR too high, or too far", sc.f_xs, C_DIM)
+            return
+        if dropping:
+            sc.text(x + w / 2, y + sc.h * 0.022, "DROPPING OUT -- last good frame",
+                    sc.f_xs, C_WARN)
+        for _, qq in link.hist[-60:]:
+            px, py = to_px(qq.mean(0))
+            if xi < px < xi + wi and yi < py < yi + hi:
+                sc.s.set_at((int(px), int(py)), (31, 111, 235))
+        q = aim_fit.canon(link.hist[-1][1])
+        pts = [to_px(q[i]) for i in range(4)]
+        for a, b in ((0, 1), (1, 3), (3, 2), (2, 0)):
+            pygame.draw.line(sc.s, (58, 127, 191), pts[a], pts[b], 1)
+        for i, nm in enumerate(("TL", "TR", "BL", "BR")):
+            pygame.draw.circle(sc.s, (255, 210, 74),
+                               (int(pts[i][0]), int(pts[i][1])), 4)
+            sc.text(pts[i][0] + sc.w * 0.012, pts[i][1], nm, sc.f_xs, C_DIM)
+        pygame.draw.line(sc.s, C_RING, (ccx - 6, ccy), (ccx + 6, ccy), 1)
+        pygame.draw.line(sc.s, C_RING, (ccx, ccy - 6), (ccx, ccy + 6), 1)
+
+    def draw_cursor(self, sc):
+        """Draw the pointer ourselves.
+
+        The Pi hides the system cursor (there is nothing to hide it behind on
+        a console), and it is invisible against a dark screen anyway. This is
+        the same pointer -- the gun drives it over USB HID -- just drawn where
+        it can be seen, so aim can be judged instead of imagined.
+        """
+        if not self._mseen or not self.link.hid_on:
+            return
+        # Some screens deliberately do not want it: during a lens sweep and a
+        # dot capture the cursor is being driven by the stock aim or by a
+        # calibration that is about to be replaced, so it would be a lie.
+        if getattr(self.view, "hide_cursor", False):
+            return
+        x, y = pygame.mouse.get_pos()
+        sc.crosshair(x, y, sc.h * 0.022, C_RING, dot=True)
+
     def draw_noise(self, sc, y):
         """The blob noise floor and what it means, in one line."""
         link = self.link
@@ -1217,6 +1506,7 @@ class App:
     def draw(self):
         self.sc.s.fill(C_BG)
         self.view.draw(self.sc)
+        self.draw_cursor(self.sc)
         if self.toast and (time.time() - self.toast_t) < 5.0:
             sc = self.sc
             img = sc.f_s.render(self.toast, True, C_WARN)
@@ -1229,6 +1519,9 @@ class App:
     def step(self, events, now):
         acts = self.inp.actions(events, now)
         mouse = pygame.mouse.get_pos()
+        if self._mpos is not None and mouse != self._mpos:
+            self._mseen = True
+        self._mpos = mouse
         # Extra keys that only make sense on the fine-tune screen.
         if isinstance(self.view, FineTune):
             for e in events:
