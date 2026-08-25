@@ -28,6 +28,9 @@ extern "C" void ov2640_set_reply_sink(void (*fn)(const char*)) { s_reply_sink = 
 #include <stdarg.h>
 #include <stdio.h>
 // Emits one command reply, to the reply sink if installed, else printf.
+// printf-checked: a format that gains a conversion without an argument
+// is a compile error, not a garbage line on the wire.
+__attribute__((format(printf, 1, 2)))
 static void ov_reply(const char* fmt, ...)
 {
     char b[256];
@@ -509,6 +512,11 @@ static void on_chunk(const uint8_t* base, size_t len, bool frame_end)
                 lens_undistort(&lr.blobs[i].cx, &lr.blobs[i].cy);
         ov2640_bridge_frame_t lf = {};
         lf.frame_w = FRAME_W; lf.frame_h = FRAME_H;
+#ifdef USE_AIM_PIPELINE
+        // Outside the resolver path there is no per-corner bookkeeping, so the
+        // pipeline keeps the lead it was given and assumes a whole quad.
+        if (!s_resolver) { aim_lead_note(s_lead_ms); aim_conf_note(1.0f); }
+#endif
         if (s_resolver) {
             // Identity plus rigid reconstruction: emits a stable 4 once locked,
             // so OpenFIRE never sees a count change. res=1 keeps the historical
@@ -550,8 +558,23 @@ static void on_chunk(const uint8_t* base, size_t len, bool frame_end)
             // untouched and the solve stays exact. Capped in both time and
             // pixels, and skipped unless the lock is real and at least two
             // corners were measured this frame.
+            // Temporal mode 1 folds the lead into the pipeline's own FIR, so
+            // the quad must be published unled or it would be compensated
+            // twice. The FIR needs both numbers from here: the lead is ours,
+            // and the confidence scales its horizon on dropouts.
+#ifdef USE_AIM_PIPELINE
+            aim_lead_note(s_lead_ms);
+            aim_conf_note((float)q.n_real * 0.25f);
+            // Mode 1's FIR only runs inside aim_runtime_solve, which needs a
+            // loaded calibration. Without one the stock OpenFIRE warp runs
+            // instead, so the lead has to stay HERE or it vanishes entirely --
+            // an uncalibrated gun in mode 1 would silently lose it.
+            const bool lead_here = (aim_tmode_get() == 0) || !aim_runtime_active();
+#else
+            const bool lead_here = true;      // no pipeline: the lead is ours alone
+#endif
             float lead_x = 0.0f, lead_y = 0.0f;
-            if (s_lead_ms > 0.0f && q.locked && q.n_real >= 2) {
+            if (lead_here && s_lead_ms > 0.0f && q.locked && q.n_real >= 2) {
                 float ms = s_lead_ms;
                 if (ms > LIGHTGUN_LEAD_MS_MAX) ms = LIGHTGUN_LEAD_MS_MAX;
                 const float frames = ms * (LIGHTGUN_FPS_NOMINAL / 1000.0f);
@@ -1140,6 +1163,23 @@ int ov2640_capture_start(void)
             aim_smooth_set(smooth);
             printf("CAM: restored smooth=%d from NVS\n", smooth);
         }
+        // One Euro speed sensitivity, own key like the lead.
+        int beta = -1;
+        if (aim_beta_load(&beta)) {
+            aim_beta_set(beta);
+            printf("CAM: restored beta=%d from NVS\n", beta);
+        }
+        // Temporal mode and FIR shape, own keys like the lead.
+        int tmode = 0;
+        if (aim_tmode_load(&tmode)) {
+            aim_tmode_set(tmode);
+            printf("CAM: restored tmode=%d from NVS\n", tmode);
+        }
+        int fk = 0, fp = 0;
+        if (aim_fir_load(&fk, &fp)) {
+            aim_fir_set(fk, fp);
+            printf("CAM: restored firk=%d firpct=%d from NVS\n", fk, fp);
+        }
         // Output dead-band, own key like the lead.
         int dead = 0;
         if (aim_dead_load(&dead)) {
@@ -1234,10 +1274,17 @@ extern "C" bool ov2640_cam_command(const char* line)
     // boot uses the compiled-in recipe again.
     if (!strncmp(line, "camsave", 7)) {
         aim_cam_t cs = { (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost };
-        const bool ok = aim_cam_store(&cs);
-        aim_lead_store((int)s_lead_ms);
-        aim_smooth_store(aim_smooth_get());
-        aim_dead_store(aim_dead_get());
+        // Every store is checked, not only the camera block. A reply that says
+        // "saved" while the lead or beta write quietly failed is worse than no
+        // reply at all, because the tools report it to the user as confirmed.
+        // No short-circuit: each store still runs even after one fails.
+        bool ok = aim_cam_store(&cs);
+        ok = aim_lead_store((int)s_lead_ms) && ok;
+        ok = aim_smooth_store(aim_smooth_get()) && ok;
+        ok = aim_dead_store(aim_dead_get()) && ok;
+        ok = aim_beta_store(aim_beta_get()) && ok;
+        ok = aim_tmode_store(aim_tmode_get()) && ok;
+        ok = aim_fir_store(aim_fir_k(), aim_fir_pct()) && ok;
         // Lens rides along; model 0 clears rather than stores, so a stale
         // stored lens cannot survive a return to the stock lens.
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
@@ -1245,11 +1292,14 @@ extern "C" bool ov2640_cam_command(const char* line)
         bool lens_ok = true;
         if (ls.model == 0) aim_lens_clear();
         else               lens_ok = aim_lens_store(&ls);
+        // beta rides in the reply so a tool can VERIFY what was written rather
+        // than assume it; cam? reports the live value, this reports the stored one.
         ov_reply(ok && lens_ok
-                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d dead=%d lens=%d\n"
-                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d dead=%d lens=%d\n",
+                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n"
+                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
                  cs.thr, cs.aec, cs.agc, cs.boost, (int)s_lead_ms,
-                 aim_smooth_get(), aim_dead_get(), ls.model);
+                 aim_smooth_get(), aim_dead_get(), aim_beta_get(), ls.model,
+                 aim_tmode_get(), aim_fir_k(), aim_fir_pct());
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
@@ -1262,12 +1312,15 @@ extern "C" bool ov2640_cam_command(const char* line)
     if (!strncmp(line, "cam?", 4)) {
         // Everything the tools read back, one line: lead and lens included.
         ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d lead=%d smooth=%d dead=%d "
-                 "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d lcxu=%d lcyu=%d vfill=%d\n",
+                 "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d lcxu=%d lcyu=%d "
+                 "beta=%d tmode=%d firk=%d firpct=%d vfill=%d\n",
                  (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost, (int)s_lead_ms,
                  aim_smooth_get(), aim_dead_get(),
                  (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
                  (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
-                 (int)(s_lcx*10.0f), (int)(s_lcy*10.0f), (int)s_vfill_pct);
+                 (int)(s_lcx*10.0f), (int)(s_lcy*10.0f),
+                 aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
+                 (int)s_vfill_pct);
         return true;
     }
 #endif
@@ -1323,6 +1376,26 @@ extern "C" void ov2640_tune(const char* cmd)
 #ifdef USE_AIM_PIPELINE
             // output dead-band in final output units, 0 = off
             aim_dead_set(val);
+#endif
+        } else if (!strcmp(key, "beta")) {
+#ifdef USE_AIM_PIPELINE
+            // One Euro speed sensitivity: cutoff = min_cutoff + beta*speed.
+            // Raises how fast the filter lets go once the gun moves, without
+            // touching how heavy it is at rest. -1 follows the table.
+            aim_beta_set(val);
+#endif
+        } else if (!strcmp(key, "tmode")) {
+#ifdef USE_AIM_PIPELINE
+            // 0 = One Euro + this layer's lead; 1 = the pipeline's single FIR
+            aim_tmode_set(val);
+#endif
+        } else if (!strcmp(key, "firk")) {
+#ifdef USE_AIM_PIPELINE
+            aim_fir_set(val, aim_fir_pct());     // FIR window, 3..9 samples
+#endif
+        } else if (!strcmp(key, "firpct")) {
+#ifdef USE_AIM_PIPELINE
+            aim_fir_set(aim_fir_k(), val);       // horizon, % of the lead
 #endif
         } else if (!strcmp(key, "vfill")) {
             // LED vertical span as a PERCENT of screen height; 100 = off.

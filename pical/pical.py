@@ -32,9 +32,10 @@ import pygame
 
 import aim_fit
 import calib_lens
-from aim_calib import (CaptureSession, aimcal_line, install_over_serial,
-                       make_plan, FRAME_W, FRAME_H)
-from aim_finetune import LEAD_MAX, LEAD_STEP, SHOT_FRAMES, SMOOTH_MAX, TARGET, Tuner
+from aim_calib import (CaptureSession, aimcal_line, camsave_verified,
+                       install_over_serial, make_plan, FRAME_W, FRAME_H)
+from aim_finetune import (BETA_MAX, LEAD_MAX, LEAD_STEP, SHOT_FRAMES,
+                          SMOOTH_MAX, TARGET, Tuner)
 from aim_verify import GRID_3x3
 from gun_studio import (CAM_KEYS, CAM_RANGE, LENS_KEYS, Link, auto_tune,
                         sigma_gates)
@@ -306,13 +307,18 @@ class RowScreen:
                             r.act()
                         break
 
-    def draw_rows(self, sc, y0):
+    def draw_rows(self, sc, y0, y1=None):
         # With the camera view on the right the rows move into a narrower
         # left-hand column; without it they keep the full width.
         bx, bw = (0.04, 0.58) if self.preview else (0.14, 0.72)
         lx, vx = bx + 0.03, bx + bw - 0.09
         y = y0
+        # Pitch shrinks to fit y1 when there are many rows, so adding one never
+        # pushes the last row over whatever the screen draws below the list.
         dy = sc.h * 0.072
+        n = max(1, len(self.rows))
+        if y1 is not None and n > 1:
+            dy = min(dy, (y1 - y0) / float(n - 1))
         for i, r in enumerate(self.rows):
             on = (i == self.sel)
             col = C_FG if on else C_DIM
@@ -344,7 +350,7 @@ class RowScreen:
         sc.text(sc.w / 2, sc.h * 0.09, self.title, sc.f_l, C_FG)
         if self.subtitle:
             sc.text(sc.w / 2, sc.h * 0.155, self.subtitle, sc.f_s, C_DIM)
-        self.draw_rows(sc, sc.h * 0.27)
+        self.draw_rows(sc, sc.h * 0.27, sc.h * 0.84)
         if self.preview:
             w = sc.w * 0.30
             self.app.draw_preview(sc, sc.w * 0.66, sc.h * 0.28,
@@ -400,8 +406,7 @@ class Camera(RowScreen):
         self.rows.append(Row("Back", act=self.app.to_menu))
 
     def save(self):
-        self.app.link.send("~camsave")
-        self.app.toast_now("saved to the gun")
+        self.app.save_cam()
 
     def run_auto(self):
         if self.tuning:
@@ -506,8 +511,10 @@ class Lens(RowScreen):
         ]
 
     def save(self):
-        self.app.link.send("~camsave")
-        self.app.toast_now("saved %s to the gun" % self.live_name())
+        # the gun's own confirmation first; the friendly name only if it took
+        if self.app.save_cam(lens=int(self.app.link.last.get("lens", 0) or 0)):
+            self.app.toast_now("%s -- saved and confirmed by the gun"
+                               % self.live_name())
 
     def off(self):
         self.app.link.send("~cam=lens:0")
@@ -895,7 +902,7 @@ class FineTune:
         # always ADJUSTS -- the same rule as every other screen. The sight
         # offset used to own all four arrows, which left no way to reach
         # smoothing or lead with a d-pad at all.
-        self.controls = ["dx", "dy", "smooth", "lead"]
+        self.controls = ["dx", "dy", "smooth", "beta", "lead"]
 
     def send_preview(self):
         self.app.link.send("~" + aimcal_line(self.t.preview())
@@ -906,7 +913,11 @@ class FineTune:
         for a in acts:
             if a == "back":
                 self.app.link.send("~" + aimcal_line(t.c0))
-                self.app.link.send("~cam=lead:%d,smooth:%d" % (t.lead0, t.smooth0))
+                # beta belongs in the revert too: leaving it changed after a
+                # cancel is a silent edit the user did not agree to keep.
+                self.app.link.send("~cam=lead:%d,smooth:%d,beta:%d"
+                                   % (t.lead0, t.smooth0, t.beta0))
+                self.app.link.last["beta"] = t.beta0
                 self.app.to_menu()
             elif a == "up":
                 self.sel = (self.sel - 1) % len(self.controls)
@@ -922,6 +933,14 @@ class FineTune:
                 elif k == "lead":
                     t.nudge_lead(d)
                     self.app.link.send("~cam=lead:%d" % t.lead)
+                elif k == "beta":
+                    # How fast the smoothing lets go once the gun moves.
+                    # Independent of how heavy it is at rest. The step and the
+                    # -1 "follow the table" rule live in Tuner, so this screen
+                    # and Studio's fine-tune bar cannot drift apart.
+                    t.nudge_beta(d)
+                    self.app.link.last["beta"] = t.beta
+                    self.app.link.send("~cam=beta:%d" % t.beta)
                 else:
                     t.nudge_smooth(d)
                     self.app.link.send("~cam=smooth:%d" % t.smooth)
@@ -962,11 +981,24 @@ class FineTune:
                 self.app.toast_now(t.msg)
 
     def save_now(self):
+        """Two independent things live on this screen, so save both.
+
+        The sight offset only exists once there is something to solve; lead,
+        smoothing and beta are always savable. Gating the second on the first
+        meant a session spent purely on feel ended with NOTHING written to the
+        gun and a toast that only said 'nothing to save yet'."""
         c = self.t.solve_direct()
         if c is None:
-            self.app.toast_now(self.t.msg or "nothing to save yet")
+            if self.save_cam_settings():
+                self.t.lead0 = self.t.lead
+                self.t.smooth0 = self.t.smooth
+                self.t.beta0 = self.t.beta
             return
         self.commit(c, "saved as a constant offset from one position")
+
+    def save_cam_settings(self):
+        return self.app.save_cam(lead=self.t.lead, smooth=self.t.smooth,
+                                 beta=self.t.beta)
 
     def commit(self, c, note):
         link = self.app.link
@@ -974,8 +1006,17 @@ class FineTune:
             msg = install_over_serial(link.src, aimcal_line(c), c)
         except Exception as e:
             msg = "NOT SENT -- %s" % e
-        link.send("~camsave")
-        self.app.view = Result(self.app, c, None, msg, None, note)
+        # The camera settings get their own verified save and their own line on
+        # the result screen: the calibration going in says nothing about
+        # whether lead, smoothing and beta reached flash.
+        ok, cam_msg = camsave_verified(link.src, lead=self.t.lead,
+                                       smooth=self.t.smooth, beta=self.t.beta)
+        if ok:
+            self.t.lead0 = self.t.lead
+            self.t.smooth0 = self.t.smooth
+            self.t.beta0 = self.t.beta
+        self.app.view = Result(self.app, c, None, msg, None,
+                               note + "\n" + cam_msg)
 
     def draw(self, sc):
         t = self.t
@@ -1004,11 +1045,12 @@ class FineTune:
         rows = [
             ("Sight  left / right", "%+.0f px" % (d[0] * 1920.0)),
             ("Sight  up / down", "%+.0f px" % (d[1] * 1200.0)),
-            ("Smoothing", "%d / %d" % (t.smooth, SMOOTH_MAX)),
+            ("Smoothing (at rest)", "%d / %d" % (t.smooth, SMOOTH_MAX)),
+            ("Speed sensitivity", "%s / %d" % (t.beta_label(), BETA_MAX)),
             ("Lead", "%d ms" % t.lead),
         ]
-        y = sc.h * 0.655
-        dy = sc.h * 0.055
+        y = sc.h * 0.635
+        dy = sc.h * 0.050
         for i, (label, val) in enumerate(rows):
             on = (i == self.sel)
             col = C_FG if on else C_DIM
@@ -1022,7 +1064,8 @@ class FineTune:
             y += dy
         hint = ("left / right moves the cursor across, relative to your sights",
                 "left / right moves the cursor up and down",
-                "raise until jitter settles, stop when it feels floaty",
+                "raise until rest jitter settles, stop when it feels floaty",
+                "raise if a SLOW drag feels sticky; a fast swipe's trail is LEAD",
                 "raise while the cursor trails, stop when reversals overshoot")
         sc.text(sc.w / 2, sc.h * 0.885, hint[self.sel], sc.f_xs, C_DIM)
         sc.text(sc.w / 2, sc.h * 0.915,
@@ -1202,7 +1245,9 @@ class Result:
                     "sight offset %+.1f, %+.1f camera px"
                     % (self.c["bx"], self.c["by"])]
             if self.note:
-                body.append(self.note)
+                # the note carries one line per thing saved (calibration, then
+                # the camera settings), so it must not be drawn as one string
+                body.extend(l[:88] for l in self.note.split("\n") if l)
             sc.lines(sc.w / 2, sc.h * 0.34, body, sc.f_s, C_DIM)
             ok = "INSTALLED" in (self.install or "").upper()
             sc.text(sc.w / 2, sc.h * 0.56,
@@ -1269,7 +1314,7 @@ class Menu(RowScreen):
     def draw(self, sc):
         sc.text(sc.w / 2, sc.h * 0.075, self.title, sc.f_xl, C_FG)
         sc.text(sc.w / 2, sc.h * 0.135, self.subtitle, sc.f_s, C_DIM)
-        self.draw_rows(sc, sc.h * 0.24)
+        self.draw_rows(sc, sc.h * 0.24, sc.h * 0.77)
         link = self.app.link
         if link.src:
             b = link.last.get("board", "gun")
@@ -1314,6 +1359,18 @@ class App:
         self.toast = str(msg)
         self.toast_t = time.time()
         self.log(msg)
+
+    def save_cam(self, **want):
+        """Write the live camera settings to the gun and SAY WHAT HAPPENED.
+
+        Every screen that saves goes through here so the answer is the gun's
+        own, not this app's optimism: the reply says whether the flash write
+        returned OK and carries the values that were written, which are then
+        compared against what the screen asked for. `want` is optional -- pass
+        the fields the screen actually changed."""
+        ok, msg = camsave_verified(self.link.src, **want)
+        self.toast_now(msg)
+        return ok
 
     def no_data(self):
         return (self.link.src is not None and self.link.frames == 0
@@ -1363,7 +1420,8 @@ class App:
             return
         lead = int(self.link.last.get("lead", 0) or 0)
         smooth = int(self.link.last.get("smooth", 3) or 3)
-        t = Tuner(c, lead, smooth)
+        beta = int(self.link.last.get("beta", -1))
+        t = Tuner(c, lead, smooth, beta)
         view = FineTune(self, t)
         self.link.sink = lambda q, gt: view.recent.append(np.asarray(q, float))
         self.link.trig_sink = view.shoot

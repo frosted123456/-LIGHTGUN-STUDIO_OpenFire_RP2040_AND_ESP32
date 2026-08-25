@@ -158,7 +158,9 @@ class Link:
                             if k == "board":
                                 self.last["board"] = v
                             elif k in CAM_KEYS or k in LENS_KEYS \
-                                    or k in ("sens", "dead", "lead", "smooth"):
+                                    or k in ("sens", "dead", "lead", "smooth",
+                                                 "beta", "tmode",
+                                                 "firk", "firpct"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -521,7 +523,10 @@ def main():
         "noise floor above -- it still measures on this board.",
         (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(2, 4))
     barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=6)
-    tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"), log("~camsave sent")),
+    tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
+                                     log("~camsave sent -- the gun answers "
+                                         "with a CAM: saved / SAVE FAILED line "
+                                         "listing what it wrote")),
               font=FB, bg="#238636", fg="white", relief="flat", padx=14, pady=6).pack(side="left")
     tk.Button(barw, text="Read from gun", command=lambda: link.send("~cam?"),
               font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=6).pack(side="left", padx=8)
@@ -553,7 +558,10 @@ def main():
         threading.Thread(target=run, daemon=True).start()
     tk.Button(bar, text="Auto-tune", command=do_auto, font=FB, bg="#1f6feb", fg="white",
               relief="flat", padx=14, pady=6).pack(side="left")
-    tk.Button(bar, text="Save to gun", command=lambda: (link.send("~camsave"), log("~camsave sent")),
+    tk.Button(bar, text="Save to gun", command=lambda: (link.send("~camsave"),
+                                     log("~camsave sent -- the gun answers "
+                                         "with a CAM: saved / SAVE FAILED line "
+                                         "listing what it wrote")),
               font=FB, bg="#238636", fg="white", relief="flat", padx=14, pady=6).pack(side="left", padx=8)
     tk.Button(bar, text="Read from gun", command=lambda: link.send("~cam?"),
               font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=6).pack(side="left")
@@ -779,7 +787,37 @@ def main():
               fg=C_FG, relief="flat", padx=10).pack(side="left", padx=2)
     dead_lbl = lab(rowd, "off", F, C_DIM); dead_lbl.pack(side="left", padx=8)
 
-    tk.Button(rowb, text="Save to gun", command=lambda: (link.send("~camsave"), log("~camsave sent")),
+    # One Euro speed sensitivity. The cutoff is min_cutoff + beta*speed, so
+    # `smooth` sets how heavy the filter is AT REST and beta sets how quickly
+    # it lets go once the gun moves. Raising it shortens the trail on a swipe
+    # without touching rest stability.
+    def beta_nudge(d):
+        cur = int(link.last.get("beta", -1))
+        v = 15 if cur < 0 else cur
+        v = max(0, min(60, v + d * 3))
+        link.last["beta"] = v
+        link.send("~cam=beta:%d" % v)
+        log("beta -> %d  (speed sensitivity; 15 = default. Raise if the cursor "
+            "trails on a swipe, lower if fast motion looks noisy. "
+            "Save to gun to keep)" % v)
+    def beta_reset():
+        link.last["beta"] = -1
+        link.send("~cam=beta:-1")
+        log("beta -> default (15 at every smoothing level)")
+    rowt = tk.Frame(tab_lens, bg=C_BG); rowt.pack(fill="x", pady=(0, 4))
+    lab(rowt, "Smoothing speed sensitivity (beta):", F, C_DIM).pack(side="left")
+    tk.Button(rowt, text="-", command=lambda: beta_nudge(-1), font=F, bg="#161b22",
+              fg=C_FG, relief="flat", padx=10).pack(side="left", padx=(8, 2))
+    tk.Button(rowt, text="+", command=lambda: beta_nudge(+1), font=F, bg="#161b22",
+              fg=C_FG, relief="flat", padx=10).pack(side="left", padx=2)
+    tk.Button(rowt, text="default", command=beta_reset, font=F, bg="#161b22",
+              fg=C_FG, relief="flat", padx=10).pack(side="left", padx=6)
+    tmode_lbl = lab(rowt, "15 (default)", F, C_DIM); tmode_lbl.pack(side="left", padx=8)
+
+    tk.Button(rowb, text="Save to gun", command=lambda: (link.send("~camsave"),
+                                     log("~camsave sent -- the gun answers "
+                                         "with a CAM: saved / SAVE FAILED line "
+                                         "listing what it wrote")),
               font=FB, bg="#238636", fg="white", relief="flat", padx=12, pady=6).pack(side="left", padx=8)
     tk.Button(rowb, text="Read from gun", command=lambda: link.send("~cam?"),
               font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=6).pack(side="left")
@@ -806,6 +844,13 @@ def main():
 
     def lens_tick():
         # keep the state line honest from the gun's own cam? replies
+        bt = link.last.get("beta", None)
+        if bt is None:
+            tmode_lbl.config(text="?", fg=C_DIM)
+        elif bt < 0:
+            tmode_lbl.config(text="15 (default)", fg=C_DIM)
+        else:
+            tmode_lbl.config(text="%d" % bt, fg=C_OK if bt != 15 else C_DIM)
         d = link.last.get("dead", None)
         if d is not None:
             dead_lbl.config(text=("off" if d == 0 else "%d units" % d),

@@ -122,6 +122,64 @@ def install_over_serial(src, cmd, c, timeout=2.5):
             % (timeout, cmd.lstrip("~")))
 
 
+def camsave_verified(src, timeout=2.5, **want):
+    """Persist the live camera settings and CHECK what the gun actually wrote.
+
+    Two separate facts, and the caller is told both. The gun answers ~camsave
+    with "CAM: saved ..." or "CAM: SAVE FAILED ...", which is the flash write's
+    own result, and that same line carries the values that were written -- so
+    an expected lead, smoothing or beta is COMPARED against them instead of
+    assumed. An optimistic "saved" message printed over a write that never
+    happened is how a whole tuning session gets lost.
+
+    Returns (ok, message). Keys in `want` that the firmware does not report are
+    named in the message rather than treated as a mismatch, so an older build
+    reports "saved" honestly instead of failing on a field it never had.
+    """
+    if src is None:
+        return False, "no gun connected -- NOT saved"
+    try:
+        src.replies.clear()
+        src.ser.write(b"\n~camsave\n")
+    except Exception as e:
+        return False, "could not reach the gun (%s) -- NOT saved" % e
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        for r in list(src.replies):
+            if not (r.startswith("CAM: saved")
+                    or r.startswith("CAM: SAVE FAILED")):
+                continue
+            if r.startswith("CAM: SAVE FAILED"):
+                return False, "the gun REFUSED the save -- %s" % r.strip()
+            got = {}
+            for tok in r.split():
+                k, sep, v = tok.partition("=")
+                if not sep:
+                    continue
+                # lead is reported with its unit, as "lead=30ms"
+                try: got[k] = int(v[:-2] if v.endswith("ms") else v)
+                except ValueError: pass
+            bad = ["%s is %d, asked %d" % (k, got[k], int(v))
+                   for k, v in sorted(want.items())
+                   if k in got and got[k] != int(v)]
+            if bad:
+                return False, ("the gun saved DIFFERENT values -- %s"
+                               % "; ".join(bad))
+            shown = ", ".join("%s=%d" % (k, got[k])
+                              for k in sorted(want) if k in got)
+            msg = "SAVED to the gun and read back"
+            if shown:
+                msg += ": " + shown
+            missing = sorted(k for k in want if k not in got)
+            if missing:
+                msg += ("  (this firmware does not report %s in its save reply)"
+                        % ", ".join(missing))
+            return True, msg
+        time.sleep(0.05)
+    return False, ("NO REPLY to ~camsave in %.1fs -- treat the settings as NOT "
+                   "saved and try again" % timeout)
+
+
 def make_plan(n_dist=3, n_roll=2):
     """The stance list: distances first, then the rolled stances."""
     plan = [dict(kind='dist', roll=0) for _ in range(n_dist)]

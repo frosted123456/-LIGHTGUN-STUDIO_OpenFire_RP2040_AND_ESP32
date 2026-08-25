@@ -38,10 +38,18 @@ else
 fi
 
 # The aim pipeline's own C++ suites.
-for T in aim_core_test aim_runtime_test roll_test lever_test; do
+for T in aim_core_test aim_runtime_test roll_test lever_test fir_temporal_test; do
     SRC="lib/AimPipeline/aim_core.cpp"
-    [ "$T" = "aim_runtime_test" ] && SRC="$SRC lib/AimPipeline/aim_runtime.cpp"
-    if g++ -std=c++17 -O2 -Ilib/AimPipeline hostcheck/$T.cpp $SRC \
+    TFLAGS=""
+    case "$T" in
+        aim_runtime_test)
+            SRC="$SRC lib/AimPipeline/aim_runtime.cpp" ;;
+        fir_temporal_test)
+            # Mode 1 is compiled out of the shipped build; its tests ask for it
+            # explicitly, so a kept negative result stays verified.
+            SRC="$SRC lib/AimPipeline/aim_runtime.cpp"; TFLAGS="-DAIM_FIR_MODE" ;;
+    esac
+    if g++ -std=c++17 -O2 $TFLAGS -Ilib/AimPipeline hostcheck/$T.cpp $SRC \
            -o /tmp/ov_$T -lm && /tmp/ov_$T > /tmp/ov_$T.out 2>&1 \
        && grep -q "ALL PASS" /tmp/ov_$T.out; then
         echo "$T: OK"
@@ -213,6 +221,16 @@ if python3 hostcheck/install_verify_test.py > /tmp/ov_inst.out 2>&1 \
 else
     cat /tmp/ov_inst.out 2>/dev/null
     echo "calibration install + read-back: FAILED"; exit 1
+fi
+
+# The camera-settings save path: a save is CONFIRMED from the gun's own reply,
+# and the beta knob steps the way both front ends claim it does.
+if python3 hostcheck/camsave_verify_test.py > /tmp/ov_csv.out 2>&1 \
+   && grep -q "camsave verification: ALL PASS" /tmp/ov_csv.out; then
+    echo "camsave read-back + beta knob: OK"
+else
+    cat /tmp/ov_csv.out 2>/dev/null
+    echo "camsave read-back + beta knob: FAILED"; exit 1
 fi
 
 # The roll term end to end: paired on identical data, and the fitted coefficient

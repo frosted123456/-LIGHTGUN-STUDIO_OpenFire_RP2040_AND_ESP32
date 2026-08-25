@@ -74,7 +74,7 @@ session is logged to `pical/calib_out/` on that same partition.
 
 ## Step 5, fine tune
 
-Four rows, driven like every other screen: **up/down** picks a row,
+Five rows, driven like every other screen: **up/down** picks a row,
 **left/right** changes it, and any controller button steps through the rows.
 The sight offset has one row per axis so that up and down are never taken
 away from moving between rows.
@@ -83,11 +83,18 @@ away from moving between rows.
 |---|---|
 | Sight left / right | moves the cursor across, relative to your iron sights |
 | Sight up / down | the same, vertically |
-| Smoothing | raise until jitter settles; stop when it feels floaty |
+| Smoothing (at rest) | raise until rest jitter settles; stop when it feels floaty |
+| Speed sensitivity | how fast smoothing lets go once you MOVE; raise if swipes trail |
 | Lead | raise while the cursor trails; stop when reversals overshoot |
 
 Do them in that order — smoothing changes the latency that lead is
 compensating for, and the screen says so when you change it.
+
+**The drawn cursor is not a latency reference.** pical renders at 60 fps and
+presents a frame later, so the crosshair carries 17-33 ms of the app's own
+display lag. That is irrelevant for aligning iron sights, which is what it is
+there for. To compare filter settings by feel, save them to the gun, quit, and
+use the desktop cursor.
 
 ## Running it
 

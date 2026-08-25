@@ -10,7 +10,9 @@ only ever measures what is left AFTER your nudges.
 
 Nudges go out as "aimcal!=" (applied, not written to flash); saving installs
 and persists. LEAD +/- trades latency for overshoot on reversals.
-SMOOTH +/- trades cursor jitter for glide (0 = filter off, 10 = heaviest)."""
+SMOOTH +/- trades cursor jitter for glide (0 = filter off, 10 = heaviest).
+BETA +/- sets how fast the smoothing lets go once the gun moves, independently
+of how heavy it is at rest; "auto" follows the smoothing table."""
 import argparse, os, queue, sys, time
 import numpy as np
 
@@ -18,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import aim_fit
 from aim_calib import (parse_q, find_gun, SerialSource, FRAME_W, FRAME_H,
-                       install_over_serial, aimcal_line)
+                       install_over_serial, aimcal_line, camsave_verified)
 
 STEP_PX   = 4.0                 # screen px per nudge, at 1920 wide
 # 5 ms, not 2. Measured through the real resolver: on a fast sweep one 2 ms
@@ -29,6 +31,12 @@ STEP_PX   = 4.0                 # screen px per nudge, at 1920 wide
 LEAD_STEP = 5                   # ms per lead nudge
 LEAD_MAX  = 50                  # the ceiling the capture layer clamps to anyway
 SMOOTH_MAX = 10                 # smoothing level range the firmware accepts
+# One Euro speed sensitivity: cutoff = min_cutoff + beta * speed. SMOOTH sets
+# how heavy the filter is at REST, BETA how fast it lets go once the gun moves.
+# -1 means "follow the smoothing table", which is a flat 15 at every level.
+BETA_STEP = 3                   # beta units per nudge
+BETA_MAX  = 60                  # AIM_BETA_MAX in the firmware
+BETA_AUTO = 15                  # what the table uses, and the base for a nudge off -1
 MIN_SPREAD = 1.25               # quad-span ratio between the two stations
 # Where the ring sits, as a fraction of the window. ONE definition: the drawing
 # and the measurement both read it, so they cannot drift apart -- a ring drawn
@@ -44,7 +52,7 @@ C_OK, C_WARN, C_BAD = "#39c26e", "#d8a13a", "#d24b4b"
 class Tuner:
     """State and arithmetic. No GUI, so it is testable headlessly."""
 
-    def __init__(self, calib, lead=0, smooth=3):
+    def __init__(self, calib, lead=0, smooth=3, beta=-1):
         self.c0 = dict(calib)          # what calibration produced, untouched
         self.stage = 0                 # 0 = near, 1 = far, 2 = done
         self.off = [np.zeros(2), np.zeros(2)]   # normalised screen nudges
@@ -55,6 +63,7 @@ class Tuner:
         # instead of stomping it back to a default.
         self.lead = self.lead0 = int(lead)
         self.smooth = self.smooth0 = int(smooth)
+        self.beta = self.beta0 = int(beta)
         self.msg = ""
 
     # ---- the live preview -------------------------------------------------
@@ -80,6 +89,23 @@ class Tuner:
 
     def nudge_smooth(self, d):
         self.smooth = int(min(SMOOTH_MAX, max(0, self.smooth + d)))
+
+    def nudge_beta(self, d):
+        """Step beta, with -1 ("follow the table") on the low side of zero.
+
+        A nudge off -1 starts from BETA_AUTO rather than from 0, because -1 IS
+        BETA_AUTO as far as the filter is concerned -- stepping to 0 would be a
+        15-unit jump in the wrong direction. Stepping below 0 lands on -1 and
+        STAYS there, so the default is reachable without a separate button and
+        holding the button down cannot walk back up the range."""
+        if self.beta < 0 and d < 0:
+            return
+        base = BETA_AUTO if self.beta < 0 else self.beta
+        v = base + d * BETA_STEP
+        self.beta = -1 if v < 0 else int(min(BETA_MAX, v))
+
+    def beta_label(self):
+        return ("auto, %d" % BETA_AUTO) if self.beta < 0 else str(self.beta)
 
     def note_quad(self, q):
         """A shot on the ring MEASURES the offset; it does not merely record a
@@ -161,7 +187,8 @@ class Tuner:
             return None
         d = self.off[self.stage]
         if (abs(d[0]) < 1e-9 and abs(d[1]) < 1e-9
-                and self.lead == self.lead0 and self.smooth == self.smooth0):
+                and self.lead == self.lead0 and self.smooth == self.smooth0
+                and self.beta == self.beta0):
             self.msg = "nothing to save yet -- nudge or shoot the ring first"
             return None
         return self.preview()
@@ -190,19 +217,26 @@ def run_gui(src, tuner, on_send):
                        font=("DejaVu Sans", int(size), "bold" if bold else "normal"))
 
     # ---- the buttons, as canvas rectangles we hit-test ourselves ----------
-    BW, BH, BY = SW * 0.105, SH * 0.11, SH * 0.03
-    gap = SW * 0.012
-    total = 8 * BW + 7 * gap
+    # BETA sits on the same bar as LEAD and SMOOTH: it is the third thing the
+    # cursor's feel depends on, and it was only reachable from Studio's lens tab.
+    # Width is derived from the count so adding a pair does not overrun the row.
+    DEFS = (("◀", ("nudge", -1, 0)),
+            ("▶", ("nudge", +1, 0)),
+            ("▲", ("nudge", 0, -1)),
+            ("▼", ("nudge", 0, +1)),
+            ("LEAD −", ("lead", -1)),
+            ("LEAD +", ("lead", +1)),
+            ("SMOOTH −", ("smooth", -1)),
+            ("SMOOTH +", ("smooth", +1)),
+            ("BETA −", ("beta", -1)),
+            ("BETA +", ("beta", +1)))
+    BH, BY = SH * 0.11, SH * 0.03
+    gap = SW * 0.010
+    BW = (SW * 0.95 - (len(DEFS) - 1) * gap) / len(DEFS)
+    total = len(DEFS) * BW + (len(DEFS) - 1) * gap
     x0 = (SW - total) / 2.0
     BUTTONS = []
-    for i, (lab, act) in enumerate((("◀", ("nudge", -1, 0)),
-                                    ("▶", ("nudge", +1, 0)),
-                                    ("▲", ("nudge", 0, -1)),
-                                    ("▼", ("nudge", 0, +1)),
-                                    ("LEAD −", ("lead", -1)),
-                                    ("LEAD +", ("lead", +1)),
-                                    ("SMOOTH −", ("smooth", -1)),
-                                    ("SMOOTH +", ("smooth", +1)))):
+    for i, (lab, act) in enumerate(DEFS):
         bx = x0 + i * (BW + gap)
         BUTTONS.append(dict(x0=bx, y0=BY, x1=bx + BW, y1=BY + BH, lab=lab, act=act))
     DONE = dict(x0=SW*0.29, y0=SH*0.86, x1=SW*0.49, y1=SH*0.94, lab="DONE", act=("done",))
@@ -244,6 +278,18 @@ def run_gui(src, tuner, on_send):
                 # lead no longer matches once the level changes
                 say("smoothing  %d  ->  %d   (re-check LEAD: its lag changed)"
                     % (before, tuner.smooth), b)
+        elif act[0] == "beta":
+            before = tuner.beta
+            tuner.nudge_beta(act[1])
+            on_send("~cam=beta:%d" % tuner.beta)
+            if tuner.beta == before:
+                say("speed sensitivity already at %s (range auto, 0-%d)"
+                    % (tuner.beta_label(), BETA_MAX), b)
+            else:
+                say("speed sensitivity  %s  ->  %s   (rest jitter unchanged)"
+                    % (("auto" if before < 0 else str(before)),
+                       tuner.beta_label()), b)
+            st["dirty"] = True
         elif act[0] == "save":
             c = tuner.solve_direct()
             if c is not None:
@@ -252,6 +298,10 @@ def run_gui(src, tuner, on_send):
                              "drifts when you change distance, redo this with "
                              "both stations.")
                 st["done"] = c
+            else:
+                # Without this the button looked dead: the refusal was written
+                # to tuner.msg, which is only drawn once stage 2 is reached.
+                say(tuner.msg or "nothing to save yet", b)
             st["dirty"] = True
         elif act[0] == "done":
             if tuner.stage == 0:
@@ -294,6 +344,8 @@ def run_gui(src, tuner, on_send):
     root.bind("<equal>", lambda e: do(("lead", +1), BUTTONS[5]))
     root.bind("<bracketleft>",  lambda e: do(("smooth", -1), BUTTONS[6]))
     root.bind("<bracketright>", lambda e: do(("smooth", +1), BUTTONS[7]))
+    root.bind("<comma>",  lambda e: do(("beta", -1), BUTTONS[8]))
+    root.bind("<period>", lambda e: do(("beta", +1), BUTTONS[9]))
     root.bind("<Return>", lambda e: do(("done",)))
 
     def push():
@@ -322,15 +374,20 @@ def run_gui(src, tuner, on_send):
         worth = st["vpx"] * (tuner.lead / 1000.0) * 1920.0
         text(SW/2, BY + BH + SH*0.026,
              "lead %d ms (worth about %.0f screen px at your current speed)"
-             "      smoothing %d / %d" % (tuner.lead, abs(worth),
-                                          tuner.smooth, SMOOTH_MAX), SH*0.019,
-             C_OK if (tuner.lead or tuner.smooth) else C_DIM)
+             "      smoothing %d / %d      speed sensitivity %s"
+             % (tuner.lead, abs(worth), tuner.smooth, SMOOTH_MAX,
+                tuner.beta_label()), SH*0.019,
+             C_OK if (tuner.lead or tuner.smooth or tuner.beta >= 0) else C_DIM)
         text(SW/2, BY + BH + SH*0.055,
              "LEAD: raise while the cursor trails you, stop when reversals "
              "overshoot.   SMOOTHING: raise until the jitter settles, stop "
              "when the cursor starts to glide.", SH*0.016, C_DIM)
+        text(SW/2, BY + BH + SH*0.078,
+             "BETA (speed sensitivity): how fast the smoothing lets go once you "
+             "move. Raise it if slow drags feel sticky; it does NOT shorten the "
+             "trail on a fast swipe -- that is LEAD.", SH*0.016, C_DIM)
         if (time.time() - st["toast_t"]) < 1.6 and st["toast"]:
-            text(SW/2, BY + BH + SH*0.090, st["toast"], SH*0.024, C_OK, bold=True)
+            text(SW/2, BY + BH + SH*0.112, st["toast"], SH*0.024, C_OK, bold=True)
 
         if tuner.stage == 2:
             text(SW/2, SH*0.42, "FINE TUNE APPLIED", SH*0.045, C_OK, bold=True)
@@ -454,7 +511,7 @@ def main():
     src.replies.clear()
     src.ser.write(b"\n~cam?\n")
     time.sleep(0.8)
-    lead0, smooth0 = 0, 3
+    lead0, smooth0, beta0 = 0, 3, -1
     for r in src.replies:
         if "lead=" not in r:
             continue
@@ -463,24 +520,28 @@ def main():
             try:
                 if k == "lead":     lead0 = int(float(v.rstrip("ms")))
                 elif k == "smooth": smooth0 = int(float(v))
+                elif k == "beta":   beta0 = int(float(v))
             except ValueError:
                 pass
-    print("gun reports lead=%d ms smooth=%d" % (lead0, smooth0))
+    print("gun reports lead=%d ms smooth=%d beta=%s"
+          % (lead0, smooth0, "auto" if beta0 < 0 else beta0))
 
     def send(line):
         try: src.ser.write(("\n%s\n" % line).encode())
         except Exception: pass
 
-    tuner = Tuner(cal, lead0, smooth0)
+    tuner = Tuner(cal, lead0, smooth0, beta0)
     out = run_gui(src, tuner, send)
     if out is None:
         send("~" + aimcal_line(cal))         # put the original back, saved
-        send("~cam=lead:%d,smooth:%d" % (tuner.lead0, tuner.smooth0))
-        print("cancelled; original calibration, lead and smoothing restored")
+        send("~cam=lead:%d,smooth:%d,beta:%d"
+             % (tuner.lead0, tuner.smooth0, tuner.beta0))
+        print("cancelled; original calibration, lead, smoothing and beta restored")
         return
     print(install_over_serial(src, aimcal_line(out), out))
-    send("~camsave")
-    print("lead %d ms + smoothing %d saved" % (tuner.lead, tuner.smooth))
+    ok, msg = camsave_verified(src, lead=tuner.lead, smooth=tuner.smooth,
+                               beta=tuner.beta)
+    print(("lead, smoothing and beta: " if ok else "SAVE PROBLEM -- ") + msg)
 
 
 if __name__ == "__main__":

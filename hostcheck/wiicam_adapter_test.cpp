@@ -29,7 +29,7 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 esp_err_t nvs_erase_key(nvs_handle_t, const char* k){ if(is_lens(k)) g_lh=false; else g_bh=false; return ESP_OK; }
 // key-aware i16 store: lead and smoothing live under their own keys
 struct I16Slot { char key[16]; int16_t v; bool have; };
-static I16Slot g_i16s[4];
+static I16Slot g_i16s[8];   // lead0 smth0 dead0 tmod0 fir0, plus room
 static I16Slot* i16_find(const char* k){
     for (auto& s : g_i16s) if (s.have && !strcmp(s.key, k)) return &s;
     return nullptr; }

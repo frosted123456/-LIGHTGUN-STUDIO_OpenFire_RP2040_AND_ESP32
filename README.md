@@ -85,7 +85,6 @@ while you were working. Not tested or supported on diamond shape.
 
 **Software**
 
-Fully tested using Visual Studio Code. Procedure, below not fully tested but should work.  
 
 You need Python 3.9+, PlatformIO Core, `git`, and two Python packages.
 
@@ -279,7 +278,7 @@ corrected upstream in the firmware — this step configures that.
   so the fitted numbers may not match the lens spec even when the correction
   is right. The calibration absorbs that scale.
 - **Save to gun** persists it; it reloads at every boot.
-- **A decentered lens leaves a one-sided error — and Measure now fits it.**
+- **A decentered lens leaves a one-sided error — and Measure fits it.**
   A clip-on lens that is not perfectly coaxial has its distortion centre off
   the frame centre, which shows up as an offset that grows toward one edge.
   Measure searches for that centre automatically, applies it when it clearly
@@ -305,6 +304,20 @@ corrected upstream in the firmware — this step configures that.
   deliberate drags start to step. **Save to gun** keeps it.
 - **Applying or changing a lens correction invalidates the aim calibration** —
   redo step 4, then step 5, after every change here.
+- (refer to step 5)**Smoothing speed sensitivity (`beta`).** The One Euro filter's cutoff is
+  `min_cutoff + beta x speed`. The **Smoothing** level sets `min_cutoff` — how
+  heavy the filter is **at rest**; `beta` sets how quickly it lets go once the
+  gun **moves**. The two are independent, which is why beta is its own knob.
+  Default 15 at every smoothing level, useful range roughly 12–35, `-1`
+  restores the default. **Save to gun** keeps it. I recommend leaving at 15 as 
+I did not experience much improvement by tweaking.
+- (refer to step 5)**Do not judge final delay lag from inside emulator or pical directly.**
+  The crosshair those apps draw is sampled at their render rate (60 fps) and presented 
+  a frame later, which adds 17–33 ms of chunky *display* latency that has nothing to 
+  do with the gun. It is fine for aligning iron sights, which is a static task. To
+  compare settings by feel: set them, `~camsave`, **close the app**, and use
+  the real desktop cursor, which the OS draws at the HID rate.
+
 
 **4 — Aim calibration** *(both boards)*. Five dots at each of two or three distances. Aim, pull
 the trigger four times per dot. Note the live preview refreshes slower than the
@@ -315,7 +328,7 @@ the fit will refuse. It ends by sending the calibration to the gun and reading
 it back to confirm.
 
 **5 — Fine tune** *(both boards)*. Lines the cursor up with your **iron sights**, which is not
-where the camera points. It opens showing the gun's SAVED lead and smoothing,
+where the camera points. It opens showing the gun's SAVED lead, smoothing and beta,
 so the first press steps from where you left off. Do it in this order:
 
 1. **Align first.** Shoot the ring with your iron sights, nudge with the
@@ -327,12 +340,22 @@ so the first press steps from where you left off. Do it in this order:
 2. **Then SMOOTH ± (0–10)** until the cursor's tracking feels consistent —
    raise it while the cursor jitters, stop when it starts to feel floaty.
    Wide and fisheye lenses usually want a level or two more than stock.
-3. **Then LEAD ±, last** — smoothing changes the total latency, so lead
+3. **Then BETA ±** if a slow deliberate drag feels sticky after step 2.
+   `auto` follows the smoothing table (15); the range is 0–60 and stepping
+   below 0 returns to `auto`. Expect a small effect: see the table in step 3
+   above for what it is worth in milliseconds. It does **not** shorten the
+   trail on a fast swipe. I recommend keeping at default 15. 
+4. **Then LEAD ±, last** — smoothing changes the total latency, so lead
    tuned before smoothing no longer matches (the screen reminds you). Raise
    it while the cursor trails your swings, stop as soon as it overshoots
-   when you reverse direction.
+   when you reverse direction. This is the knob that shortens a swipe trail.
+5. Repeat tuning step 2 and 4 until you are happy with final result. I recommend
+   to perform the verification using a cursor where possible. As mentionned previously, 
+   pycal add its own delay which  is not present on a desktop that read directly from HID. 
 
-Both are saved with the fine tune.
+All three are saved with the fine tune, and the gun's own reply is read back
+and reported: **SAVE** confirms what the gun actually wrote, so a refused or
+partial write is shown as a failure instead of a hopeful "saved".
 You will see a big difference here
 
 **6 — Verify** *(both boards)*. Shoots a nine-point grid and reports the error of the pipeline
@@ -512,7 +535,8 @@ All are prefixed `~` on the native USB port.
 | `~cam=dead:16` | Output dead-band in cursor units, 0 = off (default); swallows rest shimmer, never delays real motion |
 | `~cam=lens:2,lfeq:900,lfpx:840` | Set the lens correction live |
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only) |
-| `~camsave` | Persist camera settings, lead, smoothing, dead-band and lens |
+| `~cam=beta:24` | Smoothing speed sensitivity, 0–60; −1 = default (15) |
+| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens and temporal mode. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
 
 ## Calibrating without a PC
 

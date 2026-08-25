@@ -33,18 +33,43 @@ def ck(ok, msg):
 
 
 class FakeSer:
-    """Just enough serial for the calibration read-back and install paths."""
+    """Just enough serial for the calibration read-back and install paths.
+
+    It also APPLIES ~cam= lines and answers ~camsave with what it is holding,
+    so the save path is tested against a gun that can disagree rather than one
+    that always says yes."""
 
     def __init__(self, replies):
         self.replies = replies
         self.written = []
+        self.state = {"lead": 0, "smooth": 3, "beta": -1, "dead": 0, "lens": 0}
+        self.save_fails = False
 
     def write(self, b):
         self.written.append(b)
-        if b"aimcal?" in b:
+        txt = b.decode("ascii", "replace")
+        for line in txt.split("\n"):
+            line = line.strip().lstrip("~")
+            if not line.startswith("cam="):
+                continue
+            for tok in line[4:].split(","):
+                k, sep, v = tok.partition(":")
+                if sep and k in self.state:
+                    try:
+                        self.state[k] = int(v)
+                    except ValueError:
+                        pass
+        if "aimcal?" in txt:
             self.replies.append(
                 "AIM: cx=0.500000 cy=0.500000 w=0.350000 h=1.200000 "
                 "bx=5.00 by=-3.00 lever=0.000000 rx=0.000000 ry=0.000000")
+        if "camsave" in txt:
+            self.replies.append(
+                "%s thr=110 aec=300 agc=4 boost=0 lead=%dms smooth=%d dead=%d "
+                "beta=%d lens=%d tmode=0 firk=7 firpct=100"
+                % ("CAM: SAVE FAILED" if self.save_fails else "CAM: saved",
+                   self.state["lead"], self.state["smooth"],
+                   self.state["dead"], self.state["beta"], self.state["lens"]))
         return len(b)
 
 
@@ -220,15 +245,15 @@ def main():
        "it seeds lead and smoothing from the gun, not from defaults")
     app.step([], t + 1)
     ck(True, "fine-tune screen renders")
-    ck(ft.controls == ["dx", "dy", "smooth", "lead"],
+    ck(ft.controls == ["dx", "dy", "smooth", "beta", "lead"],
        "every adjustable thing has its own row")
     ft.sel = 0
     app.step([key(pygame.K_DOWN)], t + 1.5)
     ck(ft.sel == 1, "up/down moves between rows even on the sight-offset row")
-    ft.sel = 3                             # lead
+    ft.sel = 4                             # lead
     app.step([key(pygame.K_RIGHT)], t + 2)
     ck(ft.t.lead == 20 + pical.LEAD_STEP, "lead adjusts from the seeded value")
-    ft.sel = 2                             # smoothing
+    ft.sel = 2                             # rest smoothing
     app.step([key(pygame.K_RIGHT)], t + 3)
     ck(ft.t.smooth == 8 and "LEAD" in app.toast,
        "changing smoothing warns that lead must be re-checked")
@@ -244,6 +269,73 @@ def main():
     ft.sel = 0
     app.step([key(pygame.K_RETURN)], t + 4.7)
     ck(ft.sel == 1, "a pad button (select) also steps through the rows")
+
+    # ---- beta: how fast the smoothing lets go once the gun moves ---------
+    ck(ft.controls == ["dx", "dy", "smooth", "beta", "lead"],
+       "fine tune exposes rest smoothing and speed sensitivity separately")
+    ft.sel = 3                             # beta
+    n0 = len(app.link.src.ser.written)
+    lead_before, smooth_before = ft.t.lead, ft.t.smooth
+    app.step([key(pygame.K_RIGHT)], t + 4.9)
+    ck(app.link.last["beta"] == 18
+       and any(b"beta:18" in w for w in app.link.src.ser.written[n0:]),
+       "beta nudges up from the 15 default")
+    ck(ft.t.lead == lead_before and ft.t.smooth == smooth_before,
+       "and touches neither the lead nor the rest smoothing")
+    app.step([], t + 5.0)
+    ck(True, "fine-tune screen renders all five rows")
+    ft.sel = 4                             # lead is now the fifth row
+    app.step([key(pygame.K_RIGHT)], t + 5.1)
+    ck(ft.t.lead == lead_before + pical.LEAD_STEP, "the lead row still adjusts lead")
+
+    # ---- save: the feel settings must reach the gun on their own ---------
+    # A session spent purely on lead, smoothing and beta used to end with
+    # nothing written at all, because SAVE returned early when there was no
+    # sight offset to solve.
+    ser = app.link.src.ser
+    ft.t.off[0][:] = 0.0
+    ft.t.measured[0] = False
+    # nothing left for the sight-offset solver: this is the state a session
+    # spent purely on feel ends in, and it used to save nothing at all
+    ft.t.lead0, ft.t.smooth0, ft.t.beta0 = ft.t.lead, ft.t.smooth, ft.t.beta
+    ck(ft.t.solve_direct() is None, "there is no sight offset left to solve")
+    n0 = len(ser.written)
+    ft.save_now()
+    ck(any(b"camsave" in w for w in ser.written[n0:]),
+       "SAVE writes the feel settings even with no sight offset to solve")
+    ck(ser.state["lead"] == ft.t.lead and ser.state["beta"] == ft.t.beta,
+       "the gun ends up holding exactly what the screen shows")
+    ck("SAVED" in app.toast, "and the toast is the gun's own words: %s" % app.toast)
+
+    ser.save_fails = True
+    ft.save_now()
+    ck("REFUSED" in app.toast,
+       "a refused write is reported as a failure, not as saved: %s" % app.toast)
+    ser.save_fails = False
+
+    # cancelling must put back the beta the gun had, not leave a silent edit
+    app.to_menu()
+    app.link.last["beta"] = 9
+    app.begin_finetune()
+    ft2 = app.view
+    ft2.sel = 3
+    app.step([key(pygame.K_RIGHT)], t + 5.4)
+    ck(ser.state["beta"] == 12, "beta steps from the value the gun reported")
+    ft2.handle(["back"], (0, 0))
+    ck(ser.state["beta"] == 9, "cancelling puts the gun's own beta back")
+
+    # and the two-thing save: calibration AND feel settings, each reported
+    app.to_menu()
+    app.begin_finetune()
+    ft3 = app.view
+    ft3.sel = 0
+    app.step([key(pygame.K_LEFT)], t + 5.6)
+    ft3.save_now()
+    ck(isinstance(app.view, pical.Result),
+       "saving a sight offset lands on the result view")
+    ck("SAVED" in (app.view.note or ""),
+       "and the result names the camera settings' own outcome: %s"
+       % (app.view.note or "").replace("\n", " | "))
 
     # ---- 6 verify --------------------------------------------------------
     app.to_menu()

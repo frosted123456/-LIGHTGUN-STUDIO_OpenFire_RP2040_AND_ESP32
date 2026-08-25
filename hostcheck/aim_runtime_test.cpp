@@ -16,6 +16,32 @@ int main(){
     float sx,sy;
     ck(!aim_runtime_solve(q,240,176,&sx,&sy,0.0f), "solve refuses with no calibration");
 
+    printf("\ntemporal mode is off in the shipped build:\n");
+    aim_tmode_set(1);
+    ck(aim_tmode_get() == 0,
+       "mode 1 cannot be selected without -DAIM_FIR_MODE");
+    aim_tmode_set(0);
+
+    printf("\nOne Euro speed sensitivity (beta):\n");
+    aim_smooth_set(3);
+    ck(aim_beta_get() == -1, "beta follows the smoothing table by default");
+    ck(aim_filter_beta() == 15.0f, "which is 15 at level 3");
+    aim_beta_set(30);
+    ck(aim_beta_get() == 30 && aim_filter_beta() == 30.0f,
+       "an override takes effect immediately");
+    ck(aim_filter_min_cutoff() == 3.5f,
+       "and leaves the at-rest cutoff alone -- beta is speed only");
+    aim_smooth_set(7);
+    ck(aim_filter_beta() == 30.0f && aim_filter_min_cutoff() == 1.55f,
+       "the override survives a smoothing change");
+    aim_beta_set(999);
+    ck(aim_beta_get() == 60, "beta clamps high");
+    aim_beta_set(-1);
+    ck(aim_beta_get() == -1 && aim_filter_beta() == 15.0f,
+       "-1 hands beta back to the table");
+    aim_smooth_set(3);
+    aim_filter_set(0.0f, 0.0f);   // restore the deterministic setup
+
     printf("\nserial surface:\n");
     ck(!aim_runtime_command("thr=20"),        "unrelated line not claimed");
     ck(aim_runtime_command("aimcal?"),        "aimcal? claimed");

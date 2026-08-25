@@ -28,9 +28,12 @@ void wiicam_set_sens_hooks(void (*set_fn)(int), int (*get_fn)(void),
                            void (*save_fn)(void))
 { s_sens_set = set_fn; s_sens_get = get_fn; s_sens_save = save_fn; }
 
+// printf-checked: a format that gains a conversion without an argument
+// is a compile error, not a garbage line on the wire.
+__attribute__((format(printf, 1, 2)))
 static void reply(const char* fmt, ...)
 {
-    char b[192];
+    char b[256];        // cam? reaches ~185 with a fitted lens; 192 was too tight
     va_list ap; va_start(ap, fmt);
     const int n = vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
@@ -74,6 +77,12 @@ void wiicam_aim_begin(void)
     if (aim_smooth_load(&smooth)) aim_smooth_set(smooth);
     int dead = 0;
     if (aim_dead_load(&dead)) aim_dead_set(dead);
+    int beta = -1;
+    if (aim_beta_load(&beta)) aim_beta_set(beta);
+    int tmode = 0;
+    if (aim_tmode_load(&tmode)) aim_tmode_set(tmode);
+    int fk = 0, fp = 0;
+    if (aim_fir_load(&fk, &fp)) aim_fir_set(fk, fp);
     aim_lens_t ls;
     if (aim_lens_load(&ls)) {
         s_lens = (uint8_t)ls.model;
@@ -175,7 +184,15 @@ bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
     // clamped; never fed back into the resolver.
     float qx[4], qy[4];
     float lx = 0.0f, ly = 0.0f;
-    if (s_lead_ms > 0.0f && dt > 1e-4f) {
+    // Temporal mode 1 folds the lead into the pipeline's own FIR, so publish
+    // the quad unled there; both numbers it needs come from here.
+    aim_lead_note(s_lead_ms);
+    aim_conf_note((float)r.n_real * 0.25f);
+    // Mode 1 folds the lead into the FIR inside aim_runtime_solve, which is
+    // only reached with a calibration loaded. Uncalibrated, the lead must stay
+    // here or it disappears with nothing replacing it.
+    if ((aim_tmode_get() == 0 || !aim_runtime_active())
+        && s_lead_ms > 0.0f && dt > 1e-4f) {
         const float frames = (s_lead_ms * 1e-3f) / dt;
         lx = r.vx * frames; ly = r.vy * frames;
         const float m = sqrtf(lx*lx + ly*ly);
@@ -206,18 +223,28 @@ bool wiicam_cam_command(const char* line)
 {
     if (!line) return false;
     if (!strncmp(line, "camsave", 7)) {
-        aim_lead_store((int)s_lead_ms);
-        aim_smooth_store(aim_smooth_get());
-        aim_dead_store(aim_dead_get());
+        // Every store is checked. A reply that says "saved" while one write
+        // quietly failed is worse than no reply, because the tools report it
+        // to the user as confirmed. No short-circuit: all stores still run.
+        bool ok = aim_lead_store((int)s_lead_ms);
+        ok = aim_smooth_store(aim_smooth_get()) && ok;
+        ok = aim_dead_store(aim_dead_get()) && ok;
+        ok = aim_beta_store(aim_beta_get()) && ok;
+        ok = aim_tmode_store(aim_tmode_get()) && ok;
+        ok = aim_fir_store(aim_fir_k(), aim_fir_pct()) && ok;
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
                           s_lcx, s_lcy };
         bool lens_ok = true;
         if (ls.model == 0) aim_lens_clear();
         else               lens_ok = aim_lens_store(&ls);
-        reply(lens_ok ? "CAM: saved lead=%dms smooth=%d dead=%d lens=%d (sens lives in the OpenFIRE profile)\n"
-                      : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d lens=%d\n",
-              (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), (int)s_lens);
+        // beta rides in the reply so a tool can VERIFY what was written rather
+        // than assume it; cam? reports the live value, this reports the stored one.
+        reply(ok && lens_ok
+              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d (sens lives in the OpenFIRE profile)\n"
+              : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
+              (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), aim_beta_get(),
+              (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct());
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
@@ -230,12 +257,13 @@ bool wiicam_cam_command(const char* line)
     if (!strncmp(line, "cam?", 4)) {
         reply("CAM: board=rp2040-wiicam sens=%d mirx=%d miry=%d lead=%d "
               "smooth=%d dead=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d "
-              "lcxu=%d lcyu=%d res=%u dash=%u\n",
+              "lcxu=%d lcyu=%d beta=%d tmode=%d firk=%d firpct=%d res=%u dash=%u\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
               (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
               (int)(s_lcx*10.0f), (int)(s_lcy*10.0f),
+              aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
               (unsigned)s_res, (unsigned)s_dash);
         return true;
     }
@@ -271,13 +299,19 @@ bool wiicam_cam_command(const char* line)
                                          s_lcy = v; }
         else if (!strcmp(key, "smooth")) { aim_smooth_set(val); }
         else if (!strcmp(key, "dead"))   { aim_dead_set(val); }
+        else if (!strcmp(key, "beta"))   { aim_beta_set(val); }
+        else if (!strcmp(key, "tmode"))  { aim_tmode_set(val); }
+        else if (!strcmp(key, "firk"))   { aim_fir_set(val, aim_fir_pct()); }
+        else if (!strcmp(key, "firpct")) { aim_fir_set(aim_fir_k(), val); }
         else if (!strcmp(key, "sens")) { if (s_sens_set && val >= 0 && val <= 2) s_sens_set(val); }
         else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); quad_reset(0); }
         else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); quad_reset(0); }
     }
     s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
-    reply("CMD ok (tune) | sens=%d lead=%d smooth=%d lens=%u res=%u dash=%u\n",
+    reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d tmode=%d firk=%d "
+          "firpct=%d lens=%u res=%u dash=%u\n",
           s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
+          aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
           (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash);
     return true;
 }
