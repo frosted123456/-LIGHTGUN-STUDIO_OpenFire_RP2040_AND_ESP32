@@ -130,6 +130,39 @@ class Screen:
                                max(2, int(r * 0.12)))
 
 
+def install_cursor(screen_h):
+    """Hand our crosshair to the system cursor. True if it took.
+
+    The point is latency, not looks: a system cursor is moved by the compositor
+    from the HID report, so it does not wait for this app's frame. The artwork is
+    the same crosshair the Pi path blits, so nothing is lost by using it -- the
+    stock arrow being hard to see on a dark screen was the reason for drawing one
+    in the first place.
+
+    Kept small: a hardware cursor plane is commonly capped at 64x64. The
+    surface is n = 2*int(1.9r)+3 across, so r must stay at or under 16 -- at
+    17 the surface is 67 px and the kmsdrm backend REFUSES it, which silently
+    turns the whole hardware-cursor mode off on the one platform it is for.
+    """
+    r = int(max(8, min(16, screen_h * 0.022)))
+    n = 2 * int(r * 1.9) + 3
+    try:
+        surf = pygame.Surface((n, n), pygame.SRCALPHA)
+        c = (n - 1) // 2
+        pygame.draw.circle(surf, C_RING, (c, c), r, 3)
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            pygame.draw.line(surf, C_RING,
+                             (c + dx * r * 1.9, c + dy * r * 1.9),
+                             (c + dx * r * 0.4, c + dy * r * 0.4), 2)
+        pygame.draw.circle(surf, C_RING, (c, c), max(2, int(r * 0.12)))
+        pygame.mouse.set_cursor(pygame.cursors.Cursor((c, c), surf))
+    except Exception:
+        # No colour-cursor support on this platform or this pygame: fall back to
+        # blitting, which always works.
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # input: keyboard, mouse and any controller reduced to one set of actions
 # ---------------------------------------------------------------------------
@@ -1348,6 +1381,40 @@ class App:
         # crosshair parked in the corner pretending to be an aim point.
         self._mpos = None
         self._mseen = False
+        # Where the crosshair comes from. On a platform with a real pointer the
+        # OS moves it on the HID report, independently of this loop; drawing our
+        # own there puts a SECOND crosshair on screen one frame behind the first
+        # one, which is visible as lag next to the system cursor on the same
+        # display. So on those platforms we hand our own artwork to the system
+        # cursor instead of blitting it.
+        #
+        # kmsdrm (the Pi console) keeps the blit BY DEFAULT: there is no
+        # compositor there, and a silently missing cursor on the platform that
+        # needs one most is not worth a silent trade. But SDL's kmsdrm backend
+        # does drive the DRM cursor plane, and the plane moves the moment
+        # motion is PUMPED -- it does not wait for this loop to draw a frame.
+        # PICAL_HWCURSOR=1 (or --hwcursor) opts in; paired with pump_wait()
+        # below, the cursor then updates faster than the 60 fps draw rate.
+        # The headless drivers never take this path.
+        self._sys_cursor = False
+        self._sys_shown = None
+        self._pump_wait = False
+        drv = pygame.display.get_driver()
+        if drv not in ("kmsdrm", "dummy", "offscreen"):
+            self._sys_cursor = install_cursor(self.sc.h)
+        elif drv == "kmsdrm" and os.environ.get("PICAL_HWCURSOR") == "1":
+            self._sys_cursor = install_cursor(self.sc.h)
+            self._pump_wait = self._sys_cursor
+            if not self._sys_cursor:
+                # The user asked for this by name; a silent fallback would
+                # look identical to the mode working. The launcher log keeps
+                # this line.
+                print("pical: HWCURSOR requested but the cursor plane "
+                      "refused the cursor; using the drawn one")
+        # The app's own frame interval, measured, so display lag stops being a
+        # guess: current and the worst over the last second, in draw_hud.
+        self._t_frame = None
+        self._frame_hist = []
         self.view = Menu(self)
 
     # ---- plumbing --------------------------------------------------------
@@ -1511,6 +1578,13 @@ class App:
     def draw_hud(self, sc, extra=""):
         link = self.link
         parts = ["%d frames" % link.frames, "%.0f Hz" % link.fps()]
+        # The app's OWN loop interval -- the gun Hz above is the serial stream,
+        # which says nothing about how often this screen redraws. The drawn
+        # cursor can never be fresher than this number.
+        if self._frame_hist:
+            dts = [d for _, d in self._frame_hist]
+            parts.append("app %.0f ms (worst %.0f)"
+                         % (1000.0 * sum(dts) / len(dts), 1000.0 * max(dts)))
         if link.span():
             parts.append("span %.0f px" % link.span())
         if extra:
@@ -1587,19 +1661,28 @@ class App:
         pygame.draw.line(sc.s, C_RING, (ccx, ccy - 6), (ccx, ccy + 6), 1)
 
     def draw_cursor(self, sc):
-        """Draw the pointer ourselves.
+        """Show the pointer -- as the system cursor where there is one, else drawn.
 
-        The Pi hides the system cursor (there is nothing to hide it behind on
-        a console), and it is invisible against a dark screen anyway. This is
-        the same pointer -- the gun drives it over USB HID -- just drawn where
-        it can be seen, so aim can be judged instead of imagined.
+        Same pointer either way: the gun drives it over USB HID. The Pi console
+        has no cursor of its own to show, so it is drawn there. On a desktop the
+        system cursor carries our crosshair artwork instead, because a blitted
+        copy can only move when this loop draws a frame and therefore trails the
+        real pointer by a frame -- which is exactly what it looks like when both
+        are on the same screen.
+
+        Some screens deliberately do not want it: during a lens sweep and a dot
+        capture the cursor is driven by the stock aim or by a calibration that is
+        about to be replaced, so showing it would be a lie.
         """
-        if not self._mseen or not self.link.hid_on:
+        want = (self._mseen and self.link.hid_on
+                and not getattr(self.view, "hide_cursor", False))
+        if self._sys_cursor:
+            # set_visible on every frame would spam SDL; only on a change
+            if want != self._sys_shown:
+                pygame.mouse.set_visible(bool(want))
+                self._sys_shown = want
             return
-        # Some screens deliberately do not want it: during a lens sweep and a
-        # dot capture the cursor is being driven by the stock aim or by a
-        # calibration that is about to be replaced, so it would be a lie.
-        if getattr(self.view, "hide_cursor", False):
+        if not want:
             return
         x, y = pygame.mouse.get_pos()
         sc.crosshair(x, y, sc.h * 0.022, C_RING, dot=True)
@@ -1646,6 +1729,14 @@ class App:
 
     # ---- one frame -------------------------------------------------------
     def step(self, events, now):
+        if self._t_frame is not None and now > self._t_frame:
+            self._frame_hist.append((now, now - self._t_frame))
+            while self._frame_hist and self._frame_hist[0][0] < now - 1.0:
+                self._frame_hist.pop(0)
+            # Hard cap as well: a backward clock step (NTP, a hand-set date)
+            # leaves future-stamped entries the window prune never reaches.
+            del self._frame_hist[:-240]
+        self._t_frame = now
         acts = self.inp.actions(events, now)
         mouse = pygame.mouse.get_pos()
         if self._mpos is not None and mouse != self._mpos:
@@ -1699,6 +1790,42 @@ def pick_drm_device():
     return None
 
 
+def pump_wait(clock, pump):
+    """Hold the ~60 fps pace -- and keep the pointer moving while holding it.
+
+    SDL only reads the gun's motion when events are pumped, so under kmsdrm the
+    hardware cursor moves at PUMP rate, not draw rate. clock.tick sleeps the
+    whole gap in one block, freezing the cursor for 16 ms at a time; this
+    spreads short sleeps with a pump after each, so the plane tracks the gun
+    several times per frame. Pumped events stay queued for event.get() -- pump
+    consumes nothing.
+
+    The plain path stays clock.tick: extra pumps cost CPU a Zero 2 W does not
+    have, and without the hardware cursor they buy nothing anyone can see.
+
+    The deadline is carried across calls, like clock.tick's own: measured from
+    ENTRY it would add a full 16.7 ms on top of each frame's work (and on top
+    of flip's vblank wait), dropping the drawn UI to ~30 fps. Carried, the
+    frame's work is subtracted from the wait, and a late frame pays no extra
+    debt. Monotonic clock: wall time steps backwards when someone sets the
+    date, and this loop must never sleep out that jump.
+    """
+    if not pump:
+        clock.tick(60)
+        return
+    now = time.monotonic()
+    deadline = getattr(pump_wait, "_next", now)
+    if deadline < now:
+        deadline = now                     # late frame: no wait, no debt
+    pump_wait._next = deadline + (1.0 / 60.0)
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(left if left < 0.004 else 0.004)
+        pygame.event.pump()
+
+
 def run(stances=3, windowed=False, port=None):
     if not windowed:
         picked = pick_drm_device()
@@ -1730,7 +1857,7 @@ def run(stances=3, windowed=False, port=None):
                 app.running = False
         app.step(events, time.time())
         pygame.display.flip()
-        clock.tick(60)
+        pump_wait(clock, app._pump_wait)
     app.link.close()
     pygame.quit()
     return 0
@@ -1744,7 +1871,13 @@ def main():
     ap.add_argument("--stances", type=int, default=3, choices=(2, 3),
                     help="distance stances for the calibration (default 3)")
     ap.add_argument("--port", help="serial port; probed when omitted")
+    ap.add_argument("--hwcursor", action="store_true",
+                    help="on a Pi console, move the cursor on the DRM hardware "
+                         "plane at pump rate instead of drawing it at frame "
+                         "rate (lower lag; costs CPU)")
     a = ap.parse_args()
+    if a.hwcursor:
+        os.environ["PICAL_HWCURSOR"] = "1"
     sys.exit(run(a.stances, a.windowed, a.port))
 
 

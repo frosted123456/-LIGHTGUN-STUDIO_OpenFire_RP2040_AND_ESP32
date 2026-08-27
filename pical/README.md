@@ -90,11 +90,21 @@ away from moving between rows.
 Do them in that order — smoothing changes the latency that lead is
 compensating for, and the screen says so when you change it.
 
-**The drawn cursor is not a latency reference.** pical renders at 60 fps and
-presents a frame later, so the crosshair carries 17-33 ms of the app's own
-display lag. That is irrelevant for aligning iron sights, which is what it is
-there for. To compare filter settings by feel, save them to the gun, quit, and
-use the desktop cursor.
+**Which cursor you get depends on the platform.** On a PC the app hands its
+crosshair to the **system** cursor, which the OS moves straight from the gun's
+reports — no app lag. On the Pi console there is no system cursor, so one is
+drawn, and a drawn cursor updates at the app's own frame rate — the HUD's
+`app N ms` figure is exactly that interval, measured. Two switch files on the
+stick change the Pi behaviour (create them empty next to `pical.py`, delete to
+undo):
+
+| file | effect |
+|---|---|
+| `HWCURSOR` | moves the cursor on the display chip's own cursor layer, at input-pump rate instead of frame rate. Less cursor lag; costs CPU. If the cursor disappears, delete the file |
+| `NOKMS` | skips the direct display path and starts the X server, where the server moves the cursor from the gun's reports like a desktop does |
+
+Even so, to compare filter settings by feel, save them to the gun, quit, and
+judge on a desktop cursor or in a game — not against a calibration screen.
 
 ## Running it
 

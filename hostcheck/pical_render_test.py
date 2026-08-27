@@ -428,6 +428,126 @@ def main():
     pygame.mouse.get_pos = real_pos
     app.view = keep
 
+    # ---- the system-cursor path -------------------------------------------
+    # On a desktop the OS moves the pointer from the HID report, so blitting a
+    # copy puts a second crosshair on screen one frame behind the real one.
+    # There we hand our artwork to the system cursor and blit NOTHING; the same
+    # show/hide rules still have to apply, through set_visible instead.
+    shown = []
+    real_vis = pygame.mouse.set_visible
+    pygame.mouse.set_visible = lambda v: shown.append(bool(v))
+    pygame.mouse.get_pos = lambda: (640, 360)
+    app._sys_cursor, app._sys_shown = True, None
+    app.view = pical.Menu(app)
+    app._mseen, app.link.hid_on = True, True
+    surf.fill(pical.C_BG); app.draw_cursor(sc)
+    ck(lit(surf) == 0, "with a system cursor nothing is blitted")
+    ck(shown[-1:] == [True], "and the system cursor is shown instead")
+    n = len(shown)
+    surf.fill(pical.C_BG); app.draw_cursor(sc)
+    ck(len(shown) == n, "an unchanged state does not re-issue set_visible")
+    app.link.hid_on = False
+    app.draw_cursor(sc)
+    ck(shown[-1:] == [False], "a frozen pointer hides the system cursor too")
+    app.link.hid_on = True
+    app.view = pical.Lens(app)
+    app.view.sweeping = True
+    app.draw_cursor(sc)
+    ck(shown[-1:] == [False], "and so does a lens sweep")
+    app.view.sweeping = False
+    app.draw_cursor(sc)
+    ck(shown[-1:] == [True], "it comes back when the sweep ends")
+    pygame.mouse.set_visible = real_vis
+    pygame.mouse.get_pos = real_pos
+    app._sys_cursor, app._sys_shown = False, None
+    app.view = keep
+    # the headless driver must NOT have taken that path by itself, or the Pi
+    # console would silently lose its only cursor
+    ck(pical.App(surf, stances=2)._sys_cursor is False,
+       "the headless driver keeps the blitted cursor")
+    ck(pical.install_cursor(720) in (True, False),
+       "install_cursor answers rather than raising")
+    # The DRM cursor plane is commonly 64x64; one pixel over and the kmsdrm
+    # backend refuses the cursor, silently killing the mode it exists for.
+    for h in (480, 720, 1080, 2160):
+        r = int(max(8, min(16, h * 0.022)))
+        n = 2 * int(r * 1.9) + 3
+        if n > 64:
+            ck(False, "cursor surface is %d px at screen height %d "
+                      "-- exceeds the 64 px hardware plane" % (n, h))
+            break
+    else:
+        ck(True, "the cursor surface fits the 64 px hardware plane at "
+                 "every screen height")
+
+    # ---- the kmsdrm hardware-cursor opt-in --------------------------------
+    # Default on the Pi console is the blit; PICAL_HWCURSOR=1 moves the
+    # pointer to the DRM cursor plane and turns on the pump-paced wait.
+    real_drv = pygame.display.get_driver
+    pygame.display.get_driver = lambda: "kmsdrm"
+    os.environ.pop("PICAL_HWCURSOR", None)
+    a1 = pical.App(surf, stances=2)
+    ck(a1._sys_cursor is False and a1._pump_wait is False,
+       "kmsdrm defaults to the blitted cursor, no extra pumping")
+    os.environ["PICAL_HWCURSOR"] = "1"
+    a2 = pical.App(surf, stances=2)
+    ck(a2._pump_wait == a2._sys_cursor,
+       "with HWCURSOR, pump pacing follows the cursor install (%s)"
+       % a2._sys_cursor)
+    os.environ.pop("PICAL_HWCURSOR", None)
+    pygame.display.get_driver = real_drv
+
+    # ---- pump_wait --------------------------------------------------------
+    class FakeClock:
+        def __init__(self): self.ticks = []
+        def tick(self, n): self.ticks.append(n)
+    fc = FakeClock()
+    pical.pump_wait(fc, False)
+    ck(fc.ticks == [60], "without pumping it is exactly clock.tick(60)")
+    pumps = []
+    real_pump = pygame.event.pump
+    pygame.event.pump = lambda: pumps.append(1)
+    if hasattr(pical.pump_wait, "_next"):
+        del pical.pump_wait._next
+    t0 = time.time()
+    # The deadline is carried across calls like clock.tick's: the first call
+    # establishes the pace (no wait), the second holds it.
+    pical.pump_wait(fc, True)
+    first = len(pumps)
+    pical.pump_wait(fc, True)
+    dt = time.time() - t0
+    pygame.event.pump = real_pump
+    ck(fc.ticks == [60], "the pumped path never touches the clock")
+    ck(first == 0, "the first call anchors the pace without waiting")
+    # Loose bounds on purpose: a loaded CI runner can turn one 4 ms sleep
+    # into most of the frame, so demand only that pumping happened and that
+    # the pace is neither skipped nor grossly overslept.
+    ck(len(pumps) >= 1,
+       "the wait pumps events while holding the pace (%d)" % len(pumps))
+    ck(0.008 < dt < 0.5,
+       "and holds roughly a frame of pace across the pair (%.1f ms)" % (dt * 1e3))
+    # a late frame must not accumulate debt: fake being far behind schedule
+    pical.pump_wait._next = time.monotonic() - 1.0
+    t0 = time.time()
+    pical.pump_wait(fc, True)
+    ck(time.time() - t0 < 0.05, "a late frame pays no extra wait")
+    del pical.pump_wait._next
+
+    # ---- the measured frame interval --------------------------------------
+    ah = pical.App(surf, stances=2)
+    attach(ah)
+    for i in range(5):
+        ah.step([], 100.0 + i * 0.016)
+    ck(len(ah._frame_hist) >= 3, "the loop interval is being recorded")
+    dts = [d for _, d in ah._frame_hist]
+    ck(all(abs(d - 0.016) < 1e-9 for d in dts),
+       "and records the real step-to-step gap")
+    ah.step([], 102.0)
+    ck(all(t > 101.0 for t, _ in ah._frame_hist),
+       "old samples age out after a second")
+    ah.draw_hud(pical.Screen(surf), "")
+    ck(True, "the HUD renders with the app-interval figure")
+
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on
     # it. Choosing that one draws nothing and reports no error at all.

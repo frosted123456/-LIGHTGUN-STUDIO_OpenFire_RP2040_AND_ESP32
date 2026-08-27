@@ -146,4 +146,6 @@ jobs:
             else
               echo "[pical-latest.img.xz](https://github.com/${{ github.repository }}/releases/download/latest/pical-latest.img.xz)"
             fi
+            echo ""
+            echo "compressed size: $(du -h "${{ steps.name.outputs.file }}" | cut -f1)"
           } >> "$GITHUB_STEP_SUMMARY"

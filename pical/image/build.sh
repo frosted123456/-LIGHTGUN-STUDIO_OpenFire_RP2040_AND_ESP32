@@ -126,6 +126,13 @@ set_p2_end() {
     [ "$got" = "$last" ] || die "partition 2 end is ${got}s, wanted ${last}s"
 }
 
+# The diet knob must survive into the chroot's environment; export it here so
+# its state is explicit, and log it -- "sudo" without -E silently strips a
+# caller's PICAL_KEEP_NET=1, and the failure mode of that is a Zero 2 W image
+# with no network path at all and nothing saying why.
+export PICAL_KEEP_NET="${PICAL_KEEP_NET:-0}"
+say "diet: network/bluetooth stack will be $([ "$PICAL_KEEP_NET" = "1" ] && echo KEPT || echo REMOVED) (PICAL_KEEP_NET=$PICAL_KEEP_NET)"
+
 mkdir -p "$WORK"
 
 # ---------------------------------------------------------------- base image
@@ -236,6 +243,46 @@ cat > /etc/X11/Xwrapper.config <<'XWRAP'
 allowed_users=anybody
 needs_root_rights=yes
 XWRAP
+# ---- diet -----------------------------------------------------------------
+# This is an offline appliance: it never joins a network, never pairs
+# bluetooth, never prints, never speaks anything but HDMI and USB. Everything
+# below is weight the base OS carries for machines that do. Each purge is
+# per-package and tolerant, so a package the base image no longer ships does
+# not fail the build; the import check afterwards is the real gate.
+#
+# PICAL_KEEP_NET=1 keeps wifi/bluetooth firmware and the network stack, for
+# anyone who wants SSH onto the stick (network is otherwise dead weight; note
+# a Pi Zero 2 W has no wired port, so without this it has no network at all).
+if [ "${PICAL_KEEP_NET:-0}" != "1" ]; then
+    for p in firmware-brcm80211 firmware-atheros firmware-libertas              firmware-realtek firmware-misc-nonfree bluez bluez-firmware              pi-bluetooth wpasupplicant wireless-regdb crda iw              network-manager modemmanager dhcpcd-base dhcpcd5 avahi-daemon              rfkill bluetooth; do
+        apt-get purge -y "$p" 2>/dev/null || true
+    done
+fi
+for p in triggerhappy alsa-utils cifs-utils nfs-common rpcbind          rsync mkvtoolnix v4l-utils; do
+    apt-get purge -y "$p" 2>/dev/null || true
+done
+apt-get autoremove --purge -y || true
+
+# Docs, manuals and translations: keep every copyright file (the image is
+# redistributed; the licences travel with it), drop the rest.
+find /usr/share/doc -depth -type f ! -name copyright -delete 2>/dev/null || true
+find /usr/share/doc -depth -type d -empty -delete 2>/dev/null || true
+rm -rf /usr/share/man/* /usr/share/info/* 2>/dev/null || true
+find /usr/share/locale -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+rm -rf /var/cache/* /var/log/*.log /var/log/journal/* 2>/dev/null || true
+
+# The gate: whatever the diet removed, the app's imports must still stand.
+# This runs the image's own ARM python (under qemu on the build host), so a
+# purge that broke SDL, numpy or pyserial fails HERE, not on the TV.
+python3 -c "import pygame, numpy, serial; print('diet: imports OK')"
+
+# What is left, largest first -- read this in the CI log to aim the next cut.
+echo "== diet: largest directories =="
+du -x --max-depth=2 / 2>/dev/null | sort -rn | head -25 || true
+echo "== diet: largest packages =="
+dpkg-query -W -f='${Installed-Size}	${Package}
+' 2>/dev/null | sort -rn | head -25 || true
+
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 # A named account exists for diagnostics over SSH or a second console; the
@@ -347,5 +394,5 @@ if [ "${PICAL_NO_XZ:-0}" = "1" ]; then
 fi
 say "compressing"
 rm -f "$OUT.xz"
-xz -T0 -9 "$OUT"
+xz -T0 -9e "$OUT"
 say "done: $OUT.xz  ($(du -h "$OUT.xz" | cut -f1))"

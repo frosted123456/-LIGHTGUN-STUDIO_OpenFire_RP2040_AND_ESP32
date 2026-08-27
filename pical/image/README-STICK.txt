@@ -27,9 +27,17 @@ UPDATING
   Replace pical.py (and tools/) from a newer release. This partition is
   FAT, so Windows, macOS and Linux can all write to it directly.
 
-IF SOMETHING GOES WRONG
-  Create an empty file called NOAUTOSTART next to pical.py, from any PC.
-  The Pi then boots to a root shell instead of the app, so you can look
-  around. Delete it to go back to normal. From that shell:
-      pical-launch            run the app by hand
-      journalctl -b | tail    what happened during this boot
+SWITCH FILES (create them empty, next to pical.py, from any PC)
+  NOAUTOSTART   boot to a root shell instead of the app, for a look around.
+                From that shell:
+                    pical-launch            run the app by hand
+                    journalctl -b | tail    what happened during this boot
+  HWCURSOR      move the cursor on the display chip's own cursor layer, at
+                input rate instead of frame rate. Less cursor lag; costs
+                some CPU. If the cursor ever disappears with this on,
+                delete the file.
+  NOKMS         skip the direct display path and start the X server
+                instead. There the SERVER moves the cursor from the gun's
+                reports, like a desktop does. Use to compare cursor lag,
+                or if the direct path shows no picture.
+  Delete a file to undo it. All three survive updates to pical.py.

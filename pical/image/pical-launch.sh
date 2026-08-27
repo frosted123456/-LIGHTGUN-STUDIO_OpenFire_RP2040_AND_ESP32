@@ -63,6 +63,18 @@ run_py() {
 # attached, and which index it gets is arbitrary; the app picks the card whose
 # connector reports "connected", and the numbered attempts below are only
 # there in case that scan finds nothing.
+#
+# PICAL_NO_KMS=1 (or a NOKMS file next to the app on the stick) skips straight
+# to X. Under X the SERVER owns the pointer and moves the hardware cursor from
+# the HID report itself, independent of the app's frame loop -- the same
+# arrangement a desktop has. kmsdrm stays the default because it needs no
+# server at all; X is there for comparing cursor latency and as the fallback.
+if [ -f "$APP/NOKMS" ]; then PICAL_NO_KMS=1; fi
+# HWCURSOR on the stick turns on the DRM hardware-cursor mode: the pointer
+# rides the display controller's cursor plane and moves at event-pump rate
+# instead of waiting for each drawn frame. Off by default -- it costs CPU.
+if [ -f "$APP/HWCURSOR" ]; then export PICAL_HWCURSOR=1; fi
+if [ "${PICAL_NO_KMS:-0}" != "1" ]; then
 for IDX in auto 0 1 2; do
     if [ "$IDX" = "auto" ]; then
         unset SDL_KMSDRM_DEVICE_INDEX
@@ -76,6 +88,9 @@ for IDX in auto 0 1 2; do
     log "   failed (exit $RC)"
 done
 unset SDL_KMSDRM_DEVICE_INDEX
+else
+    log "-- kmsdrm skipped (PICAL_NO_KMS)"
+fi
 
 # ---- 2: a minimal X server ----------------------------------------------
 # Only reached if kmsdrm could not open a display at all. X needs the same
@@ -83,8 +98,11 @@ unset SDL_KMSDRM_DEVICE_INDEX
 # it falls back to fbdev and dies with "Cannot run in framebuffer mode".
 if command -v xinit >/dev/null 2>&1 && [ -z "${PICAL_NO_X:-}" ]; then
     log "-- starting the X server"
+    # No -nocursor: the X server's own pointer IS the low-latency path -- it
+    # moves the hardware cursor from the HID report without waiting for the
+    # app's frame. The app hands it the crosshair artwork and draws nothing.
     SDL_VIDEODRIVER=x11 xinit /usr/bin/python3 "$APP/pical.py" "$@" \
-        -- :0 vt1 -keeptty -nocursor >> "$LOG" 2>&1
+        -- :0 vt1 -keeptty >> "$LOG" 2>&1
     RC=$?
     sync
     if [ "$RC" = "0" ]; then

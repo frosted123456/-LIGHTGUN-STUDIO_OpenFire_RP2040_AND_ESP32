@@ -85,6 +85,7 @@ while you were working. Not tested or supported on diamond shape.
 
 **Software**
 
+Fully tested using Visual Studio Code. Procedure, below not fully tested but should work.  
 
 You need Python 3.9+, PlatformIO Core, `git`, and two Python packages.
 
@@ -278,7 +279,7 @@ corrected upstream in the firmware — this step configures that.
   so the fitted numbers may not match the lens spec even when the correction
   is right. The calibration absorbs that scale.
 - **Save to gun** persists it; it reloads at every boot.
-- **A decentered lens leaves a one-sided error — and Measure fits it.**
+- **A decentered lens leaves a one-sided error — and Measure now fits it.**
   A clip-on lens that is not perfectly coaxial has its distortion centre off
   the frame centre, which shows up as an offset that grows toward one edge.
   Measure searches for that centre automatically, applies it when it clearly
@@ -304,20 +305,47 @@ corrected upstream in the firmware — this step configures that.
   deliberate drags start to step. **Save to gun** keeps it.
 - **Applying or changing a lens correction invalidates the aim calibration** —
   redo step 4, then step 5, after every change here.
-- (refer to step 5)**Smoothing speed sensitivity (`beta`).** The One Euro filter's cutoff is
+- **Smoothing speed sensitivity (`beta`).** The One Euro filter's cutoff is
   `min_cutoff + beta x speed`. The **Smoothing** level sets `min_cutoff` — how
   heavy the filter is **at rest**; `beta` sets how quickly it lets go once the
   gun **moves**. The two are independent, which is why beta is its own knob.
   Default 15 at every smoothing level, useful range roughly 12–35, `-1`
-  restores the default. **Save to gun** keeps it. I recommend leaving at 15 as 
-I did not experience much improvement by tweaking.
-- (refer to step 5)**Do not judge final delay lag from inside emulator or pical directly.**
-  The crosshair those apps draw is sampled at their render rate (60 fps) and presented 
-  a frame later, which adds 17–33 ms of chunky *display* latency that has nothing to 
-  do with the gun. It is fine for aligning iron sights, which is a static task. To
-  compare settings by feel: set them, `~camsave`, **close the app**, and use
-  the real desktop cursor, which the OS draws at the HID rate.
+  restores the default. **Save to gun** keeps it.
 
+  **Where it actually bites, in numbers.** At smoothing level 3 the filter lag
+  is `1 / (2 pi (3.5 + beta x speed))`, with speed in screen widths per second.
+  On a 1.2 m wide screen, going from beta 15 to beta 30:
+
+  | hand speed | lag at beta 15 | lag at beta 30 | trail removed |
+  |---|---|---|---|
+  | 0.1 m/s (settling on a target) | 34 ms | 27 ms | 0.7 mm |
+  | 0.25 m/s (deliberate drag) | 24 ms | 17 ms | 1.9 mm |
+  | 1.0 m/s (tracking) | 10 ms | 6 ms | 4.4 mm |
+  | 4.0 m/s (fast swipe) | 3 ms | 2 ms | 5.8 mm |
+
+  So beta buys the most **time** on a slow deliberate drag and almost none on a
+  swipe, where the filter is already nearly transparent. It never buys more
+  than about 6 mm of trail. **The trail you see on a fast swipe is the pipeline
+  delay, not the filter** — 2 m/s against a 20 ms delay is 40 mm on its own.
+  That is `lead`'s job, not beta's. If 15 and 30 look identical to you on a
+  swipe, that is the expected result, not a broken knob.
+- **Judging lag: which cursor you are looking at matters.** Studio, the
+  fine-tune bar and pical on a desktop all use the **system** cursor, which the
+  OS moves straight from the gun's HID report — that one is honest. pical on a
+  Pi console has no system cursor to use, so it **draws** one, and a drawn
+  crosshair can only move when the app draws a frame: it is sampled once per
+  loop and presented a frame later, adding roughly 17–33 ms of *app* latency
+  that has nothing to do with the gun (more if the loop misses 60 fps). That is
+  fine for aligning iron sights, which is a static task, but it is not a lag
+  reference. To compare settings by feel on a Pi: set them, `~camsave`, then
+  judge against a game rather than against the calibration screen.
+- **A single-FIR temporal mode exists but is compiled out** (`AIM_FIR_MODE`).
+  It replaced the One Euro filter and the lead with one least-squares fit, so
+  that smoothing and prediction stopped fighting each other. It won in
+  simulation and lost on hardware: a fixed window cannot reproduce One Euro's
+  speed-adaptive cutoff, which is the property that actually makes the shipped
+  filter feel right. The code and its tests are kept — a measured negative
+  result is worth keeping — but the shipped build cannot select it.
 
 **4 — Aim calibration** *(both boards)*. Five dots at each of two or three distances. Aim, pull
 the trigger four times per dot. Note the live preview refreshes slower than the
@@ -344,14 +372,11 @@ so the first press steps from where you left off. Do it in this order:
    `auto` follows the smoothing table (15); the range is 0–60 and stepping
    below 0 returns to `auto`. Expect a small effect: see the table in step 3
    above for what it is worth in milliseconds. It does **not** shorten the
-   trail on a fast swipe. I recommend keeping at default 15. 
+   trail on a fast swipe.
 4. **Then LEAD ±, last** — smoothing changes the total latency, so lead
    tuned before smoothing no longer matches (the screen reminds you). Raise
    it while the cursor trails your swings, stop as soon as it overshoots
    when you reverse direction. This is the knob that shortens a swipe trail.
-5. Repeat tuning step 2 and 4 until you are happy with final result. I recommend
-   to perform the verification using a cursor where possible. As mentionned previously, 
-   pycal add its own delay which  is not present on a desktop that read directly from HID. 
 
 All three are saved with the fine tune, and the gun's own reply is read back
 and reported: **SAVE** confirms what the gun actually wrote, so a refused or

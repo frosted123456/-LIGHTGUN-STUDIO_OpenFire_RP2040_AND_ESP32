@@ -797,8 +797,9 @@ def main():
         v = max(0, min(60, v + d * 3))
         link.last["beta"] = v
         link.send("~cam=beta:%d" % v)
-        log("beta -> %d  (speed sensitivity; 15 = default. Raise if the cursor "
-            "trails on a swipe, lower if fast motion looks noisy. "
+        log("beta -> %d  (speed sensitivity; 15 = default. Raise if a SLOW "
+            "deliberate drag feels sticky. It is worth a few ms at most and it "
+            "does NOT shorten a fast swipe's trail -- that is LEAD. "
             "Save to gun to keep)" % v)
     def beta_reset():
         link.last["beta"] = -1
