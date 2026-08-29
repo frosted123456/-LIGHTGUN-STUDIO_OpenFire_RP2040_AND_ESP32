@@ -419,6 +419,10 @@ class Camera(RowScreen):
                 set=lambda v: link.send("~cam=sens:%d" % v),
                 lo=0, hi=2, step=1,
                 hint="0 default, 2 highest. Use at least 1-2 with a wide lens."))
+            self.rows.append(Row(
+                "Sensor connection test", act=self.diag,
+                hint="checks power, wiring, swapped lines and the sensor "
+                     "itself; the log shows the verdict"))
         else:
             self.subtitle = "aim for a blob noise floor under 0.30 px"
             for k, tip in (("thr", "threshold: raise it if the background shows up"),
@@ -437,6 +441,11 @@ class Camera(RowScreen):
         self.rows.append(Row("Save to gun", act=self.save,
                              hint="keeps these settings across power cycles"))
         self.rows.append(Row("Back", act=self.app.to_menu))
+
+    def diag(self):
+        self.app.link.send("~camdiag")
+        self.app.toast_now("testing the sensor link -- watch the log for the "
+                           "CAM: diag VERDICT line")
 
     def save(self):
         self.app.save_cam()
@@ -1311,6 +1320,86 @@ class Result:
 
 
 # ---------------------------------------------------------------------------
+# 7 -- recoil feel
+# ---------------------------------------------------------------------------
+class Recoil(RowScreen):
+    """The solenoid feel engine's knobs, from the couch.
+
+    Every row is a serial command; the values shown are the gun's own FX:
+    echoes, so a clamp or a refused save is visible, never papered over. The
+    engine ships OFF: the gun is stock until the first row says otherwise."""
+
+    title = "RECOIL FEEL"
+    subtitle = "engine OFF = stock behaviour. Dry-fire lets the trigger work with no IR."
+
+    KNOBS = (
+        ("on",     "Engine",             1, 0,   1,
+         "0 = stock OpenFIRE recoil, 1 = this engine owns the solenoid"),
+        ("drive",  "Strike (ms)",        5, 5,  100,
+         "the full-power hit; 45 with hold 0 is the stock default"),
+        ("hold",   "Hold (ms)",          10, 0,  500,
+         "separates the strike from the spring return; the two-event feel"),
+        ("duty",   "Hold power (%)",     5, 25,  70,
+         "raise until the hold stops buzzing, then stop"),
+        ("pulse",  "After-pulses",       1, 0,   3,
+         "extra clacks after release"),
+        ("gap",    "Pulse gap (ms)",     5, 15,  120,
+         "short = meatier single hit, long = a distinct double-clack"),
+        ("jit",    "Jitter (%)",         3, 0,   15,
+         "random stretch on hold and gaps; the strike stays exact"),
+        ("rumoff", "Rumble offset (ms)", 5, -20, 50,
+         "negative = the motor leads the strike"),
+        ("rumms",  "Rumble time (ms)",   10, 0,  200,
+         "0 leaves the rumble to OpenFIRE"),
+        ("space",  "Re-fire space (ms)", 10, 0,  500,
+         "quiet time between shots"),
+        ("auto",   "Autofire wait (ms)", 50, 0, 1000,
+         "how long the trigger is held before autofire starts"),
+    )
+
+    def __init__(self, app):
+        RowScreen.__init__(self, app)
+        link = app.link
+        self.rows = []
+        for key, name, step, lo, hi, tip in self.KNOBS:
+            self.rows.append(Row(
+                name, "spin",
+                get=(lambda kk=key: link.last.get("fx" + kk)),
+                set=(lambda v, kk=key: link.send("~fx=%s:%d" % (kk, v))),
+                lo=lo, hi=hi, step=step, hint=tip))
+        self.rows.append(Row("Test fire", act=self.test,
+                             hint="one full sequence, no trigger and no IR needed"))
+        self.rows.append(Row("Dry-fire mode (10 min)", act=self.dryfire,
+                             hint=self.dry_hint))
+        self.rows.append(Row("Save to gun", act=self.save,
+                             hint="keeps every knob across power cycles"))
+        self.rows.append(Row("Back", act=self.app.to_menu))
+        link.send("~fx?")            # seed the rows from the gun's own state
+
+    def test(self):
+        self.app.link.send("~fx=test:1")
+
+    def dryfire(self):
+        self.app.link.send("~fx=ab:1")
+        self.app.link.send("~fx?")
+        self.app.toast_now("dry-fire ON for 10 minutes -- the trigger now "
+                           "fires the solenoid with no IR")
+
+    def dry_hint(self):
+        """Named state, not hope: the mode disarms itself after 10 minutes,
+        and without a countdown its expiry reads as breakage."""
+        left = int(self.app.link.last.get("fxleft", 0) or 0)
+        if left > 0:
+            return ("ARMED, %d:%02d left -- re-select to re-arm for another "
+                    "10 minutes" % (left // 60, left % 60))
+        return "the trigger fires with no IR lock; expires by itself"
+
+    def save(self):
+        self.app.link.send("~fxsave")
+        self.app.toast_now("asked the gun to save -- watch the log for FX: saved")
+
+
+# ---------------------------------------------------------------------------
 # menu
 # ---------------------------------------------------------------------------
 class Menu(RowScreen):
@@ -1330,6 +1419,8 @@ class Menu(RowScreen):
                 hint="iron sights onto the cursor, then smoothing, then lead"),
             Row("6   Verify", act=app.begin_verify,
                 hint="nine shots, measures what the calibration achieved"),
+            Row("7   Recoil feel", act=lambda: app.open(Recoil(app)),
+                hint="solenoid strike, hold and after-pulses (RP2040 build)"),
             Row("Distances for calibration", "spin",
                 get=lambda: app.stances, set=lambda v: setattr(app, "stances", v),
                 lo=2, hi=3, step=1,
@@ -1405,6 +1496,12 @@ class App:
         elif drv == "kmsdrm" and os.environ.get("PICAL_HWCURSOR") == "1":
             self._sys_cursor = install_cursor(self.sc.h)
             self._pump_wait = self._sys_cursor
+            if self._sys_cursor:
+                # The success is logged too: without this line a run with the
+                # mode on and a run without it produce identical logs, and
+                # "no difference on the delay" cannot be told apart from
+                # "the switch never took".
+                print("pical: hardware cursor on the DRM plane, pump-paced")
             if not self._sys_cursor:
                 # The user asked for this by name; a silent fallback would
                 # look identical to the mode working. The launcher log keeps
@@ -1740,6 +1837,13 @@ class App:
         acts = self.inp.actions(events, now)
         mouse = pygame.mouse.get_pos()
         if self._mpos is not None and mouse != self._mpos:
+            if not self._mseen:
+                # One line, once: proof in the log that SDL delivers this
+                # device's motion at all. Its absence after a session IS the
+                # diagnosis -- an absolute mouse classified as a tablet or
+                # touchscreen produces no pointer motion on a bare console,
+                # and then no cursor of any kind can ever appear.
+                print("pical: first pointer motion at %d,%d" % mouse)
             self._mseen = True
         self._mpos = mouse
         # Extra keys that only make sense on the fine-tune screen.
@@ -1827,6 +1931,13 @@ def pump_wait(clock, pump):
 
 
 def run(stances=3, windowed=False, port=None):
+    # The HWCURSOR switch file is read HERE, not only by the launcher: the
+    # launcher lives in the image's Linux filesystem, which a PC cannot edit,
+    # while this file sits on the FAT partition next to pical.py -- the one
+    # place every update already goes. A stick with a new pical.py and an old
+    # launcher must still honour the switch.
+    if os.path.isfile(os.path.join(HERE, "HWCURSOR")):
+        os.environ["PICAL_HWCURSOR"] = "1"
     if not windowed:
         picked = pick_drm_device()
         if picked:

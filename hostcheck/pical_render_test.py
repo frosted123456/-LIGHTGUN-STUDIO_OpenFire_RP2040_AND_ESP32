@@ -548,6 +548,30 @@ def main():
     ah.draw_hud(pical.Screen(surf), "")
     ck(True, "the HUD renders with the app-interval figure")
 
+    # ---- 7 recoil feel -----------------------------------------------------
+    app.to_menu()
+    app.view = pical.Recoil(app)
+    ser = app.link.src.ser
+    ck(any(b"fx?" in w for w in ser.written),
+       "opening the recoil screen asks the gun for its state")
+    app.step([], t + 8)
+    ck(True, "recoil screen renders with no reply yet (all rows unknown)")
+    rv = app.view
+    rv.sel = 2                                 # hold
+    n0 = len(ser.written)
+    app.step([key(pygame.K_RIGHT)], t + 8.2)
+    ck(any(b"fx=hold:" in w for w in ser.written[n0:]),
+       "a knob row sends its ~fx= command")
+    # the FX: echo is what the rows display; feed one through the pump
+    app.link.last["fxhold"] = 90
+    app.step([], t + 8.4)
+    ck(True, "and renders the gun's echoed value")
+    rv.sel = len(rv.rows) - 4                  # test fire
+    n0 = len(ser.written)
+    app.step([key(pygame.K_RETURN)], t + 8.6)
+    ck(any(b"fx=test:1" in w for w in ser.written[n0:]),
+       "the test-fire row fires over serial")
+
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on
     # it. Choosing that one draws nothing and reports no error at all.

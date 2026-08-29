@@ -16,6 +16,32 @@ for D in 0 1; do
   done
 done
 
+# The wiicam connection diagnostic: the bit-banged probe against a simulated
+# bus whose fake slave really decodes the address -- power, wiring, swap and
+# stuck faults must each produce their own named verdict.
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -Ilib/WiicamAim \
+       hostcheck/wiicam_diag_test.cpp lib/WiicamAim/wiicam_diag.cpp \
+       -o /tmp/ov_wdiag && /tmp/ov_wdiag > /tmp/ov_wdiag.out 2>&1 \
+   && grep -q "ALL PASS" /tmp/ov_wdiag.out; then
+    echo "wiicam connection diagnostic: OK"
+else
+    tail -20 /tmp/ov_wdiag.out 2>/dev/null
+    echo "wiicam connection diagnostic: FAILED"; exit 1
+fi
+
+# The recoil effect engine: the exact solenoid + rumble waveform, phase by
+# phase, against a fake clock -- what passes here is what the pins will do.
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -Ilib/RecoilFx \
+       hostcheck/recoil_fx_test.cpp lib/RecoilFx/recoil_fx.cpp \
+       lib/RecoilFx/recoil_fx_cmd.cpp \
+       -o /tmp/ov_recoil && /tmp/ov_recoil > /tmp/ov_recoil.out 2>&1 \
+   && grep -q "ALL PASS" /tmp/ov_recoil.out; then
+    echo "recoil engine waveform: OK"
+else
+    tail -20 /tmp/ov_recoil.out 2>/dev/null
+    echo "recoil engine waveform: FAILED"; exit 1
+fi
+
 # The signed wire format: out-of-frame corners must survive with their sign.
 if g++ -std=c++17 -O1 -fsanitize=undefined -Ilib/DFRobotIRPositionEx_OV2640 \
        hostcheck/shim_signed_test.cpp -o /tmp/ov_shim_signed_test \
@@ -163,8 +189,11 @@ fi
 # The RP2040/wiicam front end: the stale-slot mask, 240x176 normalisation,
 # lock + solve, lead, and the ~cam subset -- all on the host.
 if g++ -std=c++17 -O2 -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
-       -Ilib/QuadResolver -Ilib/AimPipeline hostcheck/wiicam_adapter_test.cpp \
+       -Ilib/QuadResolver -Ilib/AimPipeline -Ilib/RecoilFx \
+       hostcheck/wiicam_adapter_test.cpp \
        lib/WiicamAim/wiicam_aim.cpp lib/QuadResolver/quad_resolver.cpp \
+       lib/WiicamAim/wiicam_diag.cpp lib/WiicamAim/wiicam_diag_glue.cpp \
+       lib/RecoilFx/recoil_fx.cpp lib/RecoilFx/recoil_fx_cmd.cpp \
        lib/AimPipeline/aim_runtime.cpp lib/AimPipeline/aim_core.cpp \
        -o /tmp/ov_wiicam -lm \
    && /tmp/ov_wiicam > /tmp/ov_wiicam.out 2>&1 \

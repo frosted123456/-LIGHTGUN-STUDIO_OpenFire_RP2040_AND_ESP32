@@ -35,6 +35,7 @@ bool wiicam_cam_command(const char* line);
 // may be dropped when the host is not draining, replies may block briefly.
 void wiicam_set_line_sink(void (*fn)(const char*));
 void wiicam_set_reply_sink(void (*fn)(const char*));
+void wiicam_set_diag_hook(int (*fn)(void));   // "~camdiag" runs it
 
 // Sensitivity is OpenFIRE's own persisted setting; the patch wires these to
 // FW_Common so '~cam=sens:n' goes through the same path as their UI.

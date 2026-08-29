@@ -1,6 +1,6 @@
 --- a/OpenFIREmain/OpenFIREmain.ino
 +++ b/OpenFIREmain/OpenFIREmain.ino
-@@ -23,6 +23,60 @@
+@@ -23,6 +23,62 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIREprefs.h"
  #include "OpenFIREconstant.h"
@@ -8,6 +8,8 @@
 +// Overlay hooks: the '~' serial channel, wiicam front end, shared aim runtime.
 +#include "aim_runtime.h"
 +#include "wiicam_aim.h"
++#include "wiicam_diag.h"
++#include "recoil_fx_glue.h"
 +#include <string.h>
 +// Telemetry sink: all-or-nothing, drops when the host is not draining.
 +static void aim_line_sink(const char* line)
@@ -61,7 +63,7 @@
  
  // Sets up the environment
  void setup() {
-@@ -141,7 +195,18 @@ void setup() {
+@@ -141,7 +197,70 @@
      #endif // LED_ENABLE
  
      // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
@@ -71,7 +73,59 @@
 +#ifdef USE_AIM_PIPELINE
 +    aim_runtime_begin();
 +    wiicam_aim_begin();
++    // Recoil engine: pins from the profile; dormant until switched on.
++    fx_glue_begin(OF_Prefs::pins[OF_Const::solenoidPin],
++                  OF_Prefs::pins[OF_Const::rumblePin],
++                  OF_Prefs::settings[OF_Const::rumbleStrength]);
 +    aim_serial_set_extra(wiicam_cam_command);
++    // "~camdiag": probe the sensor's power and wiring from the gun's own
++    // pins, and if the sensor answers while the camera is down, rebuild the
++    // camera on the spot -- a fixed wire should not need a reboot to take.
++    wiicam_set_diag_hook([]() -> int {
++        const int v = wiicam_diag_arduino(OF_Prefs::pins[OF_Const::camSDA],
++                                          OF_Prefs::pins[OF_Const::camSCL],
++                                          aim_reply_sink);
++        // The driver's own view is part of the answer: a probe that says
++        // "good" while the driver is flagged dead (or the reverse) is
++        // exactly the state that reads as "something is still off".
++        aim_reply_sink(FW_Common::camNotAvailable
++            ? "CAM: diag driver flag: camera NOT available\n"
++            : "CAM: diag driver flag: camera available\n");
++        if(v == WD_ACK && FW_Common::camNotAvailable) {
++            delete FW_Common::dfrIRPos;
++            FW_Common::dfrIRPos = nullptr;
++            FW_Common::CameraSet();
++            aim_reply_sink(FW_Common::camNotAvailable
++                ? "CAM: diag restart FAILED -- the sensor answers but init "
++                  "did not; power-cycle the gun\n"
++                : "CAM: diag camera RESTARTED\n");
++        }
++        // Stream check, through the REAL driver at full bus speed. The slow
++        // probe above can pass on a joint that fails at 400 kHz, and it says
++        // nothing about the Wii Cam Clock line -- a sensor ACKs on I2C with
++        // its clock wire dead, it just never produces a frame. This names
++        // both cases apart.
++        if(v == WD_ACK && !FW_Common::camNotAvailable && FW_Common::dfrIRPos) {
++            int got = -99;
++            for(int i = 0; i < 40; ++i) {
++                got = FW_Common::dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
++                if(got >= DFRobotIRPositionEx::Error_Success) break;
++                delay(5);
++            }
++            if(got >= DFRobotIRPositionEx::Error_Success)
++                aim_reply_sink("CAM: diag stream: FRAMES FLOWING -- the camera "
++                               "is fully working\n");
++            else if(got == DFRobotIRPositionEx::Error_IICerror)
++                aim_reply_sink("CAM: diag stream: I2C FAILS at full speed "
++                               "though the slow probe passed -- a marginal "
++                               "joint on SDA or SCL; reflow or reseat it\n");
++            else
++                aim_reply_sink("CAM: diag stream: sensor answers but sends NO "
++                               "frame data -- check the Wii Cam Clock wire "
++                               "and its pin, then power-cycle the sensor\n");
++        }
++        return v;
++    });
 +    wiicam_set_sens_hooks(aim_sens_set, aim_sens_get, aim_sens_save);
 +    // Install sinks at boot so replies work before the Run loop starts.
 +    aim_set_out(aim_reply_sink);
@@ -81,22 +135,26 @@
  
      FW_Common::OpenFIREper.source(OF_Prefs::profiles[OF_Prefs::currentProfile].adjX,
                                    OF_Prefs::profiles[OF_Prefs::currentProfile].adjY);
-@@ -165,6 +230,14 @@ void setup() {
+@@ -165,6 +284,18 @@
          #endif // USES_DISPLAY
  
          while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
 +#ifdef USE_AIM_PIPELINE
-+            // Skip the first-boot hold: the overlay stores its calibration
-+            // separately, so zeroed offsets mean nothing here. A dead camera
-+            // still holds.
-+            if(!FW_Common::camNotAvailable)
-+                break;
-+            aim_serial_pump();
++            // Skip the first-boot hold UNCONDITIONALLY. The overlay stores
++            // its calibration separately, so zeroed offsets mean nothing
++            // here -- and holding boot on a dead camera parked the gun in
++            // this loop forever: serial and docked mode still answered, but
++            // the run loop (and with it every trigger-driven fire, stock or
++            // engine) was never reached. Run mode is set HERE, because the
++            // code after this loop sends any non-Run mode into OpenFIRE's
++            // calibration wizard -- a second trap with a dead camera.
++            FW_Common::SetMode(FW_Const::GunMode_Run);
++            break;
 +#endif
              // Check and process serial commands, in case user needs to change EEPROM settings.
              if(Serial.available())
                  OF_Serial::SerialProcessingDocked();
-@@ -210,7 +283,12 @@ void setup() {
+@@ -210,7 +341,12 @@
          // skip cali if we're prematurely set to run from the above loop
          // (i.e. cal'd from Desktop)
          if(FW_Common::gunMode != FW_Const::GunMode_Run)
@@ -109,7 +167,7 @@
      } else {
          // this will turn off the DotStar/RGB LED and ensure proper transition to Run
          FW_Common::SetMode(FW_Const::GunMode_Run);
-@@ -272,6 +350,12 @@ void loop1()
+@@ -272,6 +408,12 @@
          // All buttons' outputs except for the trigger are processed here.
          FW_Common::buttons.Poll(0);
  
@@ -122,27 +180,29 @@
          #ifdef USES_TEMP
              if(OF_Prefs::pins[OF_Const::tempPin] > -1)
                  OF_FFB::TemperatureUpdate();
-@@ -292,6 +376,9 @@ void loop1()
+@@ -292,6 +434,10 @@
              FW_Common::buttons.SendReports();
          }
  
 +#ifdef USE_AIM_PIPELINE
 +        aim_serial_pump();
++        fx_glue_poll();
 +#endif
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -369,6 +456,9 @@ void loop()
+@@ -369,6 +515,10 @@
      }
  
      #ifdef MAMEHOOKER
 +#ifdef USE_AIM_PIPELINE
 +        aim_serial_pump();
++        fx_glue_poll();
 +#endif
          if(Serial.available()) OF_Serial::SerialProcessing();
      #endif // MAMEHOOKER
  
-@@ -648,6 +738,10 @@ void ExecRunMode()
+@@ -648,6 +798,10 @@
      #endif // ARDUINO_ARCH_RP2040 && DUAL_CORE
  
      for(;;) {
@@ -153,7 +213,7 @@
          // Setting the state of our toggles, if used.
          // Only sets these values if the switches are mapped to valid pins.
          #ifdef USES_SWITCHES
-@@ -723,6 +817,11 @@ void ExecRunMode()
+@@ -723,6 +877,11 @@
  
          FW_Common::buttons.Poll(0);
  
@@ -165,13 +225,31 @@
          // For processing the trigger specifically.
          // (FW_Common::buttons.debounced is a binary variable intended to be read 1 bit at a time,
          // with the 0'th point == rightmost == decimal 1 == trigger, 3 = start, 4 = select)
-@@ -739,6 +838,9 @@ void ExecRunMode()
+@@ -739,6 +898,10 @@
          }
  
          // Run through serial receive buffer once this run, if it has contents.
 +#ifdef USE_AIM_PIPELINE
 +        aim_serial_pump();
++        fx_glue_poll();
 +#endif
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
+@@ -934,8 +1097,14 @@
+ // Handles events when trigger is pulled/held
+ void TriggerFire()
+ {
+-    if(!FW_Common::buttons.offScreen) {
+-        if(!OF_FFB::triggerHeld) {
++    // Dry-fire (USE_AIM_PIPELINE overlay): while armed over serial, a trigger
++    // with no IR lock still counts as on-screen so the recoil can be tuned at
++    // a desk. The mode expires by itself; aim behaviour is otherwise untouched.
++    if(!FW_Common::buttons.offScreen || fx_glue_dryfire()) {
++        // Dry-fire sends NO click: with no aim data the press report carries a
++        // centred position, so every test shot yanked the cursor to the middle
++        // of the screen. The mode tests the solenoid, not the mouse.
++        if(!OF_FFB::triggerHeld && !fx_glue_dryfire()) {
+             if(FW_Common::buttons.analogOutput) // this should only ever be gamepad outputs
+                 Gamepad16.press(LightgunButtons::ButtonDesc[FW_Const::BtnIdx_Trigger].reportCode3);
+             else switch(LightgunButtons::ButtonDesc[FW_Const::BtnIdx_Trigger].reportType) {

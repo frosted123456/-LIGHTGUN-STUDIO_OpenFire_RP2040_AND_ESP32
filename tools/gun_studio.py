@@ -141,6 +141,16 @@ class Link:
             try: line = self.src.q.get_nowait()
             except queue.Empty: break
             n += 1
+            if line.startswith("FX:"):
+                # recoil engine state: keys stored with an fx prefix so they
+                # can never collide with the camera keys
+                self.replies.append(line)
+                for tok in line.replace("FX:", "").split():
+                    if "=" in tok:
+                        k, v = tok.split("=", 1)
+                        try: self.last["fx" + k] = int(v)
+                        except ValueError: pass
+                continue
             if line.startswith("CAM:") or line.startswith("AIM:") or "CMD ok" in line:
                 self.replies.append(line)
                 # keep the label honest if the gun disagrees with us
@@ -332,7 +342,8 @@ def main():
         (3, "Lens / FOV",     "only if your lens is not the stock 66\u00b0"),
         (4, "Aim calibration","five dots x three distances"),
         (5, "Fine tune",      "iron sights to cursor, lead and smoothing"),
-        (6, "Verify",         "measures whose error it is")]):
+        (6, "Verify",         "measures whose error it is"),
+        (7, "Recoil feel",    "solenoid strike, hold and after-pulses")]):
         f = tk.Frame(left, bg=C_BG); f.pack(fill="x", pady=5)
         b = tk.Button(f, text="%d.  %s" % (num, title), font=FB, width=22, anchor="w",
                       bg="#161b22", fg=C_FG, activebackground="#21262d",
@@ -522,6 +533,19 @@ def main():
     lab(frame_wii, "Default fits most rigs (it is OpenFIRE's own default). Watch the\n"
         "noise floor above -- it still measures on this board.",
         (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(2, 4))
+    # Sensor connection test: which of power, wiring and the sensor itself is
+    # broken, straight from the gun's own pins -- and a live camera restart
+    # when the fault turns out to be fixed.
+    rowdg = tk.Frame(frame_wii, bg=C_BG); rowdg.pack(fill="x", pady=2)
+    tk.Button(rowdg, text="Test sensor connection", font=FB, bg="#1f6feb",
+              fg="white", relief="flat", padx=12, pady=6,
+              command=lambda: (link.send("~camdiag"),
+                               log("~camdiag sent -- the gun answers with "
+                                   "CAM: diag lines; the VERDICT line names "
+                                   "what is broken"))).pack(side="left")
+    lab(rowdg, "checks power, both data wires, swapped lines and the sensor "
+        "itself; restarts the camera if the fault is gone",
+        (F[0], 8), C_DIM).pack(side="left", padx=8)
     barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=6)
     tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
                                      log("~camsave sent -- the gun answers "
@@ -826,6 +850,146 @@ def main():
         "clipping, but every\nnoise source is magnified by the shorter focal. "
         "The stock 66\u00b0 lens needs nothing here.", (F[0], 8), C_DIM,
         justify="left", anchor="w").pack(fill="x", pady=(2, 4))
+
+    # ---- recoil tab: the solenoid feel engine ---------------------------
+    # Every control is a serial command; the gun echoes what it ACCEPTED and
+    # the labels below show that echo, not the button press.
+    tab_fx = tk.Frame(nb, bg=C_BG)
+    nb.add(tab_fx, text="  Recoil  ")
+    FX_KNOBS = (
+        ("drive",  "Strike (ms)",        5, 5,   50,
+         "full-power hit; 45 with hold 0 is the stock waveform"),
+        ("hold",   "Hold (ms)",          10, 0,  500,
+         "PWM after the strike; separates strike from spring return"),
+        ("duty",   "Hold power (%)",     5, 25,  70,
+         "too low buzzes as the armature bounces; raise until it stops"),
+        ("pulse",  "After-pulses",       1, 0,   3,
+         "extra clacks after release"),
+        ("gap",    "Pulse gap (ms)",     5, 15,  120,
+         "short = one meatier hit, long = a distinct double-clack"),
+        ("jit",    "Jitter (%)",         3, 0,   15,
+         "random stretch on hold and gaps; the strike is never jittered"),
+        ("rumoff", "Rumble offset (ms)", 5, -20, 50,
+         "negative = motor leads the strike (it takes ~30 ms to spin up)"),
+        ("rumms",  "Rumble time (ms)",   10, 0,  200,
+         "0 = engine leaves the rumble to OpenFIRE"),
+        ("space",  "Re-fire space (ms)", 10, 0,  500,
+         "quiet time between sequences; sets autofire cadence"),
+    )
+    fx_lbls = {}
+
+    def fx_nudge(key, d, step, lo, hi):
+        v = int(link.last.get("fx" + key, 0)) + d * step
+        v = max(lo, min(hi, v))
+        link.send("~fx=%s:%d" % (key, v))     # the FX: echo updates the label
+
+    def fx_dryfire():
+        # armed/disarmed comes from the gun's own echo -- a local toggle went
+        # out of step the moment the 10-minute expiry fired on its own
+        if int(link.last.get("fxleft", 0) or 0) > 0:
+            link.send("~fx=ab:0")
+            link.pointer(True)
+            log("dry-fire off; pointer released")
+        else:
+            link.pointer(False)
+            link.send("~fx=ab:1")
+            log("DRY-FIRE ON for 10 min: trigger fires with no IR (and sends "
+                "no mouse click). Pointer frozen (F9 releases). Click again "
+                "to disarm, or just let it expire.")
+        link.send("~fx?")
+
+    # actions FIRST: on a fixed-height window whatever packs last is what
+    # gets cut, and these are the buttons a bench session cannot live without
+    rowfx = tk.Frame(tab_fx, bg=C_BG); rowfx.pack(fill="x", pady=(3, 2))
+    tk.Button(rowfx, text="TEST FIRE", font=FB, bg="#1f6feb", fg="white",
+              relief="flat", padx=14, pady=5,
+              command=lambda: link.send("~fx=test:1")).pack(side="left")
+    tk.Button(rowfx, text="Dry-fire", font=FB, bg="#9e6a03", fg="white",
+              relief="flat", padx=10, pady=5,
+              command=fx_dryfire).pack(side="left", padx=4)
+    tk.Button(rowfx, text="Engine ON", font=FB, bg="#238636", fg="white",
+              relief="flat", padx=10, pady=5,
+              command=lambda: link.send("~fx=on:1")).pack(side="left", padx=4)
+    tk.Button(rowfx, text="off (stock)", font=F, bg="#161b22", fg=C_FG,
+              relief="flat", padx=8, pady=5,
+              command=lambda: link.send("~fx=on:0")).pack(side="left")
+    tk.Button(rowfx, text="Save", font=FB, bg="#238636", fg="white",
+              relief="flat", padx=10, pady=5,
+              command=lambda: link.send("~fxsave")).pack(side="left", padx=4)
+    tk.Button(rowfx, text="Read", font=F, bg="#161b22", fg=C_FG,
+              relief="flat", padx=8, pady=5,
+              command=lambda: link.send("~fx?")).pack(side="left")
+    # state gets its own line: appended to the button row it fell off the
+    # right edge of the fixed window
+    fx_on_lbl = lab(tab_fx, "state: press Read -- engine OFF means stock "
+                    "behaviour", (F[0], 8), C_DIM, anchor="w")
+    fx_on_lbl.pack(fill="x", pady=(0, 1))
+
+    FX_KNOBS = (
+        ("drive",  "Strike ms",   5, 5,  100,  "the hit; 45 = stock default"),
+        ("hold",   "Hold ms",     10, 0,  500, "held push after the hit"),
+        ("duty",   "Hold pwr %",  5, 25,  70,  "raise until hold stops buzzing"),
+        ("pulse",  "Pulses",      1, 0,   3,   "extra clacks after release"),
+        ("gap",    "Gap ms",      5, 15,  120, "short=meaty, long=double-clack"),
+        ("jit",    "Jitter %",    3, 0,   15,  "randomness; strike stays exact"),
+        ("rumoff", "Rum off ms",  5, -20, 50,  "negative = motor leads the hit"),
+        ("rumms",  "Rum time ms", 10, 0,  200, "0 = OpenFIRE owns the rumble"),
+        ("space",  "Space ms",    10, 0,  500, "quiet time; sets max fire rate"),
+        ("auto",   "Auto wait ms",50, 0, 1000, "hold time before autofire kicks in"),
+    )
+    fx_lbls = {}
+
+    def fx_nudge(key, d, step, lo, hi):
+        v = int(link.last.get("fx" + key, 0)) + d * step
+        v = max(lo, min(hi, v))
+        link.send("~fx=%s:%d" % (key, v))     # the FX: echo updates the label
+
+    # two columns: the single column was taller than the fixed window
+    grid = tk.Frame(tab_fx, bg=C_BG); grid.pack(fill="x")
+    cols = (tk.Frame(grid, bg=C_BG), tk.Frame(grid, bg=C_BG))
+    cols[0].pack(side="left", fill="x", expand=True)
+    cols[1].pack(side="left", fill="x", expand=True, padx=(12, 0))
+    for i, (key, name, step, lo, hi, tip) in enumerate(FX_KNOBS):
+        cell = tk.Frame(cols[i % 2], bg=C_BG); cell.pack(fill="x")
+        r = tk.Frame(cell, bg=C_BG); r.pack(fill="x")
+        lab(r, name + ":", F, C_DIM, width=11, anchor="w").pack(side="left")
+        tk.Button(r, text="-", font=F, bg="#161b22", fg=C_FG, relief="flat",
+                  padx=8, command=lambda k=key, st=step, l=lo, h=hi:
+                  fx_nudge(k, -1, st, l, h)).pack(side="left", padx=(2, 1))
+        tk.Button(r, text="+", font=F, bg="#161b22", fg=C_FG, relief="flat",
+                  padx=8, command=lambda k=key, st=step, l=lo, h=hi:
+                  fx_nudge(k, +1, st, l, h)).pack(side="left", padx=1)
+        fx_lbls[key] = lab(r, "?", F, C_FG); fx_lbls[key].pack(side="left", padx=6)
+        # one short line of purpose per knob; enough to tune without the docs
+        lab(cell, tip, (F[0], 7), C_DIM, anchor="w").pack(fill="x", padx=(4, 0))
+
+
+    step_rows[7][0].config(command=lambda: nb.select(tab_fx))
+
+    def fx_tick():
+        on = link.last.get("fxon")
+        left = link.last.get("fxleft", 0)
+        if on is None:
+            fx_on_lbl.config(text="state: press Read")
+        else:
+            t = "engine %s" % ("ON" if on else "off (stock)")
+            # the dry-fire countdown: the mode disarms itself, and before this
+            # was shown "it stopped working" was the only possible reading
+            if left:
+                t += "   dry-fire %d:%02d left" % (left // 60, left % 60)
+            temp = link.last.get("fxtemp", -1)
+            if temp == 2:
+                t += "   TEMP FATAL -- TMP36 unplugged or reading garbage; " \
+                     "autofire is blocked"
+            elif temp == 1:
+                t += "   temp WARNING -- sustained fire slowed"
+            fx_on_lbl.config(text=t,
+                             fg=C_BAD if temp == 2 else (C_OK if on else C_DIM))
+        for key, _n, _s, _l, _h, _t in FX_KNOBS:
+            v = link.last.get("fx" + key)
+            fx_lbls[key].config(text="?" if v is None else str(v))
+        root.after(400, fx_tick)
+    root.after(1200, fx_tick)
 
     board_state = {"cur": None}
 

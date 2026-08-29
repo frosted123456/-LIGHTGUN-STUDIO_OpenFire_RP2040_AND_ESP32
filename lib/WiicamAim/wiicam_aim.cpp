@@ -2,6 +2,7 @@
 #include "wiicam_aim.h"
 #include "quad_resolver.h"
 #include "aim_runtime.h"
+#include "recoil_fx.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -16,11 +17,23 @@
 #define WIICAM_LEAD_MS_MAX 50.0f
 #define WIICAM_LEAD_PX_MAX 40.0f
 
+// Microsecond clock for the recoil engine's timeline; the shim provides it on
+// both boards and the host test never calls through here.
+#if defined(ESP_PLATFORM) || defined(ARDUINO_ARCH_RP2040)
+extern "C" int64_t esp_timer_get_time(void);
+static uint64_t fx_now(void) { return (uint64_t)esp_timer_get_time(); }
+#else
+static uint64_t fx_now(void) { return 0; }
+#endif
+
 static void (*s_line)(const char*)  = 0;
 static void (*s_reply)(const char*) = 0;
 static void (*s_sens_set)(int) = 0;
 static int  (*s_sens_get)(void) = 0;
 static void (*s_sens_save)(void) = 0;
+static int  (*s_diag)(void) = 0;
+
+void wiicam_set_diag_hook(int (*fn)(void)) { s_diag = fn; }
 
 void wiicam_set_line_sink(void (*fn)(const char*))  { s_line = fn; }
 void wiicam_set_reply_sink(void (*fn)(const char*)) { s_reply = fn; }
@@ -83,6 +96,18 @@ void wiicam_aim_begin(void)
     if (aim_tmode_load(&tmode)) aim_tmode_set(tmode);
     int fk = 0, fp = 0;
     if (aim_fir_load(&fk, &fp)) aim_fir_set(fk, fp);
+    // Recoil engine: defaults (dormant), then whatever was saved. The reply
+    // sink is shared so FX: lines reach the tools the same way CAM: does.
+    {
+        fx_params_t fp2;
+        fx_defaults(&fp2);
+        fx_init(&fp2, (uint32_t)(fx_now() | 1u));
+        fx_load();
+        // Forwarded, not captured: the sink can be installed after begin().
+        fx_set_reply([](const char* l) {
+            if (s_reply) s_reply(l); else fputs(l, stdout);
+        });
+    }
     aim_lens_t ls;
     if (aim_lens_load(&ls)) {
         s_lens = (uint8_t)ls.model;
@@ -222,6 +247,8 @@ static int parse_int(const char** p)
 bool wiicam_cam_command(const char* line)
 {
     if (!line) return false;
+    // The recoil engine's commands ride the same channel: fx=, fx?, fxsave.
+    if (fx_command(line, fx_now())) return true;
     if (!strncmp(line, "camsave", 7)) {
         // Every store is checked. A reply that says "saved" while one write
         // quietly failed is worse than no reply, because the tools report it
@@ -232,6 +259,7 @@ bool wiicam_cam_command(const char* line)
         ok = aim_beta_store(aim_beta_get()) && ok;
         ok = aim_tmode_store(aim_tmode_get()) && ok;
         ok = aim_fir_store(aim_fir_k(), aim_fir_pct()) && ok;
+        ok = (fx_store() != 0) && ok;       // recoil knobs ride the same save
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
                           s_lcx, s_lcy };
@@ -245,6 +273,13 @@ bool wiicam_cam_command(const char* line)
               : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), aim_beta_get(),
               (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct());
+        return true;
+    }
+    if (!strncmp(line, "camdiag", 7)) {
+        // Sensor connection test: which of power, wiring and the sensor
+        // itself is broken, from the gun's own pins.
+        if (s_diag) s_diag();
+        else reply("CAM: diag not available in this build\n");
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {

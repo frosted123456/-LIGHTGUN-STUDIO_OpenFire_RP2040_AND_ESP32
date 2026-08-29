@@ -1,0 +1,96 @@
+--- a/OpenFIREmain/OpenFIREFeedback.cpp
++++ b/OpenFIREmain/OpenFIREFeedback.cpp
+@@ -10,8 +10,38 @@
+ 
+ #include "OpenFIREFeedback.h"
+ 
++#ifdef LIGHTGUN_RECOIL_FX
++// USE_AIM_PIPELINE overlay: the recoil engine (lib/RecoilFx) can own the
++// solenoid and rumble timeline. It is DORMANT by default -- every path below
++// behaves exactly as stock until "~fx=on:1" switches it on at runtime.
++#include "recoil_fx_glue.h"
++#endif
++
+ void OF_FFB::FFBOnScreen()
+ {
++#ifdef LIGHTGUN_RECOIL_FX
++    if(fx_glue_on()) {
++        // The engine runs the whole strike/hold/after-pulse timeline itself.
++        // This hook runs EVERY loop while the trigger is held, so the shot is
++        // asked for on the press EDGE (triggerHeld is still false here on the
++        // first call of a pull); held refires go through the autofire toggle
++        // and the engine's own hold-off, never as a side effect of polling.
++        if(OF_Prefs::toggles[OF_Const::solenoid]) {
++            if(OF_Prefs::pins[OF_Const::tempPin] >= 0)
++                TemperatureUpdate();
++            fx_glue_trigger(!triggerHeld,
++                            OF_Prefs::toggles[OF_Const::autofire] ? 1 : 0,
++                            tempStatus == Temp_Fatal ? 2
++                            : (tempStatus == Temp_Warning ? 1 : 0));
++        }
++        // A stock rumble that was already running still gets its timer
++        // serviced, or the motor stays on for the whole trigger hold.
++        if(!fx_glue_owns_rumble() && OF_Prefs::toggles[OF_Const::rumble]
++           && rumbleHappening)
++            RumbleActivation();
++        return;
++    }
++#endif
+     if(OF_Prefs::toggles[OF_Const::solenoid]) {                             // (Only activate when the solenoid switch is on!)
+         // If this is the first time we're firing,
+         if(!triggerHeld) {
+@@ -54,6 +84,9 @@
+ 
+ void OF_FFB::FFBOffScreen()
+ {
++#ifdef LIGHTGUN_RECOIL_FX
++    if(fx_glue_owns_rumble()) return;   // both outputs are the engine's
++#endif
+     if(OF_Prefs::toggles[OF_Const::rumble]) {
+         // Is this the first time we're rumbling AND only started pulling the trigger (to prevent starting a rumble w/ trigger hold)?
+         if(!OF_Prefs::toggles[OF_Const::rumbleFF] && !rumbleHappened && !triggerHeld) {
+@@ -63,6 +96,9 @@
+         }  // Else, we rumbled already, so don't do anything to prevent infinite rumbling.
+     }
+ 
++#ifdef LIGHTGUN_RECOIL_FX
++    if(fx_glue_on()) return;   // the engine finishes its own sequence
++#endif
+     if(burstFiring) BurstFire();
+     else if(digitalRead(OF_Prefs::pins[OF_Const::solenoidPin]) && !burstFireActive) { // If the solenoid is engaged, since we're not shooting the screen, shut off the solenoid a'la an idle cycle
+         SolenoidActivation(OF_Prefs::settings[OF_Const::solenoidOnLength]);
+@@ -71,6 +107,12 @@
+ 
+ void OF_FFB::FFBRelease()
+ {
++#ifdef LIGHTGUN_RECOIL_FX
++    if(fx_glue_on()) {
++        // A started strike completes -- event recoil, not level recoil. Only
++        // the rumble half below still runs, exactly as stock.
++    } else
++#endif
+     if(OF_Prefs::toggles[OF_Const::solenoid]) {
+         if(burstFiring) BurstFire();
+         else if(!burstFireActive && digitalRead(OF_Prefs::pins[OF_Const::solenoidPin])) {
+@@ -83,6 +125,11 @@
+         }
+     }
+     
++#ifdef LIGHTGUN_RECOIL_FX
++    if(fx_glue_owns_rumble()) return;   // the engine's rumble window finishes
++                                        // on its own; forcing the pin low
++                                        // here cut the co-fire short
++#endif
+     // If Rumble FF is enabled and Autofire is enabled, the motor needs to be disabled when the trigger is released. Otherwise, allow RumbleActivation to deal with the activation timer
+     if(OF_Prefs::toggles[OF_Const::rumbleFF] && OF_Prefs::toggles[OF_Const::autofire]) {
+         if(rumbleHappening || rumbleHappened) {
+@@ -247,6 +294,9 @@
+ 
+ void OF_FFB::FFBShutdown()
+ {
++#ifdef LIGHTGUN_RECOIL_FX
++    fx_glue_shutdown();   // kill the timeline so a poll cannot re-raise the pin
++#endif
+     digitalWrite(OF_Prefs::pins[OF_Const::solenoidPin], LOW);
+     digitalWrite(OF_Prefs::pins[OF_Const::rumblePin], LOW);
+     solenoidFirstShot = false;

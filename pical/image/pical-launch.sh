@@ -38,6 +38,12 @@ log() {
         echo "         $(basename "$(dirname "$st")") = $(cat "$st" 2>/dev/null)"
     done
     echo "serial:  $(ls /dev/ttyACM* /dev/ttyUSB* /dev/lightgun 2>/dev/null | tr '\n' ' ')"
+    # What the kernel thinks each input device IS. A lightgun is an ABSOLUTE
+    # mouse, and absolute pointing devices are routinely classified as
+    # tablets or touchscreens -- which X handles and a bare SDL console may
+    # not. The N/H lines say which class this gun landed in.
+    echo "input devices:"
+    grep -E '^N:|^H:' /proc/bus/input/devices 2>/dev/null | sed 's/^/         /'
 } > "$LOG" 2>&1
 sync
 

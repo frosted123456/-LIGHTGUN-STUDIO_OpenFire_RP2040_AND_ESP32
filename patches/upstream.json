@@ -30,7 +30,8 @@
     "src_subdir": "OpenFIREmain",
     "files": [
       "OpenFIREmain.ino",
-      "OpenFIREcommon.cpp"
+      "OpenFIREcommon.cpp",
+      "OpenFIREFeedback.cpp"
     ],
     "pristine": {
       "OpenFIREmain.ino": {
@@ -42,6 +43,11 @@
         "sha256": "a574d93cb19a8e99d9abc0a4ae78766475a64615ff632d371de5e89aa2d14369",
         "lines": 1167,
         "bytes": 50121
+      },
+      "OpenFIREFeedback.cpp": {
+        "sha256": "104bb73bb8262ecacf34859703b5bea5e73213da057ffe8741e66d6e56b075df",
+        "lines": 258,
+        "bytes": 16151
       }
     }
   }
