@@ -17,6 +17,15 @@ import aim_fit
 from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
                        SerialSource, FRAME_W, FRAME_H)
 
+# Version of the shared Link/serial layer in this file. pical ships as one .py
+# beside this tools/ folder and is routinely updated ON ITS OWN -- a stick that
+# gets a new pical.py and keeps an old tools/ produces a pical whose features
+# silently do nothing, because the parsing they depend on lives HERE. pical
+# checks this number at startup and says so out loud instead.
+#   1  original                       2  FX: state parsing
+#   3  quiet mode, blob gate keys, send failure + liveness reporting
+LINK_API = 3
+
 SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
 # Board-scaled noise gates: the wiicam's 33-deg lens has ~2.2x less screen
 # gain than the OV2640, so the same screen error tolerates 2.2x the sigma.
@@ -27,6 +36,59 @@ APP_PORT_WAIT_S = 60.0                 # how long to keep trying after their app
 CAM_KEYS = ("thr", "aec", "agc", "boost")
 LENS_KEYS = ("lens", "lk1u", "lk2u", "lfpx", "lfeq", "lcxu", "lcyu")
 CAM_RANGE = {"thr": (8, 200), "aec": (4, 400), "agc": (0, 30), "boost": (0, 1)}
+
+
+# ---------------------------------------------------------------------------
+# quieting the gun for a measurement
+# ---------------------------------------------------------------------------
+# A calibration measures where the gun was pointing when the trigger broke. A
+# solenoid strike swings the gun and the rumble motor shakes the camera, so
+# both have to stop for the duration -- and stopping them is less obvious than
+# it looks.
+#
+# Turning the knobs down does NOT do it. The engine only owns the rumble motor
+# while its own rumble time is above zero, so "rumble time 0" -- the setting
+# that reads like silence -- hands the motor straight back to OpenFIRE, whose
+# off-screen rumble then fires on every calibration shot. That is a real bug
+# this code was written to fix, not a hypothetical.
+QUIET_REARM_S = 30.0     # firmware quiet mode lapses on its own; hold it down
+
+# The fingerprint of a gun left sitting on the old calibration-quiet values.
+LEGACY_QUIET = {"on": 1, "drive": 5, "hold": 0, "pulse": 0}
+
+
+def is_legacy_quiet(last):
+    """Does the gun hold values a calibration put there and never took back?
+
+    A 5 ms strike with no hold, no after-pulses and a silent motor is not a
+    setting anyone chooses -- it is what the old quieting wrote. Recognising it
+    matters because saving THOSE as 'the user's settings' and restoring them
+    afterwards is how a temporary quiet became permanent.
+    """
+    for k, v in LEGACY_QUIET.items():
+        if last.get("fx" + k) != v:
+            return False
+    return last.get("fxrumms") in (0, 1)
+
+
+def quiet_plan(last):
+    """How this gun can be silenced, from what it has already told us.
+
+    "quiet"  firmware has ~fx=quiet -- one switch: nothing fires and BOTH
+             outputs belong to the engine, so the stock rumble cannot run.
+    "legacy" older firmware: force the engine on with the smallest strike and
+             a 1 ms rumble window. The 1 is what takes the motor away from
+             OpenFIRE; a 0 there gives it back.
+    "stuck"  the gun is ALREADY sitting on those legacy values. Quiet it the
+             same way, but never save and restore them -- that is what makes
+             the state permanent.
+    "none"   this gun does not speak ~fx; there is nothing to quieten.
+    """
+    if "fxquiet" in last:
+        return "quiet"
+    if "fxon" not in last:
+        return "none"
+    return "stuck" if is_legacy_quiet(last) else "legacy"
 
 
 def port_is_free(port):
@@ -89,6 +151,11 @@ class Link:
         self.gun_t = 0.0          # the gun's own clock, from the last frame
         self.sink = None          # called with (quad, gun_time_s)
         self.trig_sink = None     # called on a trigger marker
+        self.blobs = ""           # last "CAM: blobs ..." line, raw
+        # Writes that failed. A serial write throwing is how a gun that
+        # rebooted or re-enumerated announces itself, and swallowing it made a
+        # dead link look exactly like a screen whose keys had stopped working.
+        self.send_fails = 0
 
     def connect(self, port=None):
         """False on failure, never an exception: opening a stale COM name
@@ -104,6 +171,15 @@ class Link:
                 self.src = None
                 continue
             self.port = cand
+            # Everything we knew belonged to the PREVIOUS gun. Keeping it
+            # meant a reconnect onto a different (or reflashed) gun answered
+            # questions about it from the old one's replies -- including
+            # "does this firmware have quiet mode", which decides whether a
+            # calibration runs with a live solenoid. The replies that follow
+            # a connect refill all of it within a frame or two.
+            self.last.clear()
+            self.blobs = ""
+            self.replies = []
             self.src.start()
             return True
         return False
@@ -114,15 +190,34 @@ class Link:
             except Exception: pass
             self.src = None
 
+    def alive(self):
+        """Is the reader thread still on the port?
+
+        Its run loop breaks out on any serial exception -- which is what a gun
+        rebooting or re-enumerating looks like from here -- and the thread then
+        ends quietly. Nothing about the window changes when that happens: the
+        last values stay on screen and every key still 'works', it just reaches
+        a port nobody is reading. Asking this is how a front end tells the
+        difference between a frozen gun and a frozen link."""
+        if not self.src:
+            return False
+        return bool(getattr(self.src, "is_alive", lambda: True)())
+
     def send(self, line):
-        if not self.src: return
+        """Returns True when the bytes reached the port. Callers that care
+        (anything the user pressed a key for) can then say so."""
+        if not self.src: return False
         # The '~' matters. aim_runtime_command accepts a bare name, but the
         # gatekeeper on the shared serial only CLAIMS lines starting with '~' --
         # anything else is passed through to OpenFIRE and silently discarded.
         # An auto-installed calibration went missing exactly this way.
         if not line.startswith("~"): line = "~" + line
-        try: self.src.ser.write(("\n%s\n" % line).encode())
-        except Exception: pass
+        try:
+            self.src.ser.write(("\n%s\n" % line).encode())
+            return True
+        except Exception:
+            self.send_fails += 1
+            return False
 
     def pointer(self, on, remember=True):
         """Freeze or release the cursor.
@@ -163,6 +258,10 @@ class Link:
                 continue
             if line.startswith("CAM:") or line.startswith("AIM:") or "CMD ok" in line:
                 self.replies.append(line)
+                # The per-blob list is kept whole: its fields are positional
+                # (x, y, size, kept) and belong together, not as loose keys.
+                if line.startswith("CAM: blobs"):
+                    self.blobs = line.strip()
                 # keep the label honest if the gun disagrees with us
                 if "pointer FROZEN" in line: self.hid_on = False
                 elif "pointer ON" in line:   self.hid_on = True
@@ -180,7 +279,12 @@ class Link:
                             elif k in CAM_KEYS or k in LENS_KEYS \
                                     or k in ("sens", "dead", "lead", "smooth",
                                                  "beta", "tmode",
-                                                 "firk", "firpct"):
+                                                 "firk", "firpct",
+                                                 # blob gate + its counters
+                                                 "ext", "bmin", "bmax", "bn",
+                                                 "brej", "bframes", "bdrop",
+                                                 "br4", "br3", "br2", "br1",
+                                                 "br0"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -321,7 +425,15 @@ def main():
     root = tk.Tk()
     root.title("Lightgun Studio")
     root.configure(bg="#0d1117")
-    root.geometry("1020x800")
+    # Height adapts to the screen. 800 was chosen to fit a 768p laptop and is
+    # kept as the floor, but the tab panels have grown and a fixed 800 CLIPS
+    # their last lines on machines with room to spare -- silently, with no
+    # scrollbar and no sign that anything is missing.
+    try:
+        _sh = root.winfo_screenheight()
+    except Exception:
+        _sh = 800
+    root.geometry("1020x%d" % max(800, min(900, _sh - 80)))
 
     C_BG, C_FG, C_DIM, C_OK, C_WARN, C_BAD = "#0d1117", "#e6edf3", "#7d8590", "#39c26e", "#d8a13a", "#d24b4b"
     F = ("Segoe UI" if os.name == "nt" else "DejaVu Sans", 10)
@@ -545,9 +657,9 @@ def main():
                   command=lambda v=sv: (link.send("~cam=sens:%d" % v),
                                         log("sensitivity -> %d" % v))
                   ).pack(side="left", padx=(0, 6))
-    lab(frame_wii, "Default fits most rigs (it is OpenFIRE's own default). Watch the\n"
-        "noise floor above -- it still measures on this board.",
-        (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(2, 4))
+    lab(frame_wii, "Default fits most rigs. The noise floor above still "
+        "measures on this board.",
+        (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(2, 2))
     # Sensor connection test: which of power, wiring and the sensor itself is
     # broken, straight from the gun's own pins -- and a live camera restart
     # when the fault turns out to be fixed.
@@ -558,9 +670,74 @@ def main():
                                log("~camdiag sent -- the gun answers with "
                                    "CAM: diag lines; the VERDICT line names "
                                    "what is broken"))).pack(side="left")
-    lab(rowdg, "checks power, both data wires, swapped lines and the sensor "
-        "itself; restarts the camera if the fault is gone",
-        (F[0], 8), C_DIM).pack(side="left", padx=8)
+    lab(rowdg, "checks power, both data wires, swapped\n"
+        "lines and the sensor itself",
+        (F[0], 8), C_DIM, justify="left").pack(side="left", padx=8)
+    # ---- ambient light -----------------------------------------------------
+    # The wiicam finds blobs in HARDWARE and reports four slots. A bright
+    # window does not add a fifth point: it TAKES one, and an LED goes missing,
+    # which is why "too much light" shows up as a quad that keeps breaking.
+    # Nothing in software can recover a point the sensor never sent. What CAN
+    # be done is refuse the impostor, so the resolver rebuilds the missing
+    # corner from the three real ones instead of trusting four points one of
+    # which is a lie -- and the only fact that separates them is blob size,
+    # which the sensor reports in its extended format.
+    lab(frame_wii, "ambient light (a window or a lamp in view) -- read the "
+        "sizes before setting a window:",
+        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(6, 1))
+    rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x", pady=2)
+    fx_ext = tk.IntVar(value=0)
+    def send_ext():
+        link.send("~cam=ext:%d" % fx_ext.get())
+        link.send("~camblob?")
+        if fx_ext.get():
+            # The full reasoning goes in the log rather than on the panel: it
+            # is read once, and the panel has to stay short enough to fit.
+            log("blob sizes ON (resets on power-cycle). Aim at the screen and "
+                "read the sizes, then swing past the window and read them "
+                "again. If the two are DIFFERENT, set the size window to keep "
+                "the LEDs and drop the rest. If they are the SAME, no setting "
+                "here can separate them -- a curtain, an angle change or "
+                "moving the LED bar is the only real fix.")
+        else:
+            log("blob sizes off")
+    tk.Checkbutton(rowb, text="report blob sizes", variable=fx_ext,
+                   command=send_ext, font=F, bg=C_BG, fg=C_FG,
+                   selectcolor="#161b22", activebackground=C_BG,
+                   activeforeground=C_FG, highlightthickness=0
+                   ).pack(side="left")
+    bgate = {}
+    for key, name in (("bmin", "keep from size"), ("bmax", "up to")):
+        lab(rowb, name, (F[0], 9), C_DIM).pack(side="left", padx=(10, 2))
+        gv = tk.IntVar(value=0 if key == "bmin" else 15)
+        bgate[key] = gv
+        tk.Spinbox(rowb, from_=0, to=15, width=3, textvariable=gv, font=F,
+                   bg="#161b22", fg=C_FG, relief="flat",
+                   command=lambda k=key, v=gv: (link.send("~cam=%s:%d" % (k, v.get())),
+                                                link.send("~camblob?"))
+                   ).pack(side="left")
+    # wraplength, not hope: these two lines carry live numbers whose length is
+    # not known in advance, and a label that overflows this tab is CLIPPED with
+    # no sign that anything is missing.
+    blob_lbl = lab(frame_wii, "blob readout: tick 'report blob sizes' and watch "
+                   "this line while you aim at the screen and at the window",
+                   (F[0], 8), C_DIM, justify="left", anchor="w", wraplength=560)
+    blob_lbl.pack(fill="x", pady=(2, 0))
+    blob_lbl2 = lab(frame_wii, "", (F[0], 8), C_DIM, justify="left", anchor="w",
+                    wraplength=560)
+    blob_lbl2.pack(fill="x", pady=(0, 4))
+    # Wrap to the width this panel ACTUALLY has, measured, not guessed. These
+    # lines carry live numbers of unpredictable length, and a Tk label that
+    # overruns its frame is clipped silently -- the reader simply never sees
+    # the end of the sentence. Driven from the PARENT's resize, so setting a
+    # child's wraplength cannot feed back into the event that set it.
+    def wrap_blob(ev):
+        w = max(240, ev.width - 12)
+        for lb in (blob_lbl, blob_lbl2):
+            if lb.cget("wraplength") != w:
+                lb.config(wraplength=w)
+    frame_wii.bind("<Configure>", wrap_blob)
+
     barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=6)
     tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
                                      log("~camsave sent -- the gun answers "
@@ -1038,7 +1215,12 @@ def main():
         # While dry-fire is armed the countdown is re-read from the gun every
         # few seconds; a snapshot froze at "9:59 left" forever, and after the
         # gun's own expiry the pointer stayed frozen with no one to blame.
-        if left and link.src and time.time() - fx_poll["t"] > 3.0:
+        # Re-read while EITHER countdown is running. Quiet mode lapses on the
+        # gun the same way dry-fire does, and polling only for dry-fire left
+        # the quiet banner and its timer frozen on screen long after the gun
+        # had gone back to normal.
+        if (left or link.last.get("fxquiet")) and link.src \
+                and time.time() - fx_poll["t"] > 3.0:
             fx_poll["t"] = time.time()
             link.send("~fx?")
         if fx_poll["left_seen"] and not left:
@@ -1059,13 +1241,85 @@ def main():
                      "autofire is blocked"
             elif temp == 1:
                 t += "   temp WARNING -- sustained fire slowed"
+            # Quiet mode says so, loudly. A gun deliberately silenced for a
+            # calibration is otherwise indistinguishable from a broken one, and
+            # every knob on this tab would look like it had stopped working.
+            quiet = link.last.get("fxquiet", 0)
+            if quiet:
+                ql = int(link.last.get("fxqleft", 0) or 0)
+                t += ("   QUIET MODE ON -- nothing fires (%d:%02d left); "
+                      "leave the calibration screen to end it" % (ql // 60, ql % 60))
             fx_on_lbl.config(text=t,
-                             fg=C_BAD if temp == 2 else (C_OK if on else C_DIM))
+                             fg=C_BAD if temp == 2
+                             else (C_WARN if quiet else (C_OK if on else C_DIM)))
         for key, _n, _s, _l, _h, _t in FX_KNOBS:
             v = link.last.get("fx" + key)
             fx_lbls[key].config(text="?" if v is None else str(v))
         root.after(400, fx_tick)
     root.after(1200, fx_tick)
+
+    # The blob readout, polled only while the Camera tab is on a wiicam: it is
+    # a live measurement of what the sensor is handing us, and the whole point
+    # is to see it CHANGE as the gun swings past the window.
+    blob_state = {"ref": {}, "line": "", "good": True}
+
+    def blob_tick():
+        b = link.last.get("board") or ""
+        # Compared as widget names, not tab indexes: an index silently means a
+        # different tab the moment one is added.
+        if "wiicam" in b and link.src and nb.select() == str(tab_cam):
+            link.send("~camblob?")
+            for key, gv in bgate.items():
+                v = link.last.get(key)
+                if v is not None and gv.get() != v:
+                    gv.set(v)
+            e = link.last.get("ext")
+            if e is not None and fx_ext.get() != e:
+                fx_ext.set(e)
+            raw = getattr(link, "blobs", "")
+            if raw:
+                shown = []
+                for tok in raw.replace("CAM: blobs", "").split():
+                    f = tok.split(",")
+                    if len(f) == 4:
+                        shown.append("%s,%s size %s%s"
+                                     % (f[0], f[1], f[2],
+                                        "" if f[3] == "1" else " DROPPED"))
+                blob_lbl.config(
+                    text=("blobs now: " + "   ".join(shown)) if shown
+                    else "blobs now: none -- the sensor sees nothing at all",
+                    fg=C_FG if shown else C_BAD)
+            keys = ("br4", "br3", "br2", "br1", "br0")
+            now = [link.last.get(k) for k in keys]
+            if None not in now:
+                r = blob_state["ref"]
+                d = [n - r.get(k, 0) for n, k in zip(now, keys)]
+                if any(x < 0 for x in d):
+                    # The gun's counters restart at zero on a reboot, and a
+                    # negative delta never reaches the threshold below -- the
+                    # panel froze on stale numbers for the rest of the session.
+                    blob_state["ref"] = dict(zip(keys, now))
+                    d = [0] * len(keys)
+                tot = sum(d)
+                if tot >= 30:
+                    # Over EVERY frame, including the ones that saw nothing:
+                    # a share taken only over the frames that went well is not
+                    # a measure of how much the light is costing.
+                    blob_state["ref"] = dict(zip(keys, now))
+                    blob_state["good"] = d[0] * 10 >= tot * 8
+                    blob_state["line"] = (
+                        "last %d frames: %d%% saw all four LEDs, %d%% only "
+                        "three, %d%% two or fewer   --   %d blobs dropped by "
+                        "the size window so far"
+                        % (tot, 100 * d[0] // tot, 100 * d[1] // tot,
+                           100 * (d[2] + d[3] + d[4]) // tot,
+                           link.last.get("brej", 0)))
+                if blob_state["line"]:
+                    blob_lbl2.config(
+                        text=blob_state["line"],
+                        fg=C_OK if blob_state.get("good") else C_WARN)
+        root.after(700, blob_tick)
+    root.after(1400, blob_tick)
 
     board_state = {"cur": None}
 

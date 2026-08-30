@@ -28,12 +28,30 @@ void fx_glue_begin(int sol_pin, int rum_pin, int rum_strength)
     analogWriteFreq(20000);
 }
 
-int fx_glue_on(void)      { return s_sol >= 0 && fx_get()->enabled; }
+// Both answers come from the engine's own policy (fx_owns_*), so quiet mode
+// and the on-switch are decided in one host-tested place. Quiet mode makes
+// BOTH true even with the engine dormant: that is what silences the stock
+// paths, which is the half a "turn every knob down" trick could never do.
+//
+// Quiet mode is asserted WITHOUT the solenoid-pin test the engine needs. On a
+// rumble-only gun (no solenoid pin, OpenFIRE's rumble-as-recoil mode) that
+// test made quiet mode a complete no-op while the gun still answered
+// "quiet=1" -- so the tools reported silence while the motor shook the camera
+// through the whole calibration.
+int fx_glue_on(void)
+{
+    const uint64_t t = now_us();
+    return fx_quiet_active(t) || (s_sol >= 0 && fx_owns_outputs(t));
+}
 int fx_glue_dryfire(void) { return fx_ab_active(now_us()); }
 // When the engine's rumble co-fire is in use, the stock rumble paths must not
 // touch the motor pin -- a release handler forcing it LOW mid-window read as
 // "rumble randomly cuts out".
-int fx_glue_owns_rumble(void) { return fx_glue_on() && fx_get()->rum_ms > 0; }
+int fx_glue_owns_rumble(void)
+{
+    const uint64_t t = now_us();
+    return fx_quiet_active(t) || (s_sol >= 0 && fx_owns_rumble(t));
+}
 
 static unsigned long s_press_ms = 0;
 
@@ -81,9 +99,26 @@ int fx_glue_fire(int temp_state)
 
 void fx_glue_poll(void)
 {
+    const uint64_t t = now_us();
+    // Quiet mode: hold BOTH pins down on every poll, not just when the phase
+    // changes. While it is on, this is the only code left that may touch them
+    // -- every stock path that would normally release them is skipped -- and
+    // on a dual-core build those stock paths run on the OTHER core. A rumble
+    // write landing just after a single change-detected write would then stay
+    // high for the whole calibration, with nothing left to take it down.
+    // Re-asserting costs a couple of register writes on a core that is idle,
+    // and only while a measurement is actually running.
+    // Each pin guarded on its own: a rumble-only gun has no solenoid pin, and
+    // its motor is exactly the output quiet mode is there to stop.
+    if (fx_quiet_active(t)) {
+        if (s_sol >= 0) { analogWrite(s_sol, 0); digitalWrite(s_sol, LOW); }
+        if (s_rum >= 0) { analogWrite(s_rum, 0); digitalWrite(s_rum, LOW); }
+        s_lsol = s_lrum = -99;     // force a real write when quiet ends
+        return;
+    }
     if (s_sol < 0) return;
     int sol, rum;
-    fx_step(now_us(), &sol, &rum);
+    fx_step(t, &sol, &rum);
     if (sol != s_lsol) {
         if (sol == FX_SOL_FULL)      digitalWrite(s_sol, HIGH);
         else if (sol == FX_SOL_HOLD) analogWrite(s_sol,

@@ -561,7 +561,17 @@ All are prefixed `~` on the native USB port.
 | `~cam=lens:2,lfeq:900,lfpx:840` | Set the lens correction live |
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only) |
 | `~cam=beta:24` | Smoothing speed sensitivity, 0–60; −1 = default (15) |
+| `~cam=ext:1` | Extended sensor report: adds each blob's size, 0–15 (wiicam only). Off by default, not saved — a power cycle clears it |
+| `~cam=bmin:2,bmax:9` | Blob size window. Blobs outside it are dropped before the quad resolver, so a bright window is refused instead of taking an LED's slot. Needs `ext:1`; 0–15 accepts everything |
+| `~camblob?` | Each blob the sensor last reported — position, size, and whether the size window kept it — plus the share of recent frames that saw four, three or two LEDs |
+| `~camdiag` | Sensor connection test: power, both data wires, swapped lines, the sensor itself, and whether frames actually flow |
 | `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens and temporal mode. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
+| `~fx?` | Recoil engine state: every knob, dry-fire and quiet countdowns, and the trigger path's last temperature reading |
+| `~fx=on:1,drive:45,hold:0` | Tune the recoil engine live. `on:0` is stock OpenFIRE behaviour |
+| `~fx=quiet:1` / `:0` | Silence the gun: nothing fires, and the engine holds both the solenoid and the rumble motor so OpenFIRE's own recoil cannot run either. Used by the calibration screens; lapses by itself after five minutes |
+| `~fx=ab:1` | Dry-fire mode — the trigger fires the solenoid with no IR lock. Expires after ten minutes |
+| `~fx=test:1` | Fire one sequence now, no trigger and no IR needed |
+| `~fxsave` | Persist the recoil knobs |
 
 ## Calibrating without a PC
 

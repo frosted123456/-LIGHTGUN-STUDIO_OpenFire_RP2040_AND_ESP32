@@ -330,6 +330,90 @@ done_jit:;
     fx_command("fx?", 0);
     CK(strstr(cap, "on=1") != 0, "and fx? reports the switch");
 
+    // ---- quiet mode: the calibration tools' silence switch ----------------
+    // This exists because the old way of "silencing" the gun -- turning the
+    // knobs down, rumble time to zero -- HANDS the motor back to OpenFIRE,
+    // whose off-screen rumble then fired through every calibration shot. The
+    // ownership answers below are the contract the firmware glue reads.
+    {
+        fx_params_t q; fx_defaults(&q); q.enabled = 1; q.rum_ms = 0;
+        fx_init(&q, 1);
+        const uint64_t t = 5000000;
+        CK(fx_owns_outputs(t) == 1,
+           "engine on: the fx branch replaces the stock solenoid path");
+        CK(fx_owns_rumble(t) == 0,
+           "engine on with rumble time 0: the MOTOR still belongs to OpenFIRE "
+           "-- the bug that fired rumble through every calibration");
+        CK(fx_fire(t) == 1, "and it fires normally");
+
+        fx_quiet_set(1, t);
+        CK(fx_quiet_active(t) == 1, "quiet mode arms");
+        int s3, r3;
+        fx_step(t + 1000, &s3, &r3);
+        CK(s3 == FX_SOL_OFF,
+           "and kills the shot that was already playing -- not one strike "
+           "inside the first capture");
+        CK(fx_owns_outputs(t) == 1 && fx_owns_rumble(t) == 1,
+           "quiet claims BOTH outputs, so both stock paths are skipped");
+        CK(fx_fire(t + 1000000) == 0, "nothing fires from the trigger path");
+        CK(fx_fire_preempt(t + 1000000) == 0,
+           "and a fast second pull cannot preempt its way through either");
+        CK(fx_fire_forced(t + 1000000) == 0, "nor can an explicit test fire");
+        cap[0] = 0;
+        fx_command("fx=test:1", t + 1000000);
+        CK(strstr(cap, "quiet mode is ON") != 0,
+           "and the test says WHY, instead of looking like a dead solenoid");
+
+        // Dormant engine + quiet: this is the case the calibration actually
+        // runs in, and the stock paths must still be shut out.
+        fx_params_t d; fx_defaults(&d); fx_init(&d, 1);
+        fx_quiet_set(1, t);
+        CK(fx_owns_outputs(t) == 1 && fx_owns_rumble(t) == 1,
+           "quiet silences a gun whose engine was never switched on -- the "
+           "stock solenoid and rumble both belong to us while it lasts");
+        CK(fx_get()->enabled == 0,
+           "without switching the engine on behind the user's back");
+
+        // Expiry: a tool that dies mid-calibration must not leave a gun that
+        // never recoils again.
+        CK(fx_quiet_active(t + FX_QUIET_TIMEOUT_US - 1) == 1,
+           "quiet lasts the whole window");
+        CK(fx_quiet_active(t + FX_QUIET_TIMEOUT_US) == 0,
+           "then lapses by itself: a crashed tool cannot mute a gun forever");
+        CK(fx_owns_rumble(t + FX_QUIET_TIMEOUT_US) == 0,
+           "and the outputs go back to OpenFIRE when it does");
+        fx_params_t e2; fx_defaults(&e2); e2.enabled = 1; fx_init(&e2, 1);
+        fx_quiet_set(1, t);
+        CK(fx_fire(t + 10000) == 0, "still refused inside the window");
+        CK(fx_fire(t + FX_QUIET_TIMEOUT_US + 10000) == 1,
+           "and firing comes back on its own after it");
+
+        // Re-arming pushes the deadline out: the tool holds the switch down.
+        fx_quiet_set(1, t);
+        fx_quiet_set(1, t + 60000000);
+        CK(fx_quiet_active(t + FX_QUIET_TIMEOUT_US + 1000) == 1,
+           "re-arming extends the window, so a long calibration stays quiet");
+
+        fx_quiet_set(0, t + 60000000);
+        CK(fx_quiet_active(t + 60000001) == 0, "quiet:0 releases it at once");
+        CK(fx_quiet_left_s(t + 60000001) == 0, "and the countdown reads zero");
+
+        // The report carries both, and a tool tests for the KEY to learn
+        // whether this firmware has quiet mode at all.
+        fx_quiet_set(1, t);
+        cap[0] = 0;
+        fx_command("fx?", t);
+        CK(strstr(cap, "quiet=1") != 0, "fx? reports quiet mode");
+        CK(strstr(cap, "qleft=") != 0, "with its own countdown");
+        cap[0] = 0;
+        fx_command("fx=quiet:0", t);
+        CK(strstr(cap, "quiet off") != 0, "and ~fx=quiet:0 answers plainly");
+        CK(strstr(cap, " left=") == 0,
+           "the quiet reply never writes the dry-fire countdown's key");
+        fx_init(&q, 1);
+        CK(fx_quiet_active(t) == 0, "a re-init clears quiet with everything else");
+    }
+
     printf("\nrecoil engine: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;
 }

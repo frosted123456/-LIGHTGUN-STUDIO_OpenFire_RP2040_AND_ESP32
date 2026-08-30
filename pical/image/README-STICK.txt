@@ -24,8 +24,15 @@ FILES ON THIS PARTITION
   calib_out/    every session is logged here, readable from any PC
 
 UPDATING
-  Replace pical.py (and tools/) from a newer release. This partition is
-  FAT, so Windows, macOS and Linux can all write to it directly.
+  Replace pical.py AND the tools/ folder together, from the same release.
+  This partition is FAT, so Windows, macOS and Linux can all write to it
+  directly.
+
+  Copy BOTH. Half the app lives in tools/ -- the serial link, the parsing,
+  the fits -- so a new pical.py beside an old tools/ produces screens whose
+  controls appear to work and quietly do nothing. The app checks the pair on
+  startup and puts a red line across the top of the screen when they do not
+  match, rather than leaving it to be guessed at.
 
 SWITCH FILES (create them empty, next to pical.py, from any PC)
   NOAUTOSTART   boot to a root shell instead of the app, for a look around.

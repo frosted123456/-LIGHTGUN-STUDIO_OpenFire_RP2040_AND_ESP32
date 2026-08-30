@@ -46,7 +46,8 @@ void wiicam_set_sens_hooks(void (*set_fn)(int), int (*get_fn)(void),
 __attribute__((format(printf, 1, 2)))
 static void reply(const char* fmt, ...)
 {
-    char b[256];        // cam? reaches ~185 with a fitted lens; 192 was too tight
+    char b[320];        // cam? reaches ~210 with a fitted lens and the blob
+                        // gate keys; 192 was too tight, 256 left no headroom
     va_list ap; va_start(ap, fmt);
     const int n = vsnprintf(b, sizeof(b), fmt, ap);
     va_end(ap);
@@ -80,6 +81,52 @@ static int      s_cache_px[4], s_cache_py[4];
 static unsigned s_cache_seen = 0xFFFFFFFFu;    // impossible: never matches first
 static bool     s_cache_ret = false;
 static float    s_cache_sx = 0.0f, s_cache_sy = 0.0f;
+
+// ---- ambient-light rejection ----------------------------------------------
+// The wiicam finds blobs in HARDWARE and reports four slots, so a bright
+// window does not add a fifth point: it TAKES one, and an LED goes missing.
+// Nothing downstream can recover a point the sensor never sent. What the
+// sensor does give us, in extended format, is each blob's size -- and a window
+// is a different size from an LED. Dropping an out-of-window blob leaves the
+// resolver three real corners to reconstruct from instead of four points one
+// of which is a lie.
+//
+// All of it is inert by default: ext off means no sizes, and no sizes means no
+// gate, whatever the limits say.
+//
+// The wanted format and its epoch live in ONE word, written with one store:
+// bit 0 is the flag, the rest is the epoch. The camera poll runs on the other
+// core from the command parser, and reading a flag and an epoch as two
+// separate values lets a poll pair a NEW epoch with the OLD flag -- it would
+// then write the old format, latch the new epoch, and never correct itself.
+// One word cannot tear that way.
+static volatile int s_ext_state = 0;        // (epoch << 1) | wanted
+static uint8_t  s_bmin = 0, s_bmax = 15;    // accepted blob size window
+// Counters, cumulative since boot. The tools sample them and show the DELTA,
+// which is what says "this many frames lost a corner in the last two seconds"
+// rather than a number that only grows.
+static uint32_t s_bframes = 0;   // frames processed
+static uint32_t s_brej    = 0;   // blobs dropped by the size gate
+static uint32_t s_bdrop   = 0;   // frames the resolver could not turn into a quad
+static uint32_t s_breal[5] = {0, 0, 0, 0, 0};   // frames by corners actually SEEN
+// Last frame's blobs, for '~camblob?': pipeline space, size, and whether the
+// gate kept it. Evidence first -- a gate set from a guess is worth nothing.
+static int      s_bn = 0;
+static int16_t  s_bx[4], s_by[4];
+static int8_t   s_bsz[4], s_bkeep[4];
+
+int wiicam_aim_ext_state(void)  { return s_ext_state; }
+int wiicam_aim_ext(void)        { return s_ext_state & 1; }
+int wiicam_aim_ext_epoch(void)  { return s_ext_state >> 1; }
+
+// One store, so a reader on the other core sees the flag and the epoch move
+// together or not at all.
+static void ext_set(int want)
+{
+    s_ext_state = (((s_ext_state >> 1) + 1) << 1) | (want ? 1 : 0);
+}
+
+void wiicam_aim_format_dirty(void) { ext_set(s_ext_state & 1); }
 
 void wiicam_aim_begin(void)
 {
@@ -165,6 +212,13 @@ static void emit_q(uint64_t now_us, const float* xs, const float* ys, int n)
 bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
                         uint64_t now_us, float* sx, float* sy)
 {
+    return wiicam_aim_process_sz(px, py, 0, seen, now_us, sx, sy);
+}
+
+bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
+                           unsigned seen, uint64_t now_us,
+                           float* sx, float* sy)
+{
     // A byte-identical report is the previous camera frame seen again: return
     // the cached answer and leave every stateful stage untouched.
     bool same = (seen == s_cache_seen);
@@ -181,8 +235,9 @@ bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
 
     // Seen-mask gate: the driver retains an unseen slot's previous
     // coordinates, so unmasked reads would feed the resolver stale points.
-    float xs[4], ys[4];
-    int n = 0;
+    float ax[4], ay[4];
+    int   asz[4];
+    int   an = 0;
     for (int i = 0; i < 4; ++i) {
         if (!(seen & (1u << i))) continue;
         float nx = s_mirx ? (WIICAM_W - 1.0f - (float)px[i]) : (float)px[i];
@@ -190,20 +245,78 @@ bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
         float x = nx * SX;
         float y = ny * SY;
         lens_undistort(&x, &y);
-        xs[n] = x; ys[n] = y; ++n;
+        ax[an] = x; ay[an] = y;
+        asz[an] = sizes ? sizes[i] : -1;      // -1 = basic format, size unknown
+        ++an;
     }
+
+    // Blob size gate. A size of -1 is never judged, so the gate cannot act on
+    // a number the sensor did not send.
+    //
+    // The window is ORDERED here rather than when it is set: the tools send
+    // one key per keystroke, so clamping bmin against the current bmax as it
+    // arrives makes the result depend on which end was typed first -- asking
+    // for 8..12 from a stored 0..3 gave 3..12.
+    const int glo = (s_bmin <= s_bmax) ? (int)s_bmin : (int)s_bmax;
+    const int ghi = (s_bmin <= s_bmax) ? (int)s_bmax : (int)s_bmin;
+    int keep[4];
+    int nk = 0;
+    for (int i = 0; i < an; ++i) {
+        keep[i] = 1;
+        if (asz[i] >= 0 && (asz[i] < glo || asz[i] > ghi))
+            keep[i] = 0;
+        nk += keep[i];
+    }
+    // A gate that rejects EVERY blob has been set wrong; blinding the gun is
+    // worse than letting an impostor through, so the frame passes untouched
+    // and the counters still show what the gate wanted to do.
+    if (an > 0 && nk == 0) {
+        for (int i = 0; i < an; ++i) keep[i] = 1;
+        nk = an;
+    }
+
+    float xs[4], ys[4];
+    int n = 0;
+    for (int i = 0; i < an; ++i) {
+        s_bx[i]   = (int16_t)lroundf(ax[i]);
+        s_by[i]   = (int16_t)lroundf(ay[i]);
+        s_bsz[i]  = (int8_t)asz[i];
+        s_bkeep[i] = (int8_t)keep[i];
+        if (!keep[i]) { ++s_brej; continue; }
+        xs[n] = ax[i]; ys[n] = ay[i]; ++n;
+    }
+    // Count LAST. '~camblob?' is answered on the other core, and publishing
+    // the count before the entries are written let it print a tail left over
+    // from the previous frame -- in the one readout the size window is
+    // supposed to be chosen from.
+    s_bn = an;
+    ++s_bframes;
 
     const float dt = (s_prev_us && now_us > s_prev_us)
                    ? (float)(now_us - s_prev_us) * 1e-6f : 0.0f;
     s_prev_us = now_us;
 
     if (s_res == 0) {                       // raw mode, for the lens sweep
+        // Bucketed here too, by blobs kept: without this the frame counters
+        // kept climbing during a lens sweep while the per-frame buckets did
+        // not, so the percentages drawn from them stopped adding up and the
+        // readout froze exactly when the gun is being waved around.
+        s_breal[n > 4 ? 4 : n]++;
         emit_q(now_us, xs, ys, n);
         return false;
     }
 
     QuadResult r = quad_update(xs, ys, n);
-    if (r.count < 4) { emit_q(now_us, xs, ys, n); return false; }
+    // How many corners were really SEEN this frame is the honest measure of
+    // how much the light is costing: a run that sits on 3 is a run where one
+    // LED is being taken from us every frame.
+    {
+        int nr = r.n_real;
+        if (nr < 0) nr = 0;
+        if (nr > 4) nr = 4;
+        ++s_breal[nr];
+    }
+    if (r.count < 4) { ++s_bdrop; emit_q(now_us, xs, ys, n); return false; }
 
     // Latency lead: extrapolate the published quad along its velocity,
     // clamped; never fed back into the resolver.
@@ -240,7 +353,14 @@ static int parse_int(const char** p)
 {
     int sgn = 1, v = 0;
     if (**p == '-') { sgn = -1; ++(*p); }
-    while (**p >= '0' && **p <= '9') v = v * 10 + (*(*p)++ - '0');
+    // Digits past the cap are consumed but not accumulated: signed overflow is
+    // undefined behaviour, and a long digit string on a serial line is a typo
+    // or a garbled byte, not a value worth wrapping the world around. Every
+    // key clamps to its own range afterwards.
+    while (**p >= '0' && **p <= '9') {
+        const int d = *(*p)++ - '0';
+        if (v < 100000000) v = v * 10 + d;
+    }
     return v * sgn;
 }
 
@@ -282,24 +402,57 @@ bool wiicam_cam_command(const char* line)
         else reply("CAM: diag not available in this build\n");
         return true;
     }
+    if (!strncmp(line, "camblob?", 8)) {
+        // What the sensor actually handed us last frame, and what the gate did
+        // with it. This is the measurement the gate has to be set from: if the
+        // window and the LEDs land on the same size, no gate can separate them
+        // and the honest answer is to say so rather than to tune in the dark.
+        // Every bucket, including the one where nothing at all was seen: the
+        // percentages a tool draws from these have to add up, or "80% good"
+        // can quietly be 80% of the frames that were not already hopeless.
+        reply("CAM: blob ext=%u bmin=%u bmax=%u bn=%d brej=%lu bframes=%lu "
+              "bdrop=%lu br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu\n",
+              (unsigned)(s_ext_state & 1), (unsigned)s_bmin, (unsigned)s_bmax, s_bn,
+              (unsigned long)s_brej, (unsigned long)s_bframes,
+              (unsigned long)s_bdrop, (unsigned long)s_breal[4],
+              (unsigned long)s_breal[3], (unsigned long)s_breal[2],
+              (unsigned long)s_breal[1], (unsigned long)s_breal[0]);
+        char b[128];
+        int o = snprintf(b, sizeof(b), "CAM: blobs");
+        for (int i = 0; i < s_bn && o > 0 && o < (int)sizeof(b) - 20; ++i)
+            o += snprintf(b + o, sizeof(b) - o, " %d,%d,%d,%d",
+                          (int)s_bx[i], (int)s_by[i], (int)s_bsz[i],
+                          (int)s_bkeep[i]);
+        if (!(s_ext_state & 1) && o > 0 && o < (int)sizeof(b) - 34)
+            o += snprintf(b + o, sizeof(b) - o, " (sizes need ext:1)");
+        reply("%s\n", b);
+        return true;
+    }
     if (!strncmp(line, "camreset", 8)) {
         aim_lens_clear();
         s_lens = 0; s_lead_ms = 0.0f;
         s_lcx = 0.0f; s_lcy = 0.0f;
-        reply("CAM: lens + lead cleared\n");
+        // The blob gate goes back to inert here too: it is the one setting
+        // that can stop a gun aiming if it is set wrong, so the command a user
+        // reaches for when nothing works must undo it.
+        if (s_ext_state & 1) ext_set(0);
+        s_bmin = 0; s_bmax = 15;
+        reply("CAM: lens + lead cleared, blob gate off\n");
         return true;
     }
     if (!strncmp(line, "cam?", 4)) {
         reply("CAM: board=rp2040-wiicam sens=%d mirx=%d miry=%d lead=%d "
               "smooth=%d dead=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d "
-              "lcxu=%d lcyu=%d beta=%d tmode=%d firk=%d firpct=%d res=%u dash=%u\n",
+              "lcxu=%d lcyu=%d beta=%d tmode=%d firk=%d firpct=%d res=%u dash=%u "
+              "ext=%u bmin=%u bmax=%u\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
               (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
               (int)(s_lcx*10.0f), (int)(s_lcy*10.0f),
               aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
-              (unsigned)s_res, (unsigned)s_dash);
+              (unsigned)s_res, (unsigned)s_dash,
+              (unsigned)(s_ext_state & 1), (unsigned)s_bmin, (unsigned)s_bmax);
         return true;
     }
     if (strncmp(line, "cam=", 4) != 0) return false;
@@ -339,14 +492,21 @@ bool wiicam_cam_command(const char* line)
         else if (!strcmp(key, "firk"))   { aim_fir_set(val, aim_fir_pct()); }
         else if (!strcmp(key, "firpct")) { aim_fir_set(aim_fir_k(), val); }
         else if (!strcmp(key, "sens")) { if (s_sens_set && val >= 0 && val <= 2) s_sens_set(val); }
+        else if (!strcmp(key, "ext"))  { const int v = val ? 1 : 0;
+                                         if (v != (s_ext_state & 1)) ext_set(v); }
+        // Kept exactly as asked (0..15); the gate orders them when it runs, so
+        // typing the two ends in either order gives the same window.
+        else if (!strcmp(key, "bmin")) { s_bmin = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
+        else if (!strcmp(key, "bmax")) { s_bmax = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
         else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); quad_reset(0); }
         else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); quad_reset(0); }
     }
     s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
     reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d tmode=%d firk=%d "
-          "firpct=%d lens=%u res=%u dash=%u\n",
+          "firpct=%d lens=%u res=%u dash=%u ext=%u bmin=%u bmax=%u\n",
           s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
           aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
-          (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash);
+          (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash,
+          (unsigned)(s_ext_state & 1), (unsigned)s_bmin, (unsigned)s_bmax);
     return true;
 }

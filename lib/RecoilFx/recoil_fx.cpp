@@ -26,6 +26,7 @@ static uint64_t s_free_at;                  // sol_end + spacing
 static int      s_armed = 0;
 
 static uint64_t s_ab_until = 0;
+static uint64_t s_quiet_until = 0;
 
 static int clampi(int v, int lo, int hi, int* hit)
 {
@@ -78,6 +79,7 @@ void fx_init(const fx_params_t* p, uint32_t seed)
     s_armed = 0;
     s_free_at = 0;
     s_ab_until = 0;
+    s_quiet_until = 0;
 }
 
 void fx_set(const fx_params_t* p) { s_p = *p; fx_clamp(&s_p); }
@@ -149,6 +151,7 @@ static void arm_at(uint64_t now_us)
 
 int fx_fire(uint64_t now_us)
 {
+    if (fx_quiet_active(now_us)) return 0;         // quiet mode: nothing fires
     if (!s_p.enabled) return 0;                    // dormant engine never fires
     // Only the SOLENOID timeline blocks a refire. A rumble tail longer than
     // the strike must not turn fast second shots into dead triggers; a new
@@ -170,6 +173,9 @@ int fx_fire(uint64_t now_us)
 // solenoid has been off long enough, else after the re-latch gap.
 int fx_fire_preempt(uint64_t now_us)
 {
+    // Quiet mode outranks the preempt rule: a pull during a calibration must
+    // not cut through to the coil the way a normal fast second pull does.
+    if (fx_quiet_active(now_us)) return 0;
     if (!s_p.enabled) return 0;
     const uint64_t relatch = (uint64_t)FX_RELATCH_MS * 1000u;
     if (!(s_armed && now_us < s_sol_end) && now_us >= s_free_at
@@ -263,4 +269,38 @@ int fx_ab_left_s(uint64_t now_us)
 {
     if (s_ab_until == 0 || now_us >= s_ab_until) return 0;
     return (int)((s_ab_until - now_us) / 1000000u);
+}
+
+void fx_quiet_set(int on, uint64_t now_us)
+{
+    s_quiet_until = on ? now_us + FX_QUIET_TIMEOUT_US : 0;
+    // A shot already in the air stops NOW. Waiting for it to finish would put
+    // a strike inside the first capture of the calibration that just asked for
+    // silence -- the one frame the whole run is measured from.
+    if (on) fx_cancel();
+}
+
+int fx_quiet_active(uint64_t now_us)
+{
+    return s_quiet_until != 0 && now_us < s_quiet_until;
+}
+
+int fx_quiet_left_s(uint64_t now_us)
+{
+    if (s_quiet_until == 0 || now_us >= s_quiet_until) return 0;
+    return (int)((s_quiet_until - now_us) / 1000000u);
+}
+
+// Quiet mode claims both outputs precisely so the stock paths are skipped:
+// that is the whole point, not a side effect. Note what rum_ms means here --
+// with the engine merely ON and rum_ms 0, OpenFIRE keeps the motor, which is
+// the correct stock behaviour and the reason quiet needs its own switch.
+int fx_owns_outputs(uint64_t now_us)
+{
+    return s_p.enabled || fx_quiet_active(now_us);
+}
+
+int fx_owns_rumble(uint64_t now_us)
+{
+    return (s_p.enabled && s_p.rum_ms > 0) || fx_quiet_active(now_us);
 }

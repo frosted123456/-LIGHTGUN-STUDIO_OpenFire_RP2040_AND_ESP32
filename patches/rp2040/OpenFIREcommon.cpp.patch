@@ -12,18 +12,69 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIRElights.h"
  #include "OpenFIREserial.h"
-@@ -650,6 +655,24 @@ void FW_Common::GetPosition()
+@@ -210,6 +215,16 @@ void FW_Common::CameraSet()
+             PrintIrError();
+         } else camNotAvailable = false;
+     } else PrintIrError();
++#ifdef USE_AIM_PIPELINE
++    // The sensor has just been (re)initialised in BASIC format -- see the
++    // begin() call above. If the overlay wanted the extended format, it must
++    // be applied again, and the READ LENGTH in GetPosition comes from that
++    // same flag: a missed re-apply decodes every frame as garbage while still
++    // reporting success. Marked here rather than at each caller, because this
++    // function is reached from boot, from a docked save, and from the sensor
++    // diagnostic's live restart.
++    wiicam_aim_format_dirty();
++#endif
+ }
+ 
+ void FW_Common::SetMode(const FW_Const::GunMode_e &newMode)
+@@ -648,8 +663,58 @@ void FW_Common::ExecCalMode(const bool &
+ void FW_Common::GetPosition()
+ {
      if(dfrIRPos != nullptr) {
++#ifdef USE_AIM_PIPELINE
++        // Extended data format, only while the overlay asks for it
++        // (~cam=ext:1; OFF by default, so this reads exactly as the build
++        // before it until then). It is the only format that reports each
++        // blob's SIZE, which is the one hardware fact that separates a
++        // compact LED from a bright window.
++        //
++        // The read LENGTH must match the sensor's format register: a
++        // basic-length read of an extended frame still returns bytes and
++        // still reports success -- it just decodes to nonsense. So the
++        // register is written HERE, on the core that owns the camera,
++        // whenever the epoch says it must be applied again (a setting
++        // change, or a CameraSet that re-initialised the sensor to basic).
++        // ONE read of the state word, which carries the wanted format and its
++        // epoch together. Reading them as two values let this pair a new epoch
++        // with the old flag, write the old format, latch the new epoch, and
++        // then never correct itself -- a permanent desync with every frame
++        // decoding as garbage and reporting success.
++        static int aim_fmt_state = -1;
++        const int aim_st = wiicam_aim_ext_state();
++        const int aim_ext = aim_st & 1;
++        if(aim_fmt_state != aim_st) {
++            aim_fmt_state = aim_st;
++            dfrIRPos->dataFormat(aim_ext ? DFRobotIRPositionEx::DataFormat_Extended
++                                         : DFRobotIRPositionEx::DataFormat_Basic);
++        }
++        int error = aim_ext ? dfrIRPos->extendedAtomic(DFRobotIRPositionEx::Retry_2)
++                            : dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
++#else
          int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
++#endif
          if(error == DFRobotIRPositionEx::Error_Success) {
 +#ifdef USE_AIM_PIPELINE
 +            // Calibrated aim pipeline; falls through to the stock path when
 +            // no calibration is loaded. The seen() mask is applied inside
-+            // the adapter.
++            // the adapter. Sizes are handed over only when the sensor is
++            // actually in the format that carries them.
 +            bool aim_ok = false;
 +            {
 +                float asx = 0.0f, asy = 0.0f;
-+                if (wiicam_aim_process(dfrIRPos->xPositions(), dfrIRPos->yPositions(),
++                if (wiicam_aim_process_sz(dfrIRPos->xPositions(), dfrIRPos->yPositions(),
++                                       aim_ext ? dfrIRPos->sizes() : nullptr,
 +                                       dfrIRPos->seen(),
 +                                       to_us_since_boot(get_absolute_time()),
 +                                       &asx, &asy)) {
@@ -37,7 +88,7 @@
              // if diamond layout, or square
              if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) {
                  OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
-@@ -699,6 +722,9 @@ void FW_Common::GetPosition()
+@@ -699,6 +764,9 @@ void FW_Common::GetPosition()
                  default:
                      break;
                  }
@@ -47,7 +98,7 @@
  
              // Constrain that bisch so negatives don't cause underflow
              int32_t conMoveX = constrain(mouseX, 0, res_x);
-@@ -753,9 +779,18 @@ void FW_Common::GetPosition()
+@@ -753,9 +821,18 @@ void FW_Common::GetPosition()
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  

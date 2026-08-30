@@ -37,8 +37,16 @@ from aim_calib import (CaptureSession, aimcal_line, camsave_verified,
 from aim_finetune import (BETA_MAX, LEAD_MAX, LEAD_STEP, SHOT_FRAMES,
                           SMOOTH_MAX, TARGET, Tuner)
 from aim_verify import GRID_3x3
-from gun_studio import (CAM_KEYS, CAM_RANGE, LENS_KEYS, Link, auto_tune,
-                        sigma_gates)
+import gun_studio
+from gun_studio import (CAM_KEYS, CAM_RANGE, LENS_KEYS, Link, QUIET_REARM_S,
+                        auto_tune, quiet_plan, sigma_gates)
+
+# The shared serial layer lives in tools/ beside this file, and this file is
+# routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
+# every feature whose parsing lives in tools/ stops working -- silently, in a
+# way that looks exactly like a broken screen. So it is checked, out loud.
+LINK_API_NEEDED = 3
+LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
 NO_DATA_S = 5.0
@@ -402,6 +410,10 @@ class Camera(RowScreen):
         RowScreen.__init__(self, app)
         self.tuning = False
         self.stop = threading.Event()
+        self._blob_t = 0.0
+        self._blob_ref = {}        # counter values at the last readout
+        self._blob_last = ""       # keeps the last percentage on screen while
+                                   # the next window fills, so it stops flashing
         self.build()
 
     def wiicam(self):
@@ -412,7 +424,8 @@ class Camera(RowScreen):
         link = self.app.link
         self.rows = []
         if self.wiicam():
-            self.subtitle = "the wiicam does its own blob detection: one control"
+            self.subtitle = ("the wiicam finds blobs in hardware -- "
+                             "sensitivity, and what to do about stray light")
             self.rows.append(Row(
                 "Sensitivity", "spin",
                 get=lambda: link.last.get("sens", 0),
@@ -423,6 +436,32 @@ class Camera(RowScreen):
                 "Sensor connection test", act=self.diag,
                 hint="checks power, wiring, swapped lines and the sensor "
                      "itself; the log shows the verdict"))
+            # Ambient light. The wiicam finds blobs in HARDWARE and reports
+            # four slots: a bright window does not add a fifth point, it TAKES
+            # one, and an LED goes missing. The only hardware fact that tells
+            # them apart is blob SIZE, and only the extended report carries it.
+            # Read the sizes first (the line under the preview), THEN set a
+            # window -- a gate guessed at is worth nothing.
+            self.rows.append(Row(
+                "Blob detail (sizes)", "spin",
+                get=lambda: link.last.get("ext"),
+                set=lambda v: link.send("~cam=ext:%d" % v),
+                lo=0, hi=1, step=1,
+                hint="1 asks the sensor for each blob's size, so the readout "
+                     "below can show it. Resets on power-cycle."))
+            self.rows.append(Row(
+                "Smallest blob kept", "spin",
+                get=lambda: link.last.get("bmin"),
+                set=lambda v: link.send("~cam=bmin:%d" % v),
+                lo=0, hi=15, step=1,
+                hint="drops specks below this size; 0 keeps everything"))
+            self.rows.append(Row(
+                "Largest blob kept", "spin",
+                get=lambda: link.last.get("bmax"),
+                set=lambda v: link.send("~cam=bmax:%d" % v),
+                lo=0, hi=15, step=1,
+                hint="drops blobs bigger than this -- a window is usually "
+                     "much larger than an LED; 15 keeps everything"))
         else:
             self.subtitle = "aim for a blob noise floor under 0.30 px"
             for k, tip in (("thr", "threshold: raise it if the background shows up"),
@@ -473,7 +512,66 @@ class Camera(RowScreen):
                 if a == "back":
                     self.stop.set()
             return
+        # The blob readout is a live measurement, so it is re-read while this
+        # screen is up rather than sampled once on the way in.
+        if self.wiicam() and time.time() - self._blob_t > 1.0:
+            self._blob_t = time.time()
+            self.app.link.send("~camblob?")
         RowScreen.handle(self, acts, mouse)
+
+    def blob_lines(self):
+        """What the sensor is handing us right now, in words.
+
+        Two numbers matter. The per-blob sizes say whether a window and an LED
+        are even separable -- if they land on the same size, no gate can split
+        them and the honest answer is a curtain, not a setting. The share of
+        frames that lost a corner says how much the light is costing.
+        """
+        link = self.app.link
+        out = []
+        raw = getattr(link, "blobs", "")
+        if raw:
+            parts = raw.replace("CAM: blobs", "").strip()
+            if "(sizes need ext:1)" in parts:
+                out.append("blob sizes: set Blob detail to 1 to read them")
+                parts = parts.replace("(sizes need ext:1)", "").strip()
+            shown = []
+            for tok in parts.split():
+                f = tok.split(",")
+                if len(f) == 4:
+                    shown.append("%s,%s size %s%s"
+                                 % (f[0], f[1], f[2],
+                                    "" if f[3] == "1" else " DROPPED"))
+            if shown:
+                out.append("blobs now: " + "    ".join(shown))
+        keys = ("br4", "br3", "br2", "br1", "br0")
+        now = [link.last.get(k) for k in keys]
+        tot = None
+        if None not in now:
+            d = [n - self._blob_ref.get(k, 0) for n, k in zip(now, keys)]
+            if any(x < 0 for x in d):
+                # A gun that rebooted restarts its counters at zero, and a
+                # negative delta never reaches the threshold below -- the
+                # readout would freeze on stale numbers for good.
+                self._blob_ref = dict(zip(keys, now))
+                d = [0] * len(keys)
+            tot = sum(d)
+            if tot >= 20:
+                # Over EVERY frame, the hopeless ones included: a percentage
+                # taken over only the frames that went well is not a measure
+                # of anything.
+                out.append("last %d frames: %d%% saw all four LEDs, %d%% "
+                           "three, %d%% two or fewer"
+                           % (tot, 100 * d[0] // tot, 100 * d[1] // tot,
+                              100 * (d[2] + d[3] + d[4]) // tot))
+                self._blob_ref = dict(zip(keys, now))
+                self._blob_last = out[-1]
+            elif self._blob_last:
+                out.append(self._blob_last)
+        rej = link.last.get("brej")
+        if rej:
+            out.append("%d blobs dropped by the size window so far" % rej)
+        return out
 
     def draw(self, sc):
         if self.tuning:
@@ -482,7 +580,14 @@ class Camera(RowScreen):
             sc.text(sc.w / 2, sc.h * 0.92, "Esc cancels", sc.f_s, C_DIM)
             return
         RowScreen.draw(self, sc)
-        self.app.draw_noise(sc, sc.h * 0.74)
+        if self.wiicam():
+            # Under the whole layout, centred like everything else: beside the
+            # preview it ran off the right edge of the screen and over the
+            # camera view, which on a TV is simply gone.
+            sc.lines(sc.w / 2, sc.h * 0.735, self.blob_lines()[:3],
+                     sc.f_xs, C_DIM)
+        else:
+            self.app.draw_noise(sc, sc.h * 0.74)
 
 
 # ---------------------------------------------------------------------------
@@ -1376,7 +1481,7 @@ class Recoil(RowScreen):
                 set=(lambda v, kk=key: link.send("~fx=%s:%d" % (kk, v))),
                 lo=lo, hi=hi, step=step, hint=tip))
         self.rows.append(Row("Test fire", act=self.test,
-                             hint="one full sequence, no trigger and no IR needed"))
+                             hint=self.test_hint))
         self.rows.append(Row("Dry-fire mode (10 min)", act=self.dryfire,
                              hint=self.dry_hint))
         self.rows.append(Row("Save to gun", act=self.save,
@@ -1396,6 +1501,23 @@ class Recoil(RowScreen):
 
     def test(self):
         self.app.link.send("~fx=test:1")
+
+    def test_hint(self):
+        if self.app.link.last.get("fxquiet"):
+            return ("QUIET MODE is on -- nothing will fire until it is off or "
+                    "lapses; leaving a calibration turns it off")
+        return "one full sequence, no trigger and no IR needed"
+
+    def draw(self, sc):
+        RowScreen.draw(self, sc)
+        # Quiet mode has to be VISIBLE here, or a gun that is deliberately
+        # silent is indistinguishable from a gun that has broken -- which is
+        # exactly how the old quieting was read.
+        if self.app.link.last.get("fxquiet"):
+            left = int(self.app.link.last.get("fxqleft", 0) or 0)
+            sc.text(sc.w / 2, sc.h * 0.205,
+                    "QUIET MODE ON -- nothing fires (%d:%02d left)"
+                    % (left // 60, left % 60), sc.f_s, C_WARN)
 
     def dryfire(self):
         self.app.link.send("~fx=ab:1")
@@ -1484,8 +1606,19 @@ class App:
         self.toast = ""
         self.toast_t = 0.0
         self._fx_saved = None
+        self._fx_plan = "none"        # which silence this gun supports
+        self._fx_quiet_want = False   # we are asking for silence right now
+        self._fx_quiet_t = 0.0        # last time we re-armed it
+        self._fx_verify = None        # (values, deadline) for a restore check
+        self._fx_retry = 0.0          # last attempt at an owed restore
         self.log_lines = []
         self.t_open = 0.0
+        # Link liveness. The reader thread ends on any serial error, and
+        # nothing on screen changed when it did: values froze, keys still
+        # "worked", and it read as a broken screen rather than a dead gun.
+        self._link_bad = False
+        self._link_t = 0.0
+        self._link_retry = 0.0
         # Pointer tracking: draw our own cursor only once the mouse has
         # actually moved, so a gun that is not driving HID does not leave a
         # crosshair parked in the corner pretending to be an aim point.
@@ -1577,48 +1710,158 @@ class App:
         self.view = view
 
     def to_menu(self):
-        self.fx_restore()
+        self.fx_quiet(False)
         self.session = None
         self.link.sink = None
         self.link.trig_sink = None
         self.view = Menu(self)
 
     def quit(self):
+        # Leaving must never leave the gun quiet: on firmware that has quiet
+        # mode it would lapse by itself, but waiting five minutes for your
+        # recoil to come back is not an answer.
+        self.fx_quiet(False)
         self.running = False
 
     # ---- steps -----------------------------------------------------------
-    def fx_calm(self):
-        """Quiets the recoil engine for the calibration run.
+    def fx_quiet(self, on):
+        """Silence the solenoid AND the rumble motor for a measurement.
 
-        A meaty strike swings the gun for a good fraction of the capture; the
-        blanking window absorbs the normal case, but a 500 ms hold outlasts
-        it. Dropping to a 5 ms tick keeps the pull feedback without the swing.
-        Only guns that speak ~fx are touched, and only values we saved are
-        put back."""
-        if "fxon" in self.link.last and self._fx_saved is None:
+        Both matter: a strike swings the gun and the motor shakes the camera,
+        and a calibration is a measurement of where the gun was pointing.
+
+        Firmware that has quiet mode does this with one switch that also takes
+        the motor away from OpenFIRE's own off-screen rumble -- the half the
+        old approach could never do, which is why rumble kept firing through
+        calibrations. Older firmware gets the best available imitation, and is
+        told so rather than left to look silent while it is not."""
+        link = self.link
+        if not on:
+            # Intent is recorded FIRST and unconditionally. A gun that is
+            # mid-reboot when the user leaves a calibration used to keep
+            # `wanted` set, and the reconnect then re-armed quiet on a gun
+            # nobody was calibrating any more -- silent, with the only
+            # indicator on a screen the user had just left.
+            self._fx_quiet_want = False
+        if not link.src:
+            return
+        plan = quiet_plan(link.last)
+        self._fx_plan = plan
+        if plan == "none":
+            if on:
+                # Not silently: on a gun that should have a recoil engine this
+                # means the ~fx? answer never arrived, and the calibration is
+                # about to run with a live solenoid.
+                self.log("no ~fx answer from this gun -- recoil will NOT be "
+                         "quieted for this run")
+            return                            # no recoil engine on this gun
+        # Arming twice without an intervening restore would re-read the saved
+        # values from the gun -- which by then holds the QUIET ones, so the
+        # user's real settings would be replaced by them permanently.
+        if on and self._fx_quiet_want:
+            if plan == "quiet":
+                link.send("~fx=quiet:1")
+                self._fx_quiet_t = time.time()
+            return
+        if plan == "quiet":
+            ok = link.send("~fx=quiet:%d" % (1 if on else 0))
+            if not on:
+                pass                          # intent already cleared above
+            elif ok:
+                self._fx_quiet_want = True
+                self._fx_quiet_t = time.time()
+            else:
+                self.toast_now("could not reach the gun to quieten it")
+            return
+        # ---- older firmware ------------------------------------------------
+        if not on:
+            self.fx_restore()
+            return
+        if plan == "legacy":
             keys = ("on", "drive", "hold", "pulse", "rumms")
-            self._fx_saved = {k: self.link.last.get("fx" + k) for k in keys}
-            self.link.send("~fx=on:1,drive:5,hold:0,pulse:0,rumms:0")
+            self._fx_saved = {k: link.last.get("fx" + k) for k in keys}
+            msg = ("older firmware: recoil quieted the old way -- reflash for "
+                   "a fully silent calibration")
+        else:
+            # "stuck": these ARE quiet values already. Saving and restoring
+            # them would write yesterday's calibration state back as if the
+            # user had chosen it, which is how it became permanent in the
+            # first place. Quieten, keep nothing, and say what is wrong.
+            self._fx_saved = None
+            msg = ("the gun still holds calibration-quiet recoil values -- "
+                   "set them on screen 7 and Save")
+        # rumms:1, never 0. A zero rumble time gives the motor BACK to
+        # OpenFIRE, whose off-screen rumble is exactly what fired through
+        # every calibration shot; 1 ms keeps it ours and is imperceptible.
+        link.send("~fx=on:1,drive:5,hold:0,pulse:0,rumms:1")
+        self._fx_quiet_want = True
+        # One toast, and it is the SPECIFIC one: a second call here overwrote
+        # the stuck-values warning with the generic line, so the message that
+        # actually named a problem was the one nobody ever saw.
+        self.toast_now(msg)
 
     def fx_restore(self):
+        """Put the user's recoil settings back, and CHECK that they landed.
+
+        Returns False when the write could not be sent -- and KEEPS the saved
+        values in that case, so a later attempt can still put them back. The
+        old version dropped them either way, which turned a write into a dead
+        port into a permanently lost recoil setup."""
         if self._fx_saved is None:
-            return
+            return True
         parts = ["%s:%d" % (k, v) for k, v in self._fx_saved.items()
                  if v is not None and k != "on"]
         on = self._fx_saved.get("on")
         if on is not None:
             parts.append("on:%d" % on)      # the on-switch goes back LAST
-        if parts:
-            self.link.send("~fx=" + ",".join(parts))
+        if not parts:
+            self._fx_saved = None
+            return True
+        if not self.link.send("~fx=" + ",".join(parts)):
+            self.toast_now("could not reach the gun to put the recoil "
+                           "settings back -- they are still remembered")
+            return False
+        # Ask, then check the answer a moment later. A restore that was
+        # written into a dead port looks identical to one that worked, and
+        # the cost of not noticing is a gun that never recoils again.
+        self.link.send("~fx?")
+        self._fx_verify = (dict(self._fx_saved), time.time() + 1.5)
         self._fx_saved = None
+        return True
+
+    def fx_tick(self, now):
+        """Hold the quiet switch down, and confirm a restore actually took.
+
+        Firmware quiet mode expires by itself -- that is what stops a crashed
+        app from muting a gun forever -- so an app that still wants silence has
+        to keep asking for it."""
+        if (self._fx_quiet_want and self._fx_plan == "quiet"
+                and now - self._fx_quiet_t > QUIET_REARM_S):
+            self._fx_quiet_t = now
+            self.link.send("~fx=quiet:1")
+        # A restore that could not be sent is still owed. Retry it once the gun
+        # is back, rather than leaving the user's recoil settings sitting in
+        # this app's memory waiting for someone to notice.
+        if (self._fx_saved is not None and not self._fx_quiet_want
+                and self.link.src and now - self._fx_retry > 3.0):
+            self._fx_retry = now
+            self.fx_restore()
+        if self._fx_verify and now > self._fx_verify[1]:
+            want, _ = self._fx_verify
+            self._fx_verify = None
+            bad = [k for k, v in want.items()
+                   if v is not None and self.link.last.get("fx" + k) != v]
+            if bad:
+                self.toast_now("recoil settings did NOT go back (%s) -- check "
+                               "screen 7" % ",".join(sorted(bad)))
 
     def begin_calib(self):
         if not self.link.src:
             self.toast_now("connect the gun first")
             return
-        # Only once a gun is truly here: calming before the guard captured a
+        # Only once a gun is truly here: quieting before the guard captured a
         # stale saved-state that later clobbered freshly tuned recoil knobs.
-        self.fx_calm()
+        self.fx_quiet(True)
         self.session = CaptureSession(plan=make_plan(self.stances, 0))
         # Fullscreen: a window fraction IS a screen fraction.
         self.session.to_screen = lambda fx, fy: (fx, fy)
@@ -1644,6 +1887,10 @@ class App:
         c = self.read_gun_calib()
         if c is None:
             return
+        # Verify MEASURES the calibration, so the same rule applies: a strike
+        # or a rumble during the nine shots is noise added to the number the
+        # whole screen exists to report.
+        self.fx_quiet(True)
         view = Verify(self, c)
         self.link.sink = view.feed
         self.link.trig_sink = lambda: view.handle(["trigger"], (0, 0))
@@ -1694,7 +1941,7 @@ class App:
             self.session.trigger(self.link.gun_t or time.time(), pulled=True)
 
     def finish_calib(self):
-        self.fx_restore()
+        self.fx_quiet(False)
         s = self.session
         c, why = s.fit()
         saved = None
@@ -1866,6 +2113,7 @@ class App:
     def draw(self):
         self.sc.s.fill(C_BG)
         self.view.draw(self.sc)
+        self.draw_link_banner()
         self.draw_cursor(self.sc)
         if self.toast and (time.time() - self.toast_t) < 5.0:
             sc = self.sc
@@ -1874,6 +2122,71 @@ class App:
             r.center = (sc.w // 2, int(sc.h * 0.945))
             pygame.draw.rect(sc.s, (18, 22, 28), r.inflate(30, 14))
             sc.s.blit(img, r)
+
+    # ---- the link itself -------------------------------------------------
+    def link_tick(self, now):
+        """Notice when the gun stops being there, and try to get it back.
+
+        The reader thread breaks out of its loop on any serial error -- a gun
+        that reboots, a USB port that re-enumerates -- and then simply ends.
+        Everything on screen keeps its last value and every key still appears
+        to work, because writes into a dead port fail silently. That is
+        indistinguishable from a screen whose controls have broken, and it is
+        what "the arrows do not change anything" looks like from the couch.
+        """
+        if now - self._link_t < 1.0:
+            return
+        self._link_t = now
+        bad = bool(self.link.src) and not self.link.alive()
+        if bad and not self._link_bad:
+            self.toast_now("lost the gun on %s -- reconnecting" % self.link.port)
+        self._link_bad = bad
+        if not bad:
+            return
+        # Retry on a slow cadence: the gun may be mid-reboot, and hammering
+        # the port scan makes the screen stutter for no gain.
+        if now - self._link_retry < 5.0:
+            return
+        self._link_retry = now
+        # The old port name first, then a rescan: a gun that re-enumerated
+        # comes back under a different name, which is the common case here.
+        port = self.link.port
+        self.link.close()
+        if self.link.connect(port):
+            self.t_open = now
+            self.link.send("~ping")
+            self.link.send("~cam?")
+            self.link.send("~fx?")
+            self._link_bad = False
+            self.toast_now("gun back on %s" % self.link.port)
+            # A gun that rebooted has forgotten it was asked to be quiet, and
+            # a reconnect during a calibration must not resume with a live
+            # solenoid on the next pull.
+            if self._fx_quiet_want:
+                self._fx_quiet_t = 0.0
+
+    def draw_link_banner(self):
+        """One red line, on every screen, whenever the gun is not reachable.
+
+        Also the place the stale-tools warning lands: a stick that received a
+        new pical.py and kept an old tools/ produces features that quietly do
+        nothing, and that has cost a whole test session before."""
+        sc = self.sc
+        msg = None
+        if not LINK_API_OK:
+            msg = ("tools/ on this stick is OLDER than pical.py -- copy the "
+                   "whole tools folder across, several screens will not work")
+        elif self._link_bad:
+            msg = ("GUN LINK LOST on %s -- nothing you change here is reaching "
+                   "the gun. Reconnecting..." % (self.link.port or "?"))
+        if not msg:
+            return
+        img = sc.f_s.render(msg, True, C_BAD)
+        r = img.get_rect()
+        r.center = (sc.w // 2, int(sc.h * 0.035))
+        pygame.draw.rect(sc.s, (40, 14, 16), r.inflate(30, 14))
+        pygame.draw.rect(sc.s, C_BAD, r.inflate(30, 14), 1)
+        sc.s.blit(img, r)
 
     # ---- one frame -------------------------------------------------------
     def step(self, events, now):
@@ -1904,6 +2217,7 @@ class App:
                     self.view.finish_stage()
                 elif e.type == pygame.KEYDOWN and e.key == pygame.K_s:
                     self.view.save_now()
+        self.link_tick(now)
         self.link.pump()
         while self.link.replies:
             r = self.link.replies.pop(0)
@@ -1912,8 +2226,15 @@ class App:
             # pical has no visible log outside the auto-tune overlay.
             if ("diag VERDICT" in r or "diag stream" in r
                     or r.startswith("FX: saved")
-                    or r.startswith("FX: SAVE FAILED")):
+                    or r.startswith("FX: SAVE FAILED")
+                    # A refusal must be as visible as a success: both of these
+                    # otherwise read as a solenoid that has stopped working.
+                    or r.startswith("FX: quiet mode is ON")
+                    or r.startswith("FX: busy")):
                 self.toast_now(r.strip()[:110])
+        # After the replies are drained, so the restore check reads the gun's
+        # freshest answer rather than the one from the previous frame.
+        self.fx_tick(now)
         if self.session is not None and self.session.state == self.session.S_DONE:
             self.finish_calib()
         self.view.handle(acts, mouse)
@@ -2019,17 +2340,38 @@ def run(stances=3, windowed=False, port=None):
             app.link.send("~ping")
             app.link.send("~cam?")
             app.link.send("~fx?")
+    if not LINK_API_OK:
+        # Also on stdout, because the launcher keeps that log and a photo of
+        # the TV is not always how this gets reported.
+        print("pical: WARNING -- tools/ is older than pical.py (needs LINK_API "
+              "%d, found %d); copy the whole tools folder to the stick"
+              % (LINK_API_NEEDED, getattr(gun_studio, "LINK_API", 0)))
     clock = pygame.time.Clock()
-    while app.running:
-        events = pygame.event.get()
-        for e in events:
-            if e.type == pygame.QUIT:
-                app.running = False
-        app.step(events, time.time())
-        pygame.display.flip()
-        pump_wait(clock, app._pump_wait)
-    app.link.close()
-    pygame.quit()
+    try:
+        while app.running:
+            events = pygame.event.get()
+            for e in events:
+                if e.type == pygame.QUIT:
+                    app.running = False
+            app.step(events, time.time())
+            pygame.display.flip()
+            pump_wait(clock, app._pump_wait)
+    finally:
+        # Whatever ended this run -- the menu, a window close, Ctrl-C, or an
+        # exception on the way past -- the gun does not keep the state this app
+        # put it in. A crash mid-calibration used to leave the recoil silenced
+        # with no way to tell that was what had happened.
+        try:
+            app.fx_quiet(False)
+            # Said on stdout, not through a toast: the frame loop has ended,
+            # so nothing will ever draw one -- and the launcher keeps this log.
+            if not app.fx_restore():
+                print("pical: WARNING -- could not put the recoil settings "
+                      "back; check screen 7 on the gun")
+        except Exception as e:
+            print("pical: could not restore the recoil settings: %s" % e)
+        app.link.close()
+        pygame.quit()
     return 0
 
 

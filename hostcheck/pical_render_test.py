@@ -130,7 +130,12 @@ def main():
        "a slider nudge sends a ~cam= command")
     app.link.last["board"] = "rp2040-wiicam"
     cam2 = pical.Camera(app)
-    ck(len(cam2.rows) < n_rows and cam2.wiicam(),
+    # Checked by WHICH controls appear, not by how many: a count says nothing
+    # about whether the right screen was built, and broke the moment the
+    # ambient-light rows arrived.
+    wii_labels = [r.label for r in cam2.rows]
+    ck(cam2.wiicam() and "Sensitivity" in wii_labels
+       and "THR" not in wii_labels and n_rows > 0,
        "wiicam board shows the sensitivity control instead of the sliders")
     app.open(cam2)
     app.step([], 1.2)
@@ -571,6 +576,167 @@ def main():
     app.step([key(pygame.K_RETURN)], t + 8.6)
     ck(any(b"fx=test:1" in w for w in ser.written[n0:]),
        "the test-fire row fires over serial")
+
+    # ---- quieting the gun for a measurement -------------------------------
+    # A calibration measures where the gun was pointing when the trigger broke,
+    # so the solenoid AND the rumble motor have to stop. The second half is the
+    # one that was broken: setting the engine's rumble time to zero HANDS the
+    # motor back to OpenFIRE, whose off-screen rumble then fired on every
+    # calibration shot -- a "silence" that was louder than doing nothing.
+    app.link.last.clear()
+    app.link.last["board"] = "rp2040-wiicam"
+    app._fx_saved = None
+    app._fx_quiet_want = False
+
+    app.link.last["fxquiet"] = 0            # firmware that HAS quiet mode
+    app.link.last["fxon"] = 1
+    n0 = len(ser.written)
+    app.fx_quiet(True)
+    sent = b"".join(ser.written[n0:])
+    ck(b"fx=quiet:1" in sent, "new firmware is quieted with one switch")
+    ck(app._fx_saved is None,
+       "and nothing is saved and restored -- the state that used to get stuck")
+    n0 = len(ser.written)
+    app.fx_tick(time.time() + pical.QUIET_REARM_S + 1)
+    ck(b"fx=quiet:1" in b"".join(ser.written[n0:]),
+       "quiet is re-armed while it is wanted: it expires by itself, so a "
+       "crashed app can never mute a gun for good")
+    n0 = len(ser.written)
+    app.fx_quiet(False)
+    ck(b"fx=quiet:0" in b"".join(ser.written[n0:]), "and released on the way out")
+
+    # Older firmware: the best imitation available, and it must never write
+    # rumms:0 -- that is the exact value that gives the motor back.
+    app.link.last.pop("fxquiet")
+    app.link.last.update({"fxon": 0, "fxdrive": 45, "fxhold": 60,
+                          "fxpulse": 1, "fxrumms": 0})
+    n0 = len(ser.written)
+    app.fx_quiet(True)
+    sent = b"".join(ser.written[n0:])
+    ck(b"rumms:1" in sent and b"rumms:0" not in sent,
+       "old firmware keeps the motor with a 1 ms window, never a 0 that "
+       "hands it back to OpenFIRE's own rumble")
+    ck(app._fx_saved and app._fx_saved.get("drive") == 45,
+       "the user's real settings are saved first")
+    n0 = len(ser.written)
+    app.fx_quiet(False)
+    sent = b"".join(ser.written[n0:])
+    ck(b"drive:45" in sent and b"on:0" in sent, "and put back afterwards")
+    ck(b"fx?" in sent, "with a read-back asked for, so a restore that went "
+                       "into a dead port is not mistaken for one that worked")
+    app.toast = ""
+    app.link.last["fxdrive"] = 5           # the gun did NOT take it
+    app.fx_tick(time.time() + 2.0)
+    ck("did NOT go back" in app.toast, "a restore that did not land is reported")
+
+    # A gun already sitting on calibration-quiet values must not have them
+    # saved as if the user had chosen them: that is how it became permanent.
+    app._fx_saved = None
+    app.link.last.update({"fxon": 1, "fxdrive": 5, "fxhold": 0, "fxpulse": 0,
+                          "fxrumms": 0})
+    ck(pical.quiet_plan(app.link.last) == "stuck",
+       "values a calibration left behind are recognised for what they are")
+    app.toast = ""
+    app.fx_quiet(True)
+    ck(app._fx_saved is None and "screen 7" in app.toast,
+       "so they are never saved and restored, and the user is told what to fix")
+    app.fx_quiet(False)
+
+    # Arming twice without an intervening restore must not re-read the saved
+    # values from a gun that is already holding the QUIET ones -- doing so
+    # replaced the user's real settings with them, permanently. Reachable by
+    # pressing "calibrate again" on the result screen.
+    app._fx_saved = None
+    app._fx_quiet_want = False
+    app.link.last.update({"fxon": 0, "fxdrive": 45, "fxhold": 60,
+                          "fxpulse": 1, "fxrumms": 0})
+    app.link.last.pop("fxquiet", None)
+    app.fx_quiet(True)
+    app.link.last.update({"fxon": 1, "fxdrive": 5, "fxhold": 0,
+                          "fxpulse": 0, "fxrumms": 1})   # the gun's own echo
+    app.fx_quiet(True)                                   # ...and arm again
+    ck(app._fx_saved and app._fx_saved.get("drive") == 45,
+       "arming quiet twice keeps the user's real settings, not the quiet ones")
+    app.fx_quiet(False)
+
+    # A restore that could not be sent must KEEP what it was holding, so a
+    # later attempt can still put it back.
+    app._fx_saved = {"on": 1, "drive": 45, "hold": 60, "pulse": 1, "rumms": 0}
+    saved_src, app.link.src = app.link.src, None
+    ck(app.fx_restore() is False and app._fx_saved is not None,
+       "a restore into a dead link reports failure and forgets nothing")
+    app.link.src = saved_src
+    ck(app.fx_restore() is True and app._fx_saved is None,
+       "and the next attempt, with the gun back, completes it")
+
+    # Leaving with the link down must not leave the app wanting silence: the
+    # reconnect would then re-arm quiet on a gun nobody is calibrating.
+    app._fx_quiet_want = True
+    app._fx_plan = "quiet"
+    saved_src, app.link.src = app.link.src, None
+    app.fx_quiet(False)
+    app.link.src = saved_src
+    n0 = len(ser.written)
+    app.fx_tick(time.time() + pical.QUIET_REARM_S + 1)
+    ck(not app._fx_quiet_want
+       and b"quiet:1" not in b"".join(ser.written[n0:]),
+       "leaving while the gun is away still ends the wanting of silence")
+
+    # ---- the link itself --------------------------------------------------
+    # A reader thread that has died leaves every value frozen and every key
+    # apparently working, because writes into a dead port fail silently. That
+    # is indistinguishable from a screen whose controls have broken -- and it
+    # is what "the arrows do not change anything" looks like from the couch.
+    class DeadSrc(FakeSrc):
+        def is_alive(self):
+            return False
+    app.link.src = DeadSrc()
+    app.link.port = "SIM"
+    app._link_t = 0.0
+    app._link_retry = time.time()          # do not actually rescan ports here
+    app.toast = ""
+    app.link_tick(time.time())
+    ck(app._link_bad, "a dead reader thread is NOTICED")
+    ck("lost the gun" in app.toast, "and said out loud, not left to be guessed")
+    app.step([], t + 9)
+    ck(True, "the lost-link banner renders over whatever screen is up")
+    ck(pical.LINK_API_OK,
+       "pical and the tools/ beside it are the same generation")
+    attach(app)
+    app._link_bad = False
+    ser = app.link.src.ser          # attach() built a NEW fake serial
+
+    # ---- the ambient-light readout ---------------------------------------
+    app.link.last["board"] = "rp2040-wiicam"
+    cam3 = pical.Camera(app)
+    labels = [r.label for r in cam3.rows]
+    ck("Blob detail (sizes)" in labels and "Largest blob kept" in labels,
+       "the wiicam camera screen offers the blob size window")
+    app.open(cam3)
+    cam3.sel = labels.index("Largest blob kept")
+    n0 = len(ser.written)
+    app.step([key(pygame.K_LEFT)], t + 9.2)
+    ck(any(b"cam=bmax:" in w for w in ser.written[n0:]),
+       "and nudging it sends the gate to the gun")
+    app.link.blobs = "CAM: blobs 30,40,3,1 200,41,4,1 31,140,3,1 210,150,14,0"
+    app.link.last.update({"br4": 800, "br3": 150, "br2": 40, "br1": 10,
+                          "br0": 0, "brej": 7})
+    lines = "\n".join(cam3.blob_lines())
+    ck("size 14 DROPPED" in lines,
+       "the readout shows each blob's size and what the gate did with it")
+    ck("saw all four LEDs" in lines,
+       "and what share of frames is losing a corner -- the number that says "
+       "how much the light is actually costing")
+    # The gun's counters restart at zero when it reboots. A negative delta
+    # never reaches the sample threshold, so the readout used to freeze on
+    # stale numbers for the rest of the session.
+    app.link.last.update({"br4": 5, "br3": 1, "br2": 0, "br1": 0, "br0": 0})
+    cam3.blob_lines()                      # re-baselines on the negative delta
+    app.link.last.update({"br4": 300, "br3": 20, "br2": 5, "br1": 0, "br0": 0})
+    ck("saw all four LEDs" in "\n".join(cam3.blob_lines()),
+       "and it recovers by itself after the gun reboots its counters")
+    app.step([], t + 9.4)
+    ck(True, "camera screen renders with the blob readout")
 
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on

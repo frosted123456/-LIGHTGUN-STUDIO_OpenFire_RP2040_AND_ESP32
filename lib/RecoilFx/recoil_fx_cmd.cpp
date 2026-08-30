@@ -53,7 +53,13 @@ static int parse_int(const char** s)
 {
     int sgn = 1, v = 0;
     if (**s == '-') { sgn = -1; ++(*s); }
-    while (**s >= '0' && **s <= '9') v = v * 10 + (*(*s)++ - '0');
+    // Digits past the cap are consumed but not accumulated: signed overflow is
+    // undefined behaviour, and a long digit string on a serial line is a typo
+    // or a garbled byte. Every key clamps to its own range afterwards.
+    while (**s >= '0' && **s <= '9') {
+        const int d = *(*s)++ - '0';
+        if (v < 100000000) v = v * 10 + d;
+    }
     return v * sgn;
 }
 
@@ -66,8 +72,12 @@ int fx_command(const char* line, uint64_t now_us)
     }
     if (!strncmp(line, "fx?", 3)) {
         report();
-        reply("FX: ab=%d left=%d busy=%d temp=%d\n", fx_ab_active(now_us),
-              fx_ab_left_s(now_us), fx_busy(now_us), s_temp);
+        // quiet= is what a tool tests to learn this firmware HAS quiet mode:
+        // an older build simply does not print the key, and the tools fall
+        // back rather than believing a silence they never got.
+        reply("FX: ab=%d left=%d busy=%d temp=%d quiet=%d qleft=%d\n",
+              fx_ab_active(now_us), fx_ab_left_s(now_us), fx_busy(now_us),
+              s_temp, fx_quiet_active(now_us), fx_quiet_left_s(now_us));
         return 1;
     }
     if (strncmp(line, "fx=", 3) != 0) return 0;
@@ -101,12 +111,29 @@ int fx_command(const char* line, uint64_t now_us)
             reply("FX: dry-fire %s ab=%d left=%d\n",
                   v ? "ON" : "off", v ? 1 : 0, fx_ab_left_s(now_us));
         }
+        else if (!strcmp(key, "quiet")) {
+            // The calibration tools' silence switch: nothing fires and both
+            // outputs belong to the engine until it is turned off or lapses.
+            fx_quiet_set(v ? 1 : 0, now_us);
+            // qleft, never left: the tools key their state off the token name,
+            // and "left" already belongs to the dry-fire countdown. Sharing it
+            // would make arming quiet claim dry-fire was armed.
+            reply("FX: quiet %s quiet=%d qleft=%d\n", v ? "ON" : "off",
+                  fx_quiet_active(now_us), fx_quiet_left_s(now_us));
+        }
         else if (!strcmp(key, "test")) {
             // One full sequence with the current parameters, no trigger and
             // no IR involved. The refusal is reported: a silently swallowed
-            // test fire looks exactly like a dead solenoid.
-            if (v) reply(fx_fire_forced(now_us) ? "FX: test fired\n"
-                                                : "FX: busy, not fired\n");
+            // test fire looks exactly like a dead solenoid -- and "quiet mode"
+            // is named as the cause, or a tool that armed quiet and forgot
+            // looks like a gun that stopped working.
+            if (v) {
+                if (fx_quiet_active(now_us))
+                    reply("FX: quiet mode is ON -- not fired\n");
+                else
+                    reply(fx_fire_forced(now_us) ? "FX: test fired\n"
+                                                 : "FX: busy, not fired\n");
+            }
         }
     }
     if (changed) {

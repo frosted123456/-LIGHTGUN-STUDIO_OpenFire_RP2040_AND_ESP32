@@ -19,6 +19,11 @@ enum { FX_SOL_OFF = 0, FX_SOL_FULL = 1, FX_SOL_HOLD = 2 };
 // solenoid, not a taste knob.
 #define FX_RELATCH_MS 18
 #define FX_AB_TIMEOUT_US (10ull * 60 * 1000000)   // dry-fire mode auto-expiry
+// Quiet mode expiry. Short on purpose: the tool that asks for quiet re-arms it
+// while it still wants silence, so a tool that CRASHES mid-calibration leaves
+// a gun that is back to normal within this window instead of one that never
+// recoils again.
+#define FX_QUIET_TIMEOUT_US (5ull * 60 * 1000000)
 
 typedef struct {
     int enabled;     // 0 = engine dormant, stock OpenFIRE behaviour (default)
@@ -54,6 +59,25 @@ int  fx_busy(uint64_t now_us);                 // sequence or spacing still open
 void fx_ab_set(int on, uint64_t now_us);
 int  fx_ab_active(uint64_t now_us);
 int  fx_ab_left_s(uint64_t now_us);   // seconds until dry-fire expires; 0 = off
+
+// Quiet mode: one switch that makes the gun silent, for the calibration tools.
+// While it is on NOTHING fires -- trigger, autofire and the test command are
+// all refused -- and the engine claims BOTH outputs, so the stock OpenFIRE
+// solenoid and rumble paths are skipped as well. Silencing by tuning the knobs
+// down could not do that second half: a zero rumble time HANDS the motor back
+// to OpenFIRE, which is exactly how rumble kept firing during a calibration.
+// It expires by itself; the asking tool re-arms it while it still wants quiet.
+void fx_quiet_set(int on, uint64_t now_us);
+int  fx_quiet_active(uint64_t now_us);
+int  fx_quiet_left_s(uint64_t now_us);   // seconds of quiet left; 0 = off
+
+// Output ownership. The glue asks these instead of reading `enabled` itself,
+// so the policy that decides which paths OpenFIRE may run is one host-testable
+// place rather than a condition repeated in board-specific code.
+int fx_owns_outputs(uint64_t now_us);   // the engine branch replaces the stock
+                                        // solenoid path
+int fx_owns_rumble(uint64_t now_us);    // the stock rumble paths must not touch
+                                        // the motor pin
 
 #ifdef __cplusplus
 }

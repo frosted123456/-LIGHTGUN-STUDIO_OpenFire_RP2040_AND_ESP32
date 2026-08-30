@@ -208,6 +208,167 @@ int main()
        "...including the distortion-centre offset");
     ck(aim_smooth_get() == 8, "...and a reboot restores the stored smoothing");
 
+    // ---- the blob size gate (ambient light) ------------------------------
+    // A window in the sensor's view does not ADD a fifth blob: the wiicam
+    // reports four slots, so a bright patch TAKES one and an LED goes missing.
+    // The only hardware fact that separates them is blob size, and only the
+    // extended data format carries it. Everything here must be inert until
+    // asked for, and must never be able to blind the gun.
+    {
+        wiicam_aim_begin();
+        wiicam_cam_command("cam=res:0,dash:2,dashhz:0,mirx:1");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("ext=0") != std::string::npos
+           && g_replies[0].find("bmin=0") != std::string::npos
+           && g_replies[0].find("bmax=15") != std::string::npos,
+           "the gate ships inert: extended format off, window wide open");
+
+        rig(px, py, 512, 384, 512, 288);
+        int sz[4] = {3, 3, 3, 14};          // slot 3 is a big diffuse patch
+        // Sizes are only believed when the caller actually has them: the plain
+        // entry point passes none, and the gate must not act on a guess.
+        wiicam_cam_command("cam=bmin:1,bmax:8");
+        g_lines.clear();
+        t += DT;
+        wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
+        n = -1;
+        if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n);
+        ck(n == 4, "with no sizes available the gate cannot drop anything");
+
+        // With sizes, the oversized blob is dropped before the resolver.
+        g_lines.clear();
+        t += DT;
+        px[0] += 1;                          // defeat the duplicate cache
+        wiicam_aim_process_sz(px, py, sz, 0xF, t, &sx, &sy);
+        n = -1;
+        if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n);
+        ck(n == 3, "an out-of-window blob is dropped before the resolver");
+
+        g_replies.clear();
+        wiicam_cam_command("camblob?");
+        ck(g_replies.size() >= 2
+           && g_replies[0].find("brej=1") != std::string::npos,
+           "camblob? counts what the gate dropped");
+        ck(g_replies.size() >= 2
+           && g_replies[1].find(",14,0") != std::string::npos,
+           "and shows the offending blob with its size and REJECTED flag");
+
+        // The safety valve: a gate set so tight that nothing survives passes
+        // the frame through untouched. A blinded gun is worse than an impostor.
+        wiicam_cam_command("cam=bmin:12,bmax:13");
+        g_lines.clear();
+        t += DT;
+        px[0] += 1;
+        wiicam_aim_process_sz(px, py, sz, 0xF, t, &sx, &sy);
+        n = -1;
+        if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n);
+        ck(n == 4, "a gate that would reject EVERY blob is ignored for that "
+                   "frame -- it can never blind the gun");
+
+        // Clamping and the ordering guard.
+        wiicam_cam_command("cam=bmin:0,bmax:99");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty() && g_replies[0].find("bmax=15") != std::string::npos,
+           "sizes clamp to the sensor's own 0..15 range");
+        // Order independence. The tools send one key per keystroke, so
+        // clamping bmin against the CURRENT bmax as it arrives made the result
+        // depend on which end was typed first: asking for 8..12 from a stored
+        // 0..3 quietly produced 3..12, and the spin box then showed the value
+        // being refused with no explanation.
+        wiicam_cam_command("cam=bmin:0,bmax:3");
+        wiicam_cam_command("cam=bmin:8");
+        wiicam_cam_command("cam=bmax:12");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty() && g_replies[0].find("bmin=8") != std::string::npos
+           && g_replies[0].find("bmax=12") != std::string::npos,
+           "the two ends can be typed in either order and both land");
+        // And an inverted window still gates sanely rather than dropping
+        // everything: it is ordered where it is USED.
+        wiicam_cam_command("cam=bmin:9,bmax:2");
+        rig(px, py, 512, 384, 512, 288);
+        int sz2[4] = {1, 5, 5, 14};        // 5s inside 2..9, the others outside
+        wiicam_cam_command("cam=res:0,dash:2,dashhz:0");
+        g_lines.clear();
+        t += DT;
+        px[0] += 1;
+        wiicam_aim_process_sz(px, py, sz2, 0xF, t, &sx, &sy);
+        n = -1;
+        if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n);
+        ck(n == 2, "an inverted window is read low-to-high, not as empty");
+
+        // The recovery command a user reaches for when nothing works must undo
+        // the one setting here that can stop a gun aiming.
+        wiicam_cam_command("cam=ext:1");
+        const int ep = wiicam_aim_ext_epoch();
+        ck(wiicam_aim_ext() == 1, "ext:1 asks for the extended data format");
+        ck(ep != 0, "and bumps the epoch so the camera owner re-applies it");
+        wiicam_cam_command("cam=ext:1");
+        ck(wiicam_aim_ext_epoch() == ep,
+           "setting it again changes nothing -- no needless I2C writes");
+        wiicam_aim_format_dirty();
+        ck(wiicam_aim_ext_epoch() != ep,
+           "a camera restart bumps it: the format must be applied again or "
+           "the frames decode as garbage with no error at all");
+        ck(wiicam_aim_ext() == 1,
+           "and the wanted format survives that bump");
+        // The camera poll reads ONE word. Reading the flag and the epoch as
+        // two values let it pair a new epoch with the old flag, write the old
+        // format, latch the new epoch, and then never correct itself.
+        ck((wiicam_aim_ext_state() & 1) == wiicam_aim_ext()
+           && (wiicam_aim_ext_state() >> 1) == wiicam_aim_ext_epoch(),
+           "the state word carries both halves, so they cannot be read apart");
+        {
+            const int st = wiicam_aim_ext_state();
+            wiicam_cam_command("cam=ext:0");
+            ck(wiicam_aim_ext_state() != st,
+               "and every change moves the whole word at once");
+        }
+        wiicam_cam_command("cam=ext:1");
+        g_replies.clear();
+        wiicam_cam_command("camreset");
+        ck(wiicam_aim_ext() == 0, "camreset turns the extended format back off");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty() && g_replies[0].find("bmin=0") != std::string::npos
+           && g_replies[0].find("bmax=15") != std::string::npos,
+           "...and opens the window again, so one command undoes all of it");
+
+        // What the counters are FOR: the fraction of frames losing a corner.
+        wiicam_cam_command("cam=res:2,dash:0");
+        rig(px, py, 512, 384, 512, 288);
+        for (int i = 0; i < 40; ++i) {       // lock on all four
+            t += DT;
+            px[1] += (i & 1) ? 1 : -1;
+            wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
+        }
+        g_replies.clear();
+        wiicam_cam_command("camblob?");
+        unsigned long r4a = 0;
+        if (!g_replies.empty()) {
+            const char* p4 = strstr(g_replies[0].c_str(), "br4=");
+            if (p4) sscanf(p4, "br4=%lu", &r4a);
+        }
+        ck(r4a > 0, "frames with all four corners really seen are counted");
+        for (int i = 0; i < 20; ++i) {       // now one LED is taken every frame
+            t += DT;
+            px[1] += (i & 1) ? 1 : -1;
+            wiicam_aim_process(px, py, 0xF & ~(1u << 3), t, &sx, &sy);
+        }
+        g_replies.clear();
+        wiicam_cam_command("camblob?");
+        unsigned long r3 = 0;
+        if (!g_replies.empty()) {
+            const char* p3 = strstr(g_replies[0].c_str(), "br3=");
+            if (p3) sscanf(p3, "br3=%lu", &r3);
+        }
+        ck(r3 >= 19, "and so are the frames that only got three -- the number "
+                     "that says how much the light is costing");
+    }
+
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;
 }
