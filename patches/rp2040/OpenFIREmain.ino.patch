@@ -1,6 +1,6 @@
 --- a/OpenFIREmain/OpenFIREmain.ino
 +++ b/OpenFIREmain/OpenFIREmain.ino
-@@ -23,6 +23,62 @@
+@@ -23,6 +23,73 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIREprefs.h"
  #include "OpenFIREconstant.h"
@@ -41,6 +41,11 @@
 +    Serial.print("AIM: pipeline ready (rp2040-wiicam) -- send ~ping or ~aimcal?\n");
 +}
 +// Claim our own bytes out of OpenFIRE's Serial stream before their parser runs.
++// While true, core 0 leaves the camera and its I2C bus alone. The serial
++// pump runs on core 1 under DUAL_CORE, so a camdiag or a sensitivity write
++// would otherwise race core 0's 420 Hz GetPosition on the same driver.
++static volatile bool aim_cam_hold = false;
++
 +static inline void aim_serial_pump()
 +{
 +    while(Serial.available()) {
@@ -51,7 +56,13 @@
 +    }
 +}
 +// Sensitivity goes through OpenFIRE's own persisted setting.
-+static void aim_sens_set(int v) { FW_Common::SetIrSensitivity((uint32_t)v); }
++static void aim_sens_set(int v)
++{
++    aim_cam_hold = true;
++    delay(4);                       // drain an in-flight GetPosition
++    FW_Common::SetIrSensitivity((uint32_t)v);
++    aim_cam_hold = false;
++}
 +static int  aim_sens_get(void)  { return (int)OF_Prefs::profiles[OF_Prefs::currentProfile].irSens; }
 +// Persists the profile (SetIrSensitivity alone does not write flash).
 +static void aim_sens_save(void)
@@ -63,7 +74,7 @@
  
  // Sets up the environment
  void setup() {
-@@ -141,7 +197,70 @@
+@@ -141,7 +208,82 @@
      #endif // LED_ENABLE
  
      // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
@@ -82,16 +93,25 @@
 +    // pins, and if the sensor answers while the camera is down, rebuild the
 +    // camera on the spot -- a fixed wire should not need a reboot to take.
 +    wiicam_set_diag_hook([]() -> int {
++        // Core 0 polls the camera at 420 Hz; the probe borrows its pins and
++        // the restart deletes its driver, so core 0 is held off first -- and
++        // the recoil engine is silenced, or a diag mid-strike would freeze
++        // the coil energised for the whole probe.
++        fx_glue_shutdown();
++        aim_cam_hold = true;
++        delay(5);
++        // Judged by the PRE-probe flag: stealing the bus pins makes core 0's
++        // in-flight reads fail, which flips camNotAvailable on a healthy gun.
++        const bool was_down = FW_Common::camNotAvailable;
 +        const int v = wiicam_diag_arduino(OF_Prefs::pins[OF_Const::camSDA],
 +                                          OF_Prefs::pins[OF_Const::camSCL],
 +                                          aim_reply_sink);
-+        // The driver's own view is part of the answer: a probe that says
-+        // "good" while the driver is flagged dead (or the reverse) is
-+        // exactly the state that reads as "something is still off".
-+        aim_reply_sink(FW_Common::camNotAvailable
++        if(!was_down)
++            FW_Common::camNotAvailable = false;   // the probe tripped it, not a fault
++        aim_reply_sink(was_down
 +            ? "CAM: diag driver flag: camera NOT available\n"
 +            : "CAM: diag driver flag: camera available\n");
-+        if(v == WD_ACK && FW_Common::camNotAvailable) {
++        if(v == WD_ACK && was_down) {
 +            delete FW_Common::dfrIRPos;
 +            FW_Common::dfrIRPos = nullptr;
 +            FW_Common::CameraSet();
@@ -106,6 +126,8 @@
 +        // its clock wire dead, it just never produces a frame. This names
 +        // both cases apart.
 +        if(v == WD_ACK && !FW_Common::camNotAvailable && FW_Common::dfrIRPos) {
++            // still under aim_cam_hold: this stream check must be the only
++            // master on the bus
 +            int got = -99;
 +            for(int i = 0; i < 40; ++i) {
 +                got = FW_Common::dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
@@ -124,6 +146,7 @@
 +                               "frame data -- check the Wii Cam Clock wire "
 +                               "and its pin, then power-cycle the sensor\n");
 +        }
++        aim_cam_hold = false;
 +        return v;
 +    });
 +    wiicam_set_sens_hooks(aim_sens_set, aim_sens_get, aim_sens_save);
@@ -135,7 +158,7 @@
  
      FW_Common::OpenFIREper.source(OF_Prefs::profiles[OF_Prefs::currentProfile].adjX,
                                    OF_Prefs::profiles[OF_Prefs::currentProfile].adjY);
-@@ -165,6 +284,18 @@
+@@ -165,6 +307,18 @@
          #endif // USES_DISPLAY
  
          while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
@@ -154,7 +177,7 @@
              // Check and process serial commands, in case user needs to change EEPROM settings.
              if(Serial.available())
                  OF_Serial::SerialProcessingDocked();
-@@ -210,7 +341,12 @@
+@@ -210,7 +364,12 @@
          // skip cali if we're prematurely set to run from the above loop
          // (i.e. cal'd from Desktop)
          if(FW_Common::gunMode != FW_Const::GunMode_Run)
@@ -167,7 +190,7 @@
      } else {
          // this will turn off the DotStar/RGB LED and ensure proper transition to Run
          FW_Common::SetMode(FW_Const::GunMode_Run);
-@@ -272,6 +408,12 @@
+@@ -272,6 +431,12 @@
          // All buttons' outputs except for the trigger are processed here.
          FW_Common::buttons.Poll(0);
  
@@ -180,7 +203,7 @@
          #ifdef USES_TEMP
              if(OF_Prefs::pins[OF_Const::tempPin] > -1)
                  OF_FFB::TemperatureUpdate();
-@@ -292,6 +434,10 @@
+@@ -292,6 +457,10 @@
              FW_Common::buttons.SendReports();
          }
  
@@ -191,7 +214,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -369,6 +515,10 @@
+@@ -369,6 +538,10 @@
      }
  
      #ifdef MAMEHOOKER
@@ -202,7 +225,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
      #endif // MAMEHOOKER
  
-@@ -648,6 +798,10 @@
+@@ -648,6 +821,10 @@
      #endif // ARDUINO_ARCH_RP2040 && DUAL_CORE
  
      for(;;) {
@@ -213,7 +236,17 @@
          // Setting the state of our toggles, if used.
          // Only sets these values if the switches are mapped to valid pins.
          #ifdef USES_SWITCHES
-@@ -723,6 +877,11 @@
+@@ -684,7 +861,8 @@
+ 
+         if(FW_Common::irPosUpdateTick) {
+             FW_Common::irPosUpdateTick = 0;
+-            FW_Common::GetPosition();
++            if(!aim_cam_hold)
++                FW_Common::GetPosition();
+         }
+         #ifdef USES_DISPLAY
+             else {
+@@ -723,6 +901,11 @@
  
          FW_Common::buttons.Poll(0);
  
@@ -225,7 +258,7 @@
          // For processing the trigger specifically.
          // (FW_Common::buttons.debounced is a binary variable intended to be read 1 bit at a time,
          // with the 0'th point == rightmost == decimal 1 == trigger, 3 = start, 4 = select)
-@@ -739,6 +898,10 @@
+@@ -739,6 +922,10 @@
          }
  
          // Run through serial receive buffer once this run, if it has contents.
@@ -236,7 +269,17 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -934,8 +1097,14 @@
+@@ -821,7 +1008,8 @@
+ 
+         if(FW_Common::irPosUpdateTick) {
+             FW_Common::irPosUpdateTick = 0;
+-            FW_Common::GetPosition();
++            if(!aim_cam_hold)
++                FW_Common::GetPosition();
+         }
+     }
+ }
+@@ -934,8 +1122,14 @@
  // Handles events when trigger is pulled/held
  void TriggerFire()
  {

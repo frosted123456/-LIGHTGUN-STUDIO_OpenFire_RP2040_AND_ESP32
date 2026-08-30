@@ -242,6 +242,15 @@ else
     echo "pre-build setup guard: FAILED"; exit 1
 fi
 
+# The USB doctor's verdict logic, against injected port/problem snapshots.
+if python3 hostcheck/usb_doctor_test.py > /tmp/ov_usb.out 2>&1 \
+   && grep -q "usb doctor: ALL PASS" /tmp/ov_usb.out; then
+    echo "usb doctor verdicts: OK"
+else
+    cat /tmp/ov_usb.out 2>/dev/null
+    echo "usb doctor verdicts: FAILED"; exit 1
+fi
+
 # The calibration install path: the '~' prefix the firmware requires, and the
 # read-back that proves the values actually landed.
 if python3 hostcheck/install_verify_test.py > /tmp/ov_inst.out 2>&1 \

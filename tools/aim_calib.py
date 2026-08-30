@@ -37,7 +37,12 @@ ROLL_TARGET_DEG = 12.0              # what we ask for
 ROLL_MIN_DEG    = 8.0               # what we accept before continuing
 ROLL_S          = 1.2               # sustained tilt before auto-continue
 MIN_FRAMES   = 30                   # of 4-LED frames needed to accept a dot
-DRIFT_REJECT = 9.0                  # native px of centroid travel -> "you moved"
+DRIFT_REJECT = 12.0                 # native px of centroid travel -> "you moved"
+# How long after a REAL trigger pull the capture ignores frames: the solenoid
+# strike, its after-pulses and the hand's ring-down all land in this window,
+# and counting them measured the gun's own recoil as "you moved". Auto-dwell
+# captures pull nothing, so they skip the blank entirely.
+RECOIL_BLANK_MS = 300.0
 # EDGE MARGIN. An LED whose blob is partly outside the sensor has its centroid
 # pulled inward, so the quad quietly shrinks on that side and the fit is
 # corrupted. Checked on the MEDIAN quad of the pull, plus a mostly-clipped guard.
@@ -280,18 +285,25 @@ class CaptureSession:
             self.auto_reason = ("no trigger seen in %.0fs -- falling back to "
                                 "hold-still capture" % AUTO_AFTER_S)
 
-    def trigger(self, now):
+    def trigger(self, now, pulled=False):
         # Dead time after a state change: a pull made while the previous screen
         # was up arrives just after the flip and would capture un-aimed.
+        # `pulled` marks a REAL trigger pull -- one that fires the solenoid --
+        # so the capture can blank the recoil transient. The auto-dwell path
+        # and the simulators leave it False and behave exactly as before.
         if now < self.trig_deaf_until:
             return
         if self.state == self.S_AIM:
             self.buf = []; self.t0 = now; self.state = self.S_CAPTURING
+            self.blank_until = now + (RECOIL_BLANK_MS / 1000.0 if pulled else 0.0)
             self.cen_hist = []; self.dwell = 0.0; self.state_t = now
         elif self.state == self.S_REVIEW:
             self._advance()
         elif self.state == self.S_STEPBACK:
-            self.state = self.S_AIM
+            # Through _enter, so the trigger dead time re-arms: one physical
+            # pull arrives twice in pical (serial marker + HID click), and the
+            # bare assignment let the second copy start an un-aimed capture.
+            self._enter(self.S_AIM, now)
 
     def feed(self, quad, now):
         """quad: (4,2) native px. Called for every 4-LED frame."""
@@ -363,13 +375,19 @@ class CaptureSession:
                 self.sb_ok_since = None
             return
         if self.state != self.S_CAPTURING: return
+        # Recoil blanking: frames while the strike shakes the gun are not aim.
+        # The window extends past the blank so the frame budget is unchanged.
+        if now < getattr(self, "blank_until", 0.0):
+            return
         self.buf.append(quad)
-        if (now - self.t0)*1000.0 >= CAPTURE_MS:
+        blank = max(0.0, getattr(self, "blank_until", 0.0) - self.t0)
+        if (now - self.t0 - blank)*1000.0 >= CAPTURE_MS:
             self._finish(now)
 
     def progress(self, now):
         if self.state != self.S_CAPTURING: return 0.0
-        return min(1.0, (now - self.t0)*1000.0/CAPTURE_MS)
+        blank = max(0.0, getattr(self, "blank_until", 0.0) - self.t0)
+        return min(1.0, max(0.0, (now - self.t0 - blank))*1000.0/CAPTURE_MS)
 
     def _finish(self, now):
         a = np.asarray(self.buf)
@@ -895,7 +913,7 @@ def run_gui(src, session, outdir, screenshot=None):
 
     def on_trigger(_e=None):
         if session.state == session.S_DONE: return
-        session.trigger(state["gun_t"])      # gun clock, same as feed()
+        session.trigger(state["gun_t"], pulled=True)   # gun clock, same as feed()
     root.bind("<Button-1>", on_trigger)
     root.bind("<space>", on_trigger)
     root.bind("<Escape>", lambda e: (src.close(), root.destroy()))
@@ -908,7 +926,7 @@ def run_gui(src, session, outdir, screenshot=None):
 
     def on_trigger(_e=None):
         if session.state == session.S_DONE: return
-        session.trigger(state["gun_t"])      # gun clock, same as feed()
+        session.trigger(state["gun_t"], pulled=True)   # gun clock, same as feed()
     root.bind("<Button-1>", on_trigger)
     root.bind("<space>", on_trigger)
     root.bind("<Escape>", lambda e: (src.close(), root.destroy()))

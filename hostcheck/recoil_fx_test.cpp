@@ -287,7 +287,22 @@ done_jit:;
     fx_cancel();
     fx_step(t0 + 1000, &s2, &r2);
     CK(s2 == FX_SOL_OFF, "cancel kills a playing sequence dead");
-    CK(fx_fire(t0 + 2000) == 1, "and the engine is immediately free to fire");
+    CK(fx_fire(t0 + 2000) == 0,
+       "but the earned quiet spacing survives the cancel");
+    CK(fx_fire(t0 + 400000) == 1, "and firing resumes once it passes");
+
+    // ---- the re-latch floor holds even when space is tuned below it ------
+    fx_defaults(&p); p.enabled = 1; p.hold_ms = 0; p.space_ms = 0;
+    fx_init(&p, 1);
+    fx_fire(t0);
+    uint64_t te = t0 + 16000;              // 1 ms after the strike ends
+    CK(fx_fire(te) == 0,
+       "space 0 cannot strike an armature still in flight (autofire path)");
+    CK(fx_fire_preempt(te) == 1, "a pull is still accepted...");
+    fx_step(te + 1000, &s2, &r2);
+    CK(s2 == FX_SOL_OFF, "...but waits out the re-latch");
+    fx_step(t0 + 15000 + (uint64_t)FX_RELATCH_MS * 1000 + 1000, &s2, &r2);
+    CK(s2 == FX_SOL_FULL, "and strikes the moment the armature is back");
     fx_defaults(&p); fx_init(&p, 1);   // dormant again
     CK(fx_fire(400) == 0, "a dormant engine still refuses a trigger fire");
     CK(fx_fire_forced(400) == 1,

@@ -49,5 +49,45 @@ if A.TRIG_DEAD_S > 1.0:
 
 for f in fails:
     print("  [FAIL] %s" % f)
+# ---- recoil blanking -------------------------------------------------------
+# A REAL pull fires the solenoid, and the strike swings the gun through the
+# first part of the capture. Those frames are not aim and must be skipped --
+# but only on a real pull: the auto-dwell path and the simulators pull
+# nothing and must behave exactly as before.
+sess2 = A.CaptureSession(plan=A.make_plan(3, 0))
+src2 = A.SimSource(sess2, blob_sigma=0.3)
+q2 = src2._quad(0.5, 0.5, 1.6)
+t = 200.0
+sess2.live_t = t
+sess2._enter(sess2.S_AIM, t)
+sess2.trig_deaf_until = 0.0
+sess2.trigger(t, pulled=True)
+if sess2.state != sess2.S_CAPTURING:
+    fails.append("a real pull should start the capture")
+# recoil frames: violently displaced, inside the blank window
+qbad = q2 + 60.0
+for i in range(10):
+    sess2.feed(qbad, t + 0.01 + i * 0.02)
+if len(sess2.buf) != 0:
+    fails.append("recoil-window frames were counted (%d)" % len(sess2.buf))
+# settled frames after the blank are counted
+tb = t + A.RECOIL_BLANK_MS / 1000.0 + 0.01
+for i in range(50):
+    sess2.feed(q2, tb + i * 0.02)
+if len(sess2.buf) < 40:
+    fails.append("post-blank frames were not counted (%d)" % len(sess2.buf))
+# and the capture window is extended by the blank, not shortened by it
+if sess2.state != sess2.S_CAPTURING:
+    fails.append("the capture ended before its full post-blank window")
+# an auto (dwell) capture skips nothing
+sess3 = A.CaptureSession(plan=A.make_plan(3, 0))
+sess3.live_t = t
+sess3._enter(sess3.S_AIM, t)
+sess3.trig_deaf_until = 0.0
+sess3.trigger(t)                      # pulled defaults to False
+sess3.feed(q2, t + 0.02)
+if len(sess3.buf) != 1:
+    fails.append("an auto capture must not blank (%d)" % len(sess3.buf))
+
 print("retry trigger: %s" % ("ALL PASS" if not fails else "FAILED"))
 sys.exit(1 if fails else 0)

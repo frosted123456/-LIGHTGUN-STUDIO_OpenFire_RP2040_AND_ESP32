@@ -857,7 +857,8 @@ class Calib:
                 self.app.to_menu()
             elif a in ("select", "click", "trigger"):
                 self.session.note_trigger()
-                self.session.trigger(self.app.link.gun_t or time.time())
+                self.session.trigger(self.app.link.gun_t or time.time(),
+                                     pulled=True)
 
     def draw(self, sc):
         s = self.session
@@ -945,6 +946,13 @@ class FineTune:
         # offset used to own all four arrows, which left no way to reach
         # smoothing or lead with a d-pad at all.
         self.controls = ["dx", "dy", "smooth", "beta", "lead"]
+
+    def feed_quad(self, q):
+        """Banks a frame for the next ring shot, keeping only what a shot
+        uses -- the sink runs for the whole session and an untrimmed list was
+        a slow, unbounded leak on the Pi."""
+        self.recent.append(np.asarray(q, float))
+        del self.recent[:-SHOT_FRAMES]
 
     def send_preview(self):
         self.app.link.send("~" + aimcal_line(self.t.preview())
@@ -1374,7 +1382,17 @@ class Recoil(RowScreen):
         self.rows.append(Row("Save to gun", act=self.save,
                              hint="keeps every knob across power cycles"))
         self.rows.append(Row("Back", act=self.app.to_menu))
+        self._poll_t = 0.0
         link.send("~fx?")            # seed the rows from the gun's own state
+
+    def handle(self, acts, mouse):
+        # Re-read the gun every couple of seconds while this screen is up:
+        # the dry-fire countdown otherwise froze at its armed value, claiming
+        # ARMED long after the gun had disarmed itself.
+        if time.time() - self._poll_t > 2.0:
+            self._poll_t = time.time()
+            self.app.link.send("~fx?")
+        RowScreen.handle(self, acts, mouse)
 
     def test(self):
         self.app.link.send("~fx=test:1")
@@ -1465,6 +1483,7 @@ class App:
         self.running = True
         self.toast = ""
         self.toast_t = 0.0
+        self._fx_saved = None
         self.log_lines = []
         self.t_open = 0.0
         # Pointer tracking: draw our own cursor only once the mouse has
@@ -1549,6 +1568,7 @@ class App:
             self.t_open = time.time()
             self.link.send("~ping")
             self.link.send("~cam?")
+            self.link.send("~fx?")     # fx_calm and the Recoil screen need it
             self.toast_now("connected on %s" % self.link.port)
         else:
             self.toast_now("no gun answered on any serial port")
@@ -1557,6 +1577,7 @@ class App:
         self.view = view
 
     def to_menu(self):
+        self.fx_restore()
         self.session = None
         self.link.sink = None
         self.link.trig_sink = None
@@ -1566,10 +1587,38 @@ class App:
         self.running = False
 
     # ---- steps -----------------------------------------------------------
+    def fx_calm(self):
+        """Quiets the recoil engine for the calibration run.
+
+        A meaty strike swings the gun for a good fraction of the capture; the
+        blanking window absorbs the normal case, but a 500 ms hold outlasts
+        it. Dropping to a 5 ms tick keeps the pull feedback without the swing.
+        Only guns that speak ~fx are touched, and only values we saved are
+        put back."""
+        if "fxon" in self.link.last and self._fx_saved is None:
+            keys = ("on", "drive", "hold", "pulse", "rumms")
+            self._fx_saved = {k: self.link.last.get("fx" + k) for k in keys}
+            self.link.send("~fx=on:1,drive:5,hold:0,pulse:0,rumms:0")
+
+    def fx_restore(self):
+        if self._fx_saved is None:
+            return
+        parts = ["%s:%d" % (k, v) for k, v in self._fx_saved.items()
+                 if v is not None and k != "on"]
+        on = self._fx_saved.get("on")
+        if on is not None:
+            parts.append("on:%d" % on)      # the on-switch goes back LAST
+        if parts:
+            self.link.send("~fx=" + ",".join(parts))
+        self._fx_saved = None
+
     def begin_calib(self):
         if not self.link.src:
             self.toast_now("connect the gun first")
             return
+        # Only once a gun is truly here: calming before the guard captured a
+        # stale saved-state that later clobbered freshly tuned recoil knobs.
+        self.fx_calm()
         self.session = CaptureSession(plan=make_plan(self.stances, 0))
         # Fullscreen: a window fraction IS a screen fraction.
         self.session.to_screen = lambda fx, fy: (fx, fy)
@@ -1587,7 +1636,7 @@ class App:
         beta = int(self.link.last.get("beta", -1))
         t = Tuner(c, lead, smooth, beta)
         view = FineTune(self, t)
-        self.link.sink = lambda q, gt: view.recent.append(np.asarray(q, float))
+        self.link.sink = lambda q, gt: view.feed_quad(q)
         self.link.trig_sink = view.shoot
         self.view = view
 
@@ -1641,9 +1690,11 @@ class App:
 
     def on_trigger(self):
         if self.session and self.session.state != self.session.S_DONE:
-            self.session.trigger(self.link.gun_t or time.time())
+            self.session.note_trigger()   # or auto-capture decides we have none
+            self.session.trigger(self.link.gun_t or time.time(), pulled=True)
 
     def finish_calib(self):
+        self.fx_restore()
         s = self.session
         c, why = s.fit()
         saved = None
@@ -1855,7 +1906,14 @@ class App:
                     self.view.save_now()
         self.link.pump()
         while self.link.replies:
-            self.log(self.link.replies.pop(0))
+            r = self.link.replies.pop(0)
+            self.log(r)
+            # The lines a user was TOLD to watch for must actually appear:
+            # pical has no visible log outside the auto-tune overlay.
+            if ("diag VERDICT" in r or "diag stream" in r
+                    or r.startswith("FX: saved")
+                    or r.startswith("FX: SAVE FAILED")):
+                self.toast_now(r.strip()[:110])
         if self.session is not None and self.session.state == self.session.S_DONE:
             self.finish_calib()
         self.view.handle(acts, mouse)
@@ -1960,6 +2018,7 @@ def run(stances=3, windowed=False, port=None):
             app.t_open = time.time()
             app.link.send("~ping")
             app.link.send("~cam?")
+            app.link.send("~fx?")
     clock = pygame.time.Clock()
     while app.running:
         events = pygame.event.get()

@@ -155,6 +155,11 @@ int fx_fire(uint64_t now_us)
     // shot simply restarts the rumble window along with everything else.
     if (s_armed && now_us < s_sol_end) return 0;   // solenoid still playing
     if (now_us < s_free_at) return 0;              // inside the quiet spacing
+    // The re-latch time is physics, not spacing: with space tuned below it,
+    // a strike this soon lands on an armature still in flight and is weak or
+    // silent. The floor applies no matter how small space is set.
+    if (s_armed && now_us < s_sol_end + (uint64_t)FX_RELATCH_MS * 1000u)
+        return 0;
     arm_at(now_us);
     return 1;
 }
@@ -166,11 +171,12 @@ int fx_fire(uint64_t now_us)
 int fx_fire_preempt(uint64_t now_us)
 {
     if (!s_p.enabled) return 0;
-    if (!(s_armed && now_us < s_sol_end) && now_us >= s_free_at) {
+    const uint64_t relatch = (uint64_t)FX_RELATCH_MS * 1000u;
+    if (!(s_armed && now_us < s_sol_end) && now_us >= s_free_at
+        && (!s_armed || now_us >= s_sol_end + relatch)) {
         arm_at(now_us);                            // engine idle: normal shot
         return 1;
     }
-    const uint64_t relatch = (uint64_t)FX_RELATCH_MS * 1000u;
     uint64_t start = now_us;
     if (s_armed && now_us < s_sol0) {
         // strike not begun (rumble-lead window): just rebuild from now
@@ -229,8 +235,10 @@ void fx_step(uint64_t now_us, int* sol, int* rumble)
 // change can never leave the timeline re-raising a pin the caller just lowered.
 void fx_cancel(void)
 {
+    // The timeline dies but the quiet spacing it had earned does not: a pull
+    // right after a cancel used to fire with no spacing and no re-latch,
+    // onto an armature that may have been energised a moment before.
     s_armed = 0;
-    s_free_at = 0;
 }
 
 int fx_busy(uint64_t now_us)

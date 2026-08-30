@@ -91,12 +91,22 @@ class Link:
         self.trig_sink = None     # called on a trigger marker
 
     def connect(self, port=None):
-        self.port = port or find_gun()
-        if not self.port:
-            return False
-        self.src = SerialSource(self.port)
-        self.src.start()
-        return True
+        """False on failure, never an exception: opening a stale COM name
+        raises inside SerialSource, and that exception used to die in Tk's
+        callback with the header stuck on "looking for the gun...". A gun
+        that re-enumerated on a NEW port is found by falling back to a scan."""
+        for cand in (port or find_gun(), None if port is None else find_gun()):
+            if not cand:
+                continue
+            try:
+                self.src = SerialSource(cand)
+            except Exception:
+                self.src = None
+                continue
+            self.port = cand
+            self.src.start()
+            return True
+        return False
 
     def close(self):
         if self.src:
@@ -199,14 +209,19 @@ class Link:
             self.hist.append((gt, q))
             if self.sink:
                 self.sink(q, gt)
-        cut = self.hist[-1][0] - 2.0 if self.hist else 0
-        self.hist = [h for h in self.hist if h[0] >= cut][-400:]
+        # Local snapshot: the auto-tune worker rebinds hist from its own
+        # thread, and a read-then-index on the live attribute lost the race --
+        # the IndexError killed the tick loop and froze the whole live panel.
+        h = self.hist
+        cut = h[-1][0] - 2.0 if h else 0
+        self.hist = [x for x in h if x[0] >= cut][-400:]
 
     # ---- measurements ----------------------------------------------------
     def sigma(self):
         """blob noise with hand tremor removed; None until enough frames"""
-        if len(self.hist) < 40: return None
-        a = np.array([h[1] for h in self.hist[-120:]])
+        h = self.hist                  # snapshot: another thread may rebind it
+        if len(h) < 40: return None
+        a = np.array([x[1] for x in h[-120:]])
         # only use a stretch where the hand was reasonably still, or tremor
         # dominates and the number means nothing
         cen = a.mean(1)
@@ -856,34 +871,10 @@ def main():
     # the labels below show that echo, not the button press.
     tab_fx = tk.Frame(nb, bg=C_BG)
     nb.add(tab_fx, text="  Recoil  ")
-    FX_KNOBS = (
-        ("drive",  "Strike (ms)",        5, 5,   50,
-         "full-power hit; 45 with hold 0 is the stock waveform"),
-        ("hold",   "Hold (ms)",          10, 0,  500,
-         "PWM after the strike; separates strike from spring return"),
-        ("duty",   "Hold power (%)",     5, 25,  70,
-         "too low buzzes as the armature bounces; raise until it stops"),
-        ("pulse",  "After-pulses",       1, 0,   3,
-         "extra clacks after release"),
-        ("gap",    "Pulse gap (ms)",     5, 15,  120,
-         "short = one meatier hit, long = a distinct double-clack"),
-        ("jit",    "Jitter (%)",         3, 0,   15,
-         "random stretch on hold and gaps; the strike is never jittered"),
-        ("rumoff", "Rumble offset (ms)", 5, -20, 50,
-         "negative = motor leads the strike (it takes ~30 ms to spin up)"),
-        ("rumms",  "Rumble time (ms)",   10, 0,  200,
-         "0 = engine leaves the rumble to OpenFIRE"),
-        ("space",  "Re-fire space (ms)", 10, 0,  500,
-         "quiet time between sequences; sets autofire cadence"),
-    )
-    fx_lbls = {}
-
-    def fx_nudge(key, d, step, lo, hi):
-        v = int(link.last.get("fx" + key, 0)) + d * step
-        v = max(lo, min(hi, v))
-        link.send("~fx=%s:%d" % (key, v))     # the FX: echo updates the label
-
     def fx_dryfire():
+        if not link.src:
+            log("not connected -- press Reconnect first")
+            return
         # armed/disarmed comes from the gun's own echo -- a local toggle went
         # out of step the moment the 10-minute expiry fired on its own
         if int(link.last.get("fxleft", 0) or 0) > 0:
@@ -940,8 +931,17 @@ def main():
     fx_lbls = {}
 
     def fx_nudge(key, d, step, lo, hi):
-        v = int(link.last.get("fx" + key, 0)) + d * step
-        v = max(lo, min(hi, v))
+        # A nudge is an absolute set computed from the last echo. Before any
+        # echo exists, computing from a fake 0 stomped the gun's saved value
+        # (one click turned a stored drive 45 into 5) -- so the first click
+        # reads instead of writing.
+        cur = link.last.get("fx" + key)
+        if cur is None:
+            link.send("~fx?")
+            log("recoil: reading the gun's current values first -- "
+                "nudge again once they show")
+            return
+        v = max(lo, min(hi, int(cur) + d * step))
         link.send("~fx=%s:%d" % (key, v))     # the FX: echo updates the label
 
     # two columns: the single column was taller than the fixed window
@@ -966,9 +966,85 @@ def main():
 
     step_rows[7][0].config(command=lambda: nb.select(tab_fx))
 
+    # ---- USB doctor tab: which of the four USB wires is bad ---------------
+    import usb_doctor as UD
+    tab_usb = tk.Frame(nb, bg=C_BG)
+    nb.add(tab_usb, text="  USB  ")
+    for line in UD.WIRE_TABLE:
+        lab(tab_usb, line, (F[0], 8), C_DIM, anchor="w").pack(fill="x")
+    usb_state = {"watch": None, "until": 0.0, "soak": None}
+    usb_lbl = lab(tab_usb, "idle", F, C_DIM, anchor="w")
+
+    def usb_watch():
+        # 60 seconds of event logging; the user wiggles one harness section
+        # at a time and reads back WHICH SECOND each drop happened
+        usb_state["watch"] = UD.Watcher()
+        usb_state["until"] = time.time() + 60.0
+        log("USB watch: 60 s. Wiggle ONE section of the cable at a time -- "
+            "the log timestamps every drop. Start at the connector you "
+            "resoldered.")
+
+    def usb_soak():
+        if not link.src:
+            log("USB soak: not connected -- Reconnect first")
+            return
+        usb_state["soak"] = [(time.time(), link.frames)]
+        log("USB soak: 15 s of stream under load -- stalls without drops "
+            "are the marginal-joint signature.")
+
+    def usb_tick():
+        w = usb_state["watch"]
+        if w is not None:
+            left = usb_state["until"] - time.time()
+            if left <= 0:
+                for line in w.summary():
+                    log("USB " + line)
+                usb_state["watch"] = None
+                usb_lbl.config(text="watch done -- verdicts in the log")
+            else:
+                for t, kind, text in w.poll():
+                    log("USB %5.1fs  %s" % (t, text))
+                usb_lbl.config(text="watching... %ds left, %d drop(s), "
+                               "%d enum failure(s)"
+                               % (left, w.drops, w.descriptor_fails))
+        sk = usb_state["soak"]
+        if sk is not None:
+            sk.append((time.time(), link.frames))
+            if sk[-1][0] - sk[0][0] >= 15.0:
+                for line in UD.soak_report(sk):
+                    log("USB " + line)
+                usb_state["soak"] = None
+        root.after(500, usb_tick)
+    root.after(1500, usb_tick)
+
+    rowu = tk.Frame(tab_usb, bg=C_BG); rowu.pack(fill="x", pady=6)
+    tk.Button(rowu, text="Watch 60 s (wiggle the cable)", font=FB, bg="#1f6feb",
+              fg="white", relief="flat", padx=12, pady=6,
+              command=usb_watch).pack(side="left")
+    tk.Button(rowu, text="Stream soak 15 s", font=FB, bg="#1f6feb", fg="white",
+              relief="flat", padx=12, pady=6,
+              command=usb_soak).pack(side="left", padx=8)
+    usb_lbl.pack(fill="x", pady=(2, 0))
+    lab(tab_usb, "The watch also catches 'device not recognized' states that "
+        "never get a COM port\n(Windows problem codes). For a gun that is "
+        "completely dead to the PC, start the watch,\nTHEN plug the gun in.",
+        (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(4, 0))
+
+    fx_poll = {"t": 0.0, "left_seen": 0}
+
     def fx_tick():
         on = link.last.get("fxon")
         left = link.last.get("fxleft", 0)
+        # While dry-fire is armed the countdown is re-read from the gun every
+        # few seconds; a snapshot froze at "9:59 left" forever, and after the
+        # gun's own expiry the pointer stayed frozen with no one to blame.
+        if left and link.src and time.time() - fx_poll["t"] > 3.0:
+            fx_poll["t"] = time.time()
+            link.send("~fx?")
+        if fx_poll["left_seen"] and not left:
+            link.pointer(True)
+            log("dry-fire expired on the gun -- pointer released")
+        fx_poll["left_seen"] = left
         if on is None:
             fx_on_lbl.config(text="state: press Read")
         else:
@@ -1069,11 +1145,13 @@ def main():
             log("connected on %s" % link.port)
             link.send("~ping")
             link.send("~cam?")
+            link.send("~fx?")
             link.send("~aimcal?")
             link.pointer(link.hid_on)      # the gun boots ON; we own this per session
             refresh_hid()
             refresh_hid()
         else:
+            st_conn.config(text="no gun found -- replug and Reconnect", fg=C_BAD)
             st_hid.config(text="", fg=C_DIM)
             st_conn.config(text="no gun found", fg=C_BAD)
             log("No gun found. Close the OpenFIRE app if it is open, then Reconnect.")
@@ -1120,7 +1198,20 @@ def main():
             x = 4 + (c[0]/FRAME_W)*(W-8); y = 4 + (c[1]/FRAME_H)*(H-8)
             cv.create_oval(x-1, y-1, x+1, y+1, outline="", fill="#1f6feb")
 
+    link_state = {"dead": False}
+
     def tick():
+        # The reader thread dies silently on an unplug; without this check the
+        # header said "connected" forever while every send went to a corpse --
+        # and a USB soak then blamed the camera for the silence.
+        alive = (getattr(link.src, "is_alive", lambda: True)()
+                 if link.src else True)
+        if link.src and not alive and not link_state["dead"]:
+            link_state["dead"] = True
+            st_conn.config(text="link LOST -- replug and Reconnect", fg=C_BAD)
+            log("serial link lost (unplugged?) -- press Reconnect")
+        elif link.src and alive:
+            link_state["dead"] = False
         link.pump()
         while link.replies:
             log(link.replies.pop(0))

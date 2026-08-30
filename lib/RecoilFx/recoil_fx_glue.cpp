@@ -66,7 +66,10 @@ int fx_glue_trigger(int first_press, int autofire_on, int temp_state)
 int fx_glue_fire(int temp_state)
 {
     if (!fx_glue_on()) return 0;
-    if (temp_state >= 2) { fx_cancel(); return 0; }   // fatal: nothing fires
+    // Fatal temperature refuses NEW fires but does not cancel a playing
+    // shot: the edge fired by policy, and autofire cancelling it mid-play
+    // contradicted that. The whole engine is silenced by FFBShutdown paths.
+    if (temp_state >= 2) return 0;
     if (temp_state == 1 && millis() - s_last_fire_ms < 500)
         return 0;                                     // warning: forced cooldown
     if (fx_fire(now_us())) {
