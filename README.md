@@ -563,7 +563,10 @@ All are prefixed `~` on the native USB port.
 | `~cam=beta:24` | Smoothing speed sensitivity, 0–60; −1 = default (15) |
 | `~cam=ext:1` | Extended sensor report: adds each blob's size, 0–15 (wiicam only). Off by default, not saved — a power cycle clears it |
 | `~cam=bmin:2,bmax:9` | Blob size window. Blobs outside it are dropped before the quad resolver, so a bright window is refused instead of taking an LED's slot. Needs `ext:1`; 0–15 accepts everything |
-| `~camblob?` | Each blob the sensor last reported — position, size, and whether the size window kept it — plus the share of recent frames that saw four, three or two LEDs |
+| `~cam=rtol:3` | Odd-one-out gate, in blob-size steps (0–15). Drops a blob whose size is more than this far from the other three in the same frame. Needs no distance tuning; 0 = off |
+| `~cam=hwmax:150` | The sensor's OWN maximum blob size, register 0x06. Gates inside the camera, before it allocates its four object slots. −1 leaves the register alone |
+| `~cam=hwmin:3` | The sensor's own minimum blob size, register 0x1B — never written by the stock driver, so it otherwise sits at an unknown default. −1 leaves it alone |
+| `~camblob?` | Each blob the sensor last reported — position, size, and whether a gate kept it — the share of recent frames that saw four, three or two LEDs, and the gun's frame counter and clock, from which the camera's true frame rate is measured |
 | `~camdiag` | Sensor connection test: power, both data wires, swapped lines, the sensor itself, and whether frames actually flow |
 | `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens and temporal mode. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
 | `~fx?` | Recoil engine state: every knob, dry-fire and quiet countdowns, and the trigger path's last temperature reading |

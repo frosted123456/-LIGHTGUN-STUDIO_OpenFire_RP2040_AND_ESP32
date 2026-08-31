@@ -1,7 +1,7 @@
 // lead_test.cpp -- the latency lead must actually move the quad, by a known
 // amount. Drives the REAL quad_resolver with a synthetic pan and applies the
 // same arithmetic ov2640_capture uses at publish, reported in screen px.
-#include "../lib/OV2640Capture/quad_resolver.h"
+#include "../lib/QuadResolver/quad_resolver.h"
 #include <math.h>
 #include <stdio.h>
 

@@ -29,7 +29,33 @@
  }
  
  void FW_Common::SetMode(const FW_Const::GunMode_e &newMode)
-@@ -648,8 +663,58 @@ void FW_Common::ExecCalMode(const bool &
+@@ -358,6 +373,14 @@ void FW_Common::ExecCalMode(const bool &
+ 
+         if(irPosUpdateTick) {
+             irPosUpdateTick = 0;
++#ifdef USE_AIM_PIPELINE
++            // This loop polls the camera too, so it has to honour a bus hold
++            // exactly as the run loop does -- a configuration write landing
++            // during a calibration would otherwise have two masters on the
++            // wire, and the writer would never know.
++            if(wiicam_aim_cam_held()) wiicam_aim_cam_ack();
++            else
++#endif
+             GetPosition();
+         }
+ 
+@@ -562,6 +585,10 @@ void FW_Common::ExecCalMode(const bool &
+ 
+                         if(irPosUpdateTick) {
+                             irPosUpdateTick = 0;
++#ifdef USE_AIM_PIPELINE
++                            if(wiicam_aim_cam_held()) wiicam_aim_cam_ack();
++                            else
++#endif
+                             GetPosition();
+                         }
+ 
+@@ -648,8 +675,58 @@ void FW_Common::ExecCalMode(const bool &
  void FW_Common::GetPosition()
  {
      if(dfrIRPos != nullptr) {
@@ -88,7 +114,7 @@
              // if diamond layout, or square
              if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) {
                  OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
-@@ -699,6 +764,9 @@ void FW_Common::GetPosition()
+@@ -699,6 +776,9 @@ void FW_Common::GetPosition()
                  default:
                      break;
                  }
@@ -98,7 +124,7 @@
  
              // Constrain that bisch so negatives don't cause underflow
              int32_t conMoveX = constrain(mouseX, 0, res_x);
-@@ -753,9 +821,18 @@ void FW_Common::GetPosition()
+@@ -753,9 +833,18 @@ void FW_Common::GetPosition()
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  
@@ -120,3 +146,17 @@
  
              } else {
                  if(gunMode == FW_Const::GunMode_Verification) {
+@@ -970,6 +1059,13 @@ void FW_Common::SetIrSensitivity(const i
+     }
+ 
+     if(dfrIRPos != nullptr) dfrIRPos->sensitivityLevel((DFRobotIRPositionEx::Sensitivity_e)sensitivity);
++#ifdef USE_AIM_PIPELINE
++    // sensitivityLevel() rewrites register 0x06 from the preset table, wiping
++    // any MAXSIZE the overlay had written. Marked HERE rather than at the
++    // callers, because there are several and they are easy to miss: the '~cam'
++    // command, the pause menu's sensitivity keys, and a profile switch.
++    wiicam_aim_hw_dirty();
++#endif
+     //if(!(stateFlags & FW_Const::StateFlag_PrintSelectedProfile))
+         //PrintIrSensitivity();
+ }

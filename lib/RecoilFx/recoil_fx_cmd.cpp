@@ -49,17 +49,23 @@ static void report(void)
 }
 
 // Parses one signed integer, advancing the cursor.
-static int parse_int(const char** s)
+// Reports through *got whether a digit was actually present. Without it a
+// truncated line read as ZERO: "~fx=on:" switched the engine OFF and
+// "~fx=drive:" cut the strike to its minimum, so a garbled byte on the wire
+// looked exactly like a broken solenoid.
+static int parse_int(const char** s, int* got)
 {
-    int sgn = 1, v = 0;
+    int sgn = 1, v = 0, n = 0;
     if (**s == '-') { sgn = -1; ++(*s); }
     // Digits past the cap are consumed but not accumulated: signed overflow is
     // undefined behaviour, and a long digit string on a serial line is a typo
     // or a garbled byte. Every key clamps to its own range afterwards.
     while (**s >= '0' && **s <= '9') {
         const int d = *(*s)++ - '0';
+        ++n;
         if (v < 100000000) v = v * 10 + d;
     }
+    if (got) *got = (n > 0);
     return v * sgn;
 }
 
@@ -90,8 +96,12 @@ int fx_command(const char* line, uint64_t now_us)
         while (*s && *s != ':' && *s != ',' && ki < 7) key[ki++] = *s++;
         if (*s != ':') { while (*s && *s != ',') ++s; if (*s) ++s; continue; }
         ++s;
-        const int v = parse_int(&s);
+        int have = 0;
+        const int v = parse_int(&s, &have);
         if (*s == ',') ++s;
+        // No number after the colon is a truncated or garbled line, not a
+        // request to set zero -- and zero in half these keys reads as "off".
+        if (!have) continue;
         if      (!strcmp(key, "on"))     { p.enabled = v;    changed = 1; }
         else if (!strcmp(key, "drive"))  { p.drive_ms = v;   changed = 1; }
         else if (!strcmp(key, "hold"))   { p.hold_ms = v;    changed = 1; }

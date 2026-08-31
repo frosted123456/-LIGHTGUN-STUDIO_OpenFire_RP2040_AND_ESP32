@@ -52,6 +52,35 @@ int  wiicam_aim_ext(void);            // convenience: bit 0 of the state
 int  wiicam_aim_ext_epoch(void);      // convenience: the epoch half
 void wiicam_aim_format_dirty(void);   // camera was rebuilt: re-apply the format
 
+// The sensor's own blob-size thresholds, registers 0x06 (MAXSIZE) and 0x1B
+// (MINSIZE). They gate inside the sensor, BEFORE it allocates its four object
+// slots, which makes them the only settings that can stop a stray light source
+// from costing us a corner instead of merely being noticed after it has.
+//
+// The write costs tens of milliseconds of settling, so it does not belong in
+// the camera poll: the hook is called from wiicam_aim_hw_tick() on whichever
+// core runs the serial pump. Both default to "leave the register alone".
+// The hook must return non-zero ONLY when the byte really reached the sensor.
+// A hook that cannot write yet (no camera, bus not free) returns 0 and the
+// request stays pending -- otherwise it is consumed and lost while cam? goes on
+// reporting a value the sensor does not hold.
+void wiicam_set_blobreg_hook(int (*fn)(int reg, int val));
+void wiicam_aim_hw_tick(void);        // cheap; writes only when something changed
+// Mark the thresholds for rewriting without disturbing the data format. The
+// firmware calls this after anything that rewrites register 0x06 behind our
+// back -- a sensitivity change from the pause menu, or a profile switch.
+void wiicam_aim_hw_dirty(void);
+
+// Camera bus ownership. Every loop that polls the sensor must skip its poll
+// while wiicam_aim_cam_held() is true and call wiicam_aim_cam_ack() instead --
+// including OpenFIRE's own calibration and verification loops, not just the
+// main run loop. The acknowledgement is what makes a configuration write safe:
+// without it the writer is guessing at a drain time it cannot know.
+void wiicam_aim_cam_hold(int on);
+int  wiicam_aim_cam_held(void);
+void wiicam_aim_cam_ack(void);
+int  wiicam_aim_cam_acked(void);
+
 // The '~cam...' command subset for this board: cam? / camsave / camreset /
 // cam=res:..,dash:..,dashhz:..,lead:..,lens:..,lk1u:..,lk2u:..,lfpx:..,
 // lfeq:..,sens:..  Returns true if the line was handled.

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <math.h>
 #include <vector>
+#include <utility>
 #include <string>
 #include "wiicam_aim.h"
 #include "aim_runtime.h"
@@ -51,6 +52,9 @@ int64_t esp_timer_get_time(void){ return 0; }
 }
 
 static std::vector<std::string> g_lines, g_replies;
+// register writes the firmware hook would have made
+static std::vector<std::pair<int,int> > g_reg;
+static bool g_reg_fail = false;   // make the hook refuse, as a dead camera does
 static void line_sink(const char* s){ g_lines.push_back(s); }
 static void reply_sink(const char* s){ g_replies.push_back(s); }
 
@@ -255,8 +259,10 @@ int main()
            && g_replies[1].find(",14,0") != std::string::npos,
            "and shows the offending blob with its size and REJECTED flag");
 
-        // The safety valve: a gate set so tight that nothing survives passes
-        // the frame through untouched. A blinded gun is worse than an impostor.
+        // The floor. Below TWO points the resolver cannot fit anything and
+        // GetPosition falls through to the stock, uncalibrated path -- the
+        // cursor jumps. So a window that would reject everything gives the
+        // least-offending blobs back instead of blinding the gun.
         wiicam_cam_command("cam=bmin:12,bmax:13");
         g_lines.clear();
         t += DT;
@@ -264,8 +270,24 @@ int main()
         wiicam_aim_process_sz(px, py, sz, 0xF, t, &sx, &sy);
         n = -1;
         if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n);
-        ck(n == 4, "a gate that would reject EVERY blob is ignored for that "
-                   "frame -- it can never blind the gun");
+        ck(n == 2, "a window that would reject EVERY blob is held to a floor "
+                   "of two, never zero");
+        g_replies.clear();
+        wiicam_cam_command("camblob?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("bvalve=") != std::string::npos
+           && g_replies[0].find("bvalve=0 ") == std::string::npos,
+           "and it SAYS the floor had to intervene -- a window this wrong used "
+           "to report brej=0 and look idle");
+        {
+            unsigned long rej = 0;
+            const char* a = strstr(g_replies[0].c_str(), "brej=");
+            if (a) sscanf(a, "brej=%lu", &rej);
+            ck(rej > 0,
+               "and counts what the window WANTED to reject, not what survived "
+               "the floor -- the old order reported zero in exactly the case "
+               "the number exists to reveal");
+        }
 
         // Clamping and the ordering guard.
         wiicam_cam_command("cam=bmin:0,bmax:99");
@@ -367,6 +389,216 @@ int main()
         }
         ck(r3 >= 19, "and so are the frames that only got three -- the number "
                      "that says how much the light is costing");
+    }
+
+    // ---- the sensor's OWN thresholds (registers 0x06 / 0x1B) --------------
+    // These gate inside the sensor, before it hands out its four slots, so
+    // they are the only settings that can stop a stray source from COSTING us
+    // a corner. Writing them takes settling time, so the write is a hook the
+    // firmware calls from its serial-pump core, never from the camera poll.
+    {
+        wiicam_aim_begin();
+        wiicam_set_blobreg_hook([](int reg, int val) -> int {
+            if (g_reg_fail) return 0;          // a hook that cannot write yet
+            g_reg.push_back(std::make_pair(reg, val));
+            return 1;
+        });
+        // An earlier block left a camreset pending; drain it so this one starts
+        // from "leave both registers alone".
+        wiicam_cam_command("cam=hwmax:-1,hwmin:-1");
+        wiicam_aim_hw_tick();
+        g_reg.clear();
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("hwmax=-1") != std::string::npos
+           && g_replies[0].find("hwmin=-1") != std::string::npos,
+           "both sensor thresholds ship as 'leave the register alone'");
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.empty(),
+           "so a tick writes NOTHING -- the sensor is configured exactly as "
+           "the build before this one");
+
+        wiicam_cam_command("cam=hwmax:150");
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.size() == 1 && g_reg[0].first == 0x06 && g_reg[0].second == 150,
+           "hwmax reaches register 0x06, MAXSIZE");
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.empty(), "and is not rewritten every loop");
+
+        wiicam_cam_command("cam=hwmin:3");
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.size() == 2 && g_reg[1].first == 0x1B && g_reg[1].second == 3,
+           "hwmin reaches register 0x1B, MINSIZE -- which the stock driver "
+           "has never written on any gun");
+
+        // A camera rebuild re-runs the sensitivity preset, which rewrites
+        // 0x06. Ours has to go back or it is silently lost.
+        wiicam_aim_format_dirty();
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.size() == 2,
+           "a camera rebuild re-applies both: begin() rewrites 0x06 from the "
+           "preset and would otherwise undo ours without a word");
+
+        wiicam_cam_command("cam=hwmax:999,hwmin:-5");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("hwmax=255") != std::string::npos
+           && g_replies[0].find("hwmin=-1") != std::string::npos,
+           "values clamp to a byte, and any negative means leave it alone");
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.size() == 1 && g_reg[0].first == 0x06,
+           "so a 'leave alone' register really is not written");
+
+        // camreset has to put the REGISTERS back, not merely stop tracking
+        // them. Marking them "leave alone" left our value in the sensor, so
+        // the one command a user reaches for when the gun has gone dark could
+        // not undo the one setting able to make it go dark.
+        wiicam_cam_command("cam=hwmax:40,hwmin:5");
+        g_reg.clear(); wiicam_aim_hw_tick(); g_reg.clear();
+        t_sens = 2;
+        const int saves_before = t_sens;
+        wiicam_cam_command("camreset");
+        wiicam_aim_hw_tick();
+        bool restored_min = false;
+        for (size_t i = 0; i < g_reg.size(); ++i)
+            if (g_reg[i].first == 0x1B && g_reg[i].second == 0) restored_min = true;
+        ck(restored_min,
+           "camreset writes MINSIZE back to 0 -- the direction that cannot "
+           "cost an LED");
+        ck(t_sens == saves_before,
+           "and restores MAXSIZE by re-applying the sensitivity preset, which "
+           "is the only value known to be sane for this sensor");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("hwmax=-1") != std::string::npos,
+           "...after which it reports itself as leaving the register alone");
+
+        // A refused write must keep the request pending, not consume it.
+        g_reg_fail = true;
+        wiicam_cam_command("cam=hwmax:44");
+        wiicam_aim_hw_tick();
+        g_reg_fail = false;
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.size() == 1 && g_reg[0].second == 44,
+           "a write refused because the camera was down is retried later, not "
+           "forgotten while cam? claims it landed");
+
+        // Zero in MAXSIZE is a dark gun, and it is where a typo lands.
+        g_replies.clear();
+        wiicam_cam_command("cam=hwmax:0");
+        ck(!g_replies.empty()
+           && g_replies[0].find("refused") != std::string::npos,
+           "hwmax:0 is refused by name -- it tells the sensor to reject every "
+           "blob");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty() && g_replies[0].find("hwmax=0") == std::string::npos,
+           "and it does not take");
+
+        // A key with no digits after the colon is a garbled line, not a zero.
+        wiicam_cam_command("cam=hwmax:120");
+        g_reg.clear(); wiicam_aim_hw_tick();
+        wiicam_cam_command("cam=hwmax:");
+        wiicam_cam_command("cam=hwmax:0x40");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty() && g_replies[0].find("hwmax=120") != std::string::npos,
+           "a value-less or hex-looking value leaves the setting alone rather "
+           "than reading as zero and blinding the sensor");
+        wiicam_cam_command("camreset");
+        wiicam_aim_hw_tick();
+        wiicam_set_blobreg_hook(0);
+    }
+
+    // ---- the relative gate ------------------------------------------------
+    // Four identical emitters driven identically should LOOK alike in one
+    // frame. Judging by resemblance instead of by an absolute size is what
+    // makes this immune to the thing that defeats fixed windows here: the play
+    // distance varies about 2x, which is a 4x swing in brightness and so in
+    // blob size. A fixed window must straddle all of it; this one need not.
+    {
+        wiicam_aim_begin();
+        wiicam_cam_command("cam=res:0,dash:2,dashhz:0,mirx:1");
+        rig(px, py, 512, 384, 512, 288);
+
+        auto seen_n = [&](int sz[4]) {
+            g_lines.clear();
+            t += DT;
+            px[0] += 1;                       // defeat the duplicate cache
+            wiicam_aim_process_sz(px, py, sz, 0xF, t, &sx, &sy);
+            int nn = -1; unsigned long mm;
+            if (!g_lines.empty())
+                sscanf(g_lines[0].c_str(), "Q,%lu,%d", &mm, &nn);
+            return nn;
+        };
+
+        // The counters are cumulative since boot by design -- the tools show
+        // deltas -- so the test reads them the same way.
+        auto counters = [&](unsigned long* abs_rej, unsigned long* rel_rej) {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            *abs_rej = *rel_rej = 0;
+            if (g_replies.empty()) return;
+            const char* a = strstr(g_replies[0].c_str(), "brej=");
+            const char* r = strstr(g_replies[0].c_str(), "brrej=");
+            if (a) sscanf(a, "brej=%lu", abs_rej);
+            if (r) sscanf(r, "brrej=%lu", rel_rej);
+        };
+
+        int one_odd[4] = {3, 3, 3, 14};
+        ck(seen_n(one_odd) == 4, "the relative gate ships OFF: nothing dropped");
+
+        unsigned long a0, r0, a1, r1;
+        counters(&a0, &r0);
+        wiicam_cam_command("cam=rtol:3");   // steps, not percent
+        ck(seen_n(one_odd) == 3,
+           "with it on, the blob that does not match the other three is gone");
+        counters(&a1, &r1);
+        ck(r1 == r0 + 1 && a1 == a0,
+           "and it is counted SEPARATELY from the absolute window, so the "
+           "numbers say which gate did the work");
+
+        // The floor. Three impostors outvote one real LED -- a consensus method
+        // cannot do better, and the honest thing is to bound the damage rather
+        // than pretend otherwise.
+        int outvoted[4] = {3, 14, 14, 14};
+        ck(seen_n(outvoted) == 3,
+           "outvoted three to one it drops the odd blob out -- but never more "
+           "than one, so three points always survive for the resolver");
+
+        int spread[4] = {1, 5, 9, 15};
+        ck(seen_n(spread) == 3,
+           "even with no consensus at all the floor holds at three");
+
+        int no_sizes[4] = {-1, -1, -1, -1};
+        ck(seen_n(no_sizes) == 4,
+           "and in basic format, with no sizes to compare, it cannot act");
+
+        // Too few blobs to form a consensus at all.
+        g_lines.clear();
+        t += DT; px[0] += 1;
+        wiicam_aim_process_sz(px, py, one_odd, 0x7, t, &sx, &sy);
+        int n3 = -1;
+        if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n3);
+        ck(n3 == 3, "with only three blobs seen it leaves them all alone");
+
+        // It must not build its consensus out of blobs the absolute window
+        // already refused -- that would be a consensus about the contamination.
+        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty() && g_replies[0].find("rtol=0") != std::string::npos,
+           "rtol reports back, and 0 turns it off again");
     }
 
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

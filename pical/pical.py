@@ -38,14 +38,15 @@ from aim_finetune import (BETA_MAX, LEAD_MAX, LEAD_STEP, SHOT_FRAMES,
                           SMOOTH_MAX, TARGET, Tuner)
 from aim_verify import GRID_3x3
 import gun_studio
-from gun_studio import (CAM_KEYS, CAM_RANGE, LENS_KEYS, Link, QUIET_REARM_S,
-                        auto_tune, quiet_plan, sigma_gates)
+from gun_studio import (BlobLog, CAM_KEYS, CAM_RANGE, FrameRate, LENS_KEYS,
+                        Link, QUIET_REARM_S, auto_tune, quiet_plan,
+                        sigma_gates)
 
 # The shared serial layer lives in tools/ beside this file, and this file is
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
 # every feature whose parsing lives in tools/ stops working -- silently, in a
 # way that looks exactly like a broken screen. So it is checked, out loud.
-LINK_API_NEEDED = 3
+LINK_API_NEEDED = 4
 LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
@@ -277,7 +278,7 @@ class Row:
     """
 
     def __init__(self, label, kind="button", act=None, get=None, set=None,
-                 lo=0, hi=100, step=1, fmt="%d", hint=""):
+                 lo=0, hi=100, step=1, fmt="%d", hint="", vals=None):
         self.label = label
         self.kind = kind
         self.act = act
@@ -286,6 +287,11 @@ class Row:
         self.lo, self.hi, self.step = lo, hi, step
         self.fmt = fmt
         self.hint = hint
+        # An explicit ladder of values, for settings where a linear step lands
+        # somewhere harmful. The sensor's MAXSIZE is one: stepping by 5 from
+        # -1 reaches 4, a value low enough to blind the camera, and the useful
+        # range starts around 100.
+        self.vals = tuple(vals) if vals else None
         self.rect = None
 
     def value(self):
@@ -306,6 +312,21 @@ class Row:
         if self.kind != "spin" or self.set is None:
             return
         v = self.value()
+        if self.vals:
+            # Move along the ladder from wherever the gun actually is. With no
+            # reading yet, start from the end the user is stepping away from
+            # rather than inventing a value in the middle.
+            if v in self.vals:
+                i = self.vals.index(v)
+            elif v is None:
+                i = 0 if d > 0 else len(self.vals) - 1
+            else:
+                # nearest rung, so an odd value from the gun still steps sanely
+                i = min(range(len(self.vals)),
+                        key=lambda k: abs(self.vals[k] - v))
+            i = max(0, min(len(self.vals) - 1, i + d))
+            self.set(self.vals[i])
+            return
         if v is None:
             v = self.lo
         v = max(self.lo, min(self.hi, v + d * self.step))
@@ -325,7 +346,15 @@ class RowScreen:
         self.rows = []
 
     def handle(self, acts, mouse):
+        # Nothing here may raise: pical runs fullscreen on a Pi with no console,
+        # so an IndexError is a black screen with no explanation. sel is only
+        # wrapped by the up/down arithmetic, and any rebuild that shortens the
+        # list can leave it past the end.
+        if self.rows:
+            self.sel = max(0, min(self.sel, len(self.rows) - 1))
         for a in acts:
+            if not self.rows and a != "back":
+                continue
             if a == "up":
                 self.sel = (self.sel - 1) % max(1, len(self.rows))
             elif a == "down":
@@ -411,10 +440,15 @@ class Camera(RowScreen):
         self.tuning = False
         self.stop = threading.Event()
         self._blob_t = 0.0
+        self._built_wii = None     # which row set is currently built
         self._blob_ref = {}        # counter values at the last readout
+        self._drop_ref = {}        # ...and for the drop counters
+        self._rate = FrameRate()   # the camera's own new-frame rate
+        self._log = None           # CSV on the stick, when logging
         self._blob_last = ""       # keeps the last percentage on screen while
                                    # the next window fills, so it stops flashing
         self.build()
+        self._built_wii = self.wiicam()
 
     def wiicam(self):
         b = self.app.link.last.get("board", "")
@@ -462,6 +496,34 @@ class Camera(RowScreen):
                 lo=0, hi=15, step=1,
                 hint="drops blobs bigger than this -- a window is usually "
                      "much larger than an LED; 15 keeps everything"))
+            self.rows.append(Row(
+                "Odd-one-out (size steps)", "spin",
+                get=lambda: link.last.get("rtol"),
+                set=lambda v: link.send("~cam=rtol:%d" % v),
+                lo=0, hi=15, step=1,
+                hint="drops a blob more than this many size steps from the "
+                     "other three. Needs no distance tuning; 0 is off, 3 is "
+                     "a fair start"))
+            # The sensor's own thresholds. These gate INSIDE the camera, before
+            # it hands out its four slots, so they are the only ones that stop
+            # a stray source from costing a corner rather than being noticed
+            # after it already has.
+            self.rows.append(Row(
+                "Sensor max size (0x06)", "spin",
+                get=lambda: link.last.get("hwmax"),
+                set=lambda v: link.send("~cam=hwmax:%d" % v),
+                vals=(-1, 60, 80, 100, 120, 140, 160, 180, 200, 224, 255),
+                hint="the camera's OWN ceiling; -1 leaves it alone. Nintendo "
+                     "used 100-200. Safe knob: our LEDs can never be large"))
+            self.rows.append(Row(
+                "Sensor min size (0x1B)", "spin",
+                get=lambda: link.last.get("hwmin"),
+                set=lambda v: link.send("~cam=hwmin:%d" % v),
+                vals=(-1, 0, 1, 2, 3, 4, 5, 6, 8, 10),
+                hint="never written by the stock driver, so it sits at an "
+                     "unknown default. Risky knob: our LEDs are already small"))
+            self.rows.append(Row("Log blobs to the stick", act=self.log_toggle,
+                                 hint=self.log_hint))
         else:
             self.subtitle = "aim for a blob noise floor under 0.30 px"
             for k, tip in (("thr", "threshold: raise it if the background shows up"),
@@ -480,6 +542,43 @@ class Camera(RowScreen):
         self.rows.append(Row("Save to gun", act=self.save,
                              hint="keeps these settings across power cycles"))
         self.rows.append(Row("Back", act=self.app.to_menu))
+
+    def log_toggle(self):
+        """Start or stop a CSV of every new camera frame, on the stick.
+
+        The Pi has no console and the light that causes the trouble is only at
+        the TV, so the numbers have to be captured where the gun is and read
+        somewhere else. This lands on the FAT partition beside pical.py, which
+        any PC can open."""
+        if self._log is not None:
+            n, path = self._log.rows, self._log.path
+            self._log.close()
+            self._log = None
+            self.app.toast_now("stopped -- %d frames written to %s"
+                               % (n, os.path.basename(path)))
+            return
+        try:
+            if not os.path.isdir(OUT_DIR):
+                os.makedirs(OUT_DIR)
+            path = os.path.join(OUT_DIR, "blobs-%s.csv"
+                                % time.strftime("%Y%m%d-%H%M%S"))
+            self._log = BlobLog(path)
+        except Exception as e:
+            self.app.toast_now("could not open the log: %s" % e)
+            return
+        self.app.toast_now("logging to %s -- aim at the screen, then swing "
+                           "past the window" % os.path.basename(self._log.path))
+
+    def log_hint(self):
+        if self._log is not None:
+            return ("recording, %d frames so far -- select again to stop and "
+                    "close the file" % self._log.rows)
+        return "writes one row per camera frame to the stick, for reading on a PC"
+
+    def close_log(self):
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
     def diag(self):
         self.app.link.send("~camdiag")
@@ -512,12 +611,47 @@ class Camera(RowScreen):
                 if a == "back":
                     self.stop.set()
             return
+        # The row set is chosen from the board tag, which may not have arrived
+        # when this screen was opened -- and a reconnect clears it again. Left
+        # unwatched, a wiicam gun got the ESP32 sliders and none of the
+        # ambient-light controls, with no way out but leaving and returning.
+        if self.wiicam() != self._built_wii:
+            self.build()
+            self._built_wii = self.wiicam()
+            self.sel = min(self.sel, max(0, len(self.rows) - 1))
         # The blob readout is a live measurement, so it is re-read while this
-        # screen is up rather than sampled once on the way in.
-        if self.wiicam() and time.time() - self._blob_t > 1.0:
-            self._blob_t = time.time()
+        # screen is up rather than sampled once on the way in. Faster while
+        # logging, because then the samples are the deliverable.
+        # monotonic, not wall time: a Pi has no clock until NTP corrects it,
+        # and a backward step left the deadline in the future and stopped both
+        # the readout and the logging until wall time caught up.
+        every = 0.25 if self._log is not None else 1.0
+        now_m = time.monotonic()
+        if self.wiicam() and now_m - self._blob_t > every:
+            self._blob_t = now_m
             self.app.link.send("~camblob?")
+            self._rate.feed(self.app.link.last.get("bframes"),
+                            self.app.link.last.get("bms"))
+            if self._log is not None:
+                try:
+                    self._log.sample(self.app.link.last,
+                                     getattr(self.app.link, "blobs", ""),
+                                     self._rate.hz)
+                except Exception as e:
+                    self.app.toast_now("log write failed: %s" % e)
+                    self.close_log()
         RowScreen.handle(self, acts, mouse)
+
+    def _delta(self, key):
+        """How much a since-boot counter moved since the last readout."""
+        v = self.app.link.last.get(key)
+        if v is None:
+            return 0
+        prev = self._drop_ref.get(key)
+        self._drop_ref[key] = v
+        if prev is None or v < prev:      # first sample, or the gun rebooted
+            return 0
+        return v - prev
 
     def blob_lines(self):
         """What the sensor is handing us right now, in words.
@@ -544,6 +678,10 @@ class Camera(RowScreen):
                                     "" if f[3] == "1" else " DROPPED"))
             if shown:
                 out.append("blobs now: " + "    ".join(shown))
+        # First, always: this one means the window is set so tight it would
+        # blind the gun, and it was previously last and cut off by the slice.
+        if link.last.get("bvalve"):
+            out.append("SIZE WINDOW TOO TIGHT -- widen it or set it to 0..15")
         keys = ("br4", "br3", "br2", "br1", "br0")
         now = [link.last.get(k) for k in keys]
         tot = None
@@ -568,9 +706,24 @@ class Camera(RowScreen):
                 self._blob_last = out[-1]
             elif self._blob_last:
                 out.append(self._blob_last)
-        rej = link.last.get("brej")
-        if rej:
-            out.append("%d blobs dropped by the size window so far" % rej)
+        bits = []
+        if self._rate.hz is not None:
+            bits.append("camera %.0f new frames/s (we poll at 420)"
+                        % self._rate.hz)
+        # Deltas, like the percentages above. Splicing the since-boot totals
+        # into a sentence about "the last N frames" meant a window that had
+        # been fixed still read as dropping thousands of blobs, forever.
+        drej = self._delta("brej")
+        drrej = self._delta("brrej")
+        if drej:
+            bits.append("%d dropped by size" % drej)
+        if drrej:
+            bits.append("%d dropped as odd-one-out" % drrej)
+        if bits:
+            out.append("   ".join(bits))
+        if self._log is not None:
+            out.append("LOGGING: %d frames -> %s"
+                       % (self._log.rows, os.path.basename(self._log.path)))
         return out
 
     def draw(self, sc):
@@ -579,15 +732,24 @@ class Camera(RowScreen):
             sc.lines(sc.w / 2, sc.h * 0.26, self.app.log_lines[-12:], sc.f_s, C_DIM)
             sc.text(sc.w / 2, sc.h * 0.92, "Esc cancels", sc.f_s, C_DIM)
             return
-        RowScreen.draw(self, sc)
-        if self.wiicam():
-            # Under the whole layout, centred like everything else: beside the
-            # preview it ran off the right edge of the screen and over the
-            # camera view, which on a TV is simply gone.
-            sc.lines(sc.w / 2, sc.h * 0.735, self.blob_lines()[:3],
-                     sc.f_xs, C_DIM)
-        else:
+        if not self.wiicam():
+            RowScreen.draw(self, sc)
             self.app.draw_noise(sc, sc.h * 0.74)
+            return
+        # The wiicam list grew to eleven rows, so a readout at a FIXED height
+        # landed on top of the last three of them. It is placed from where the
+        # rows actually end instead, and the rows are given a shorter run.
+        sc.text(sc.w / 2, sc.h * 0.09, self.title, sc.f_l, C_FG)
+        sc.text(sc.w / 2, sc.h * 0.155, self.subtitle, sc.f_s, C_DIM)
+        y = self.draw_rows(sc, sc.h * 0.24, sc.h * 0.66)
+        w = sc.w * 0.30
+        self.app.draw_preview(sc, sc.w * 0.66, sc.h * 0.28,
+                              w, w * FRAME_H / FRAME_W)
+        lines = []
+        for ln in self.blob_lines():
+            lines.extend(wrap(ln, 96))
+        sc.lines(sc.w / 2, y + sc.h * 0.02, lines[:4], sc.f_xs, C_DIM)
+        sc.text(sc.w / 2, sc.h * 0.96, "Esc goes back", sc.f_xs, C_DIM)
 
 
 # ---------------------------------------------------------------------------
@@ -1711,6 +1873,11 @@ class App:
 
     def to_menu(self):
         self.fx_quiet(False)
+        # A screen that was writing a file does not get to keep it open once
+        # nobody is looking at it.
+        closer = getattr(self.view, "close_log", None)
+        if closer:
+            closer()
         self.session = None
         self.link.sink = None
         self.link.trig_sink = None
@@ -2362,6 +2529,9 @@ def run(stances=3, windowed=False, port=None):
         # put it in. A crash mid-calibration used to leave the recoil silenced
         # with no way to tell that was what had happened.
         try:
+            closer = getattr(app.view, "close_log", None)
+            if closer:
+                closer()
             app.fx_quiet(False)
             # Said on stdout, not through a toast: the frame loop has ended,
             # so nothing will ever draw one -- and the launcher keeps this log.

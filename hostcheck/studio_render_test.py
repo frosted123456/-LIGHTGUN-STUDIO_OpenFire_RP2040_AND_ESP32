@@ -179,7 +179,11 @@ def driver():
         wii = min(cands, key=lambda w: w.winfo_reqheight()) if cands else None
         if wii is not None and nb is not None:
             need = wii.winfo_reqheight()
-            have = nb.winfo_height() - 30          # minus the tab strip
+            # The tab PAGE's own allocated height is the content area exactly.
+            # Deriving it from the notebook minus a guessed tab-strip height
+            # was off by a pixel or two and reported false failures.
+            page = nb.nametowidget(nb.tabs()[0])
+            have = page.winfo_height()
             if need > have:
                 errs.append("the wiicam camera panel needs %dpx of a %dpx tab "
                             "area -- its last lines are cut off" % (need, have))

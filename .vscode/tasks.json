@@ -1,0 +1,32 @@
+{
+  // The PlatformIO Upload button only knows platformio.ini (the ESP32 build).
+  // These tasks give the RP2040 build the same one-click feel:
+  //   Terminal -> Run Task -> pick one.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Fetch + patch OpenFIRE (RP2040 wiicam)",
+      "type": "shell",
+      "command": "python tools/patch_openfire.py --board rp2040 --fetch",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build RP2040 (wiicam)",
+      "type": "shell",
+      "command": "pio run -c platformio_rp2040.ini",
+      "problemMatcher": []
+    },
+    {
+      "label": "Upload RP2040 (wiicam)",
+      "type": "shell",
+      "command": "pio run -c platformio_rp2040.ini -t upload",
+      "problemMatcher": []
+    },
+    {
+      "label": "Check setup (both boards)",
+      "type": "shell",
+      "command": "python tools/check_setup.py",
+      "problemMatcher": []
+    }
+  ]
+}

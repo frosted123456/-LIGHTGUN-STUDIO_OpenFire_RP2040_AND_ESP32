@@ -24,7 +24,8 @@ from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
 # checks this number at startup and says so out loud instead.
 #   1  original                       2  FX: state parsing
 #   3  quiet mode, blob gate keys, send failure + liveness reporting
-LINK_API = 3
+#   4  camera frame-rate meter, blob CSV log, sensor threshold keys
+LINK_API = 4
 
 SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
 # Board-scaled noise gates: the wiicam's 33-deg lens has ~2.2x less screen
@@ -89,6 +90,136 @@ def quiet_plan(last):
     if "fxon" not in last:
         return "none"
     return "stuck" if is_legacy_quiet(last) else "legacy"
+
+
+# ---------------------------------------------------------------------------
+# how fast the camera actually produces frames
+# ---------------------------------------------------------------------------
+class FrameRate:
+    """The camera's TRUE new-frame rate, from the gun's own clock.
+
+    Worth having because nobody knows it. Every figure in circulation for this
+    sensor -- "100 Hz" everywhere online, "~300 Hz" in OpenFIRE's own source
+    comment -- is unmeasured, and we poll it at 420 Hz, above both. Polling
+    faster than the camera produces frames buys nothing: the firmware's
+    duplicate-report cache discards repeats, so `bframes` counts only genuinely
+    new reports and its rate IS the camera's rate.
+
+    Timed from the gun's millisecond clock rather than the host's, because a
+    host-side interval measures this app's poll jitter instead of the camera.
+    """
+
+    MIN_MS = 400          # long enough that quantisation is not the answer
+
+    def __init__(self):
+        self.frames = None
+        self.gun_ms = None
+        self.hz = None
+
+    def feed(self, frames, gun_ms):
+        if frames is None or gun_ms is None:
+            return self.hz
+        # A gun that rebooted restarts both counters, so a backwards step is a
+        # new baseline rather than a negative rate.
+        if (self.frames is None or frames < self.frames
+                or gun_ms < self.gun_ms):
+            self.frames, self.gun_ms = frames, gun_ms
+            return self.hz
+        d_f = frames - self.frames
+        d_ms = gun_ms - self.gun_ms
+        if d_ms >= self.MIN_MS:
+            self.frames, self.gun_ms = frames, gun_ms
+            self.hz = 1000.0 * d_f / d_ms
+        return self.hz
+
+
+def parse_blobs(line):
+    """The per-blob list from a '~camblob?' reply -> [(x, y, size, kept), ...].
+
+    Fields are positional and belong together, so they are parsed as a unit
+    rather than scattered into the key/value store."""
+    out = []
+    if not line:
+        return out
+    for tok in line.replace("CAM: blobs", "").split():
+        f = tok.split(",")
+        if len(f) != 4:
+            continue
+        try:
+            out.append(tuple(int(v) for v in f))
+        except ValueError:
+            pass
+    return out
+
+
+class BlobLog:
+    """One CSV row per NEW camera frame, for reading afterwards on a PC.
+
+    The Pi has no console, and the contamination we are chasing only happens at
+    the TV -- so the numbers have to be captured where the gun is and read
+    somewhere else. On the stick this lands on the FAT boot partition, next to
+    pical.py, which any PC can open.
+
+    Rows are written only when the gun's frame counter has MOVED: polling adds
+    samples, not frames, and a file full of repeated frames would overstate
+    every rate computed from it."""
+
+    COLS = ("wall", "gun_ms", "bframes", "hz", "bn",
+            "ext", "bmin", "bmax", "rtol", "hwmax", "hwmin", "sens",
+            "brej", "brrej", "bvalve", "bdrop",
+            "br4", "br3", "br2", "br1", "br0",
+            "x0", "y0", "s0", "k0", "x1", "y1", "s1", "k1",
+            "x2", "y2", "s2", "k2", "x3", "y3", "s3", "k3")
+
+    def __init__(self, path):
+        self.path = path
+        self.rows = 0
+        self._last_frames = None
+        self._f = open(path, "w")
+        try:
+            self._f.write(",".join(self.COLS) + "\n")
+            self._f.flush()
+        except Exception:
+            # A full stick raises here; without this the handle is orphaned,
+            # because __init__ never returns and nothing is left to close it.
+            self._f.close()
+            raise
+
+    def sample(self, last, blobs_line, hz):
+        """Returns True when a row was actually written."""
+        frames = last.get("bframes")
+        if frames is None or frames == self._last_frames:
+            return False
+        self._last_frames = frames
+        vals = [time.strftime("%H:%M:%S"),
+                last.get("bms", ""), frames,
+                ("%.1f" % hz) if hz else ""]
+        vals.append(last.get("bn", ""))
+        for k in ("ext", "bmin", "bmax", "rtol", "hwmax", "hwmin", "sens",
+                  "brej", "brrej", "bvalve", "bdrop",
+                  "br4", "br3", "br2", "br1", "br0"):
+            vals.append(last.get(k, ""))
+        blobs = parse_blobs(blobs_line)
+        for i in range(4):
+            if i < len(blobs):
+                vals.extend(blobs[i])
+            else:
+                vals.extend(("", "", "", ""))
+        self._f.write(",".join(str(v) for v in vals) + "\n")
+        # Flushed every row: a stick pulled out of a running Pi otherwise keeps
+        # an empty file, because the writes are still in the page cache.
+        self._f.flush()
+        self.rows += 1
+        return True
+
+    def close(self):
+        """Returns False if the final flush failed -- a caller that reports
+        "N rows written" should not claim rows that never reached the disk."""
+        try:
+            self._f.close()
+            return True
+        except Exception:
+            return False
 
 
 def port_is_free(port):
@@ -284,7 +415,8 @@ class Link:
                                                  "ext", "bmin", "bmax", "bn",
                                                  "brej", "bframes", "bdrop",
                                                  "br4", "br3", "br2", "br1",
-                                                 "br0"):
+                                                 "br0", "brrej", "bvalve", "bms",
+                                                 "rtol", "hwmax", "hwmin"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -433,7 +565,11 @@ def main():
         _sh = root.winfo_screenheight()
     except Exception:
         _sh = 800
-    root.geometry("1020x%d" % max(800, min(900, _sh - 80)))
+    # The tab panels have grown enough that 800 no longer holds the tallest of
+    # them. Take what the screen offers, up to 980, and keep 800 as the floor
+    # for a 768p laptop -- trimming the panels instead only shrinks the tab
+    # area with them, which is a race that cannot be won.
+    root.geometry("1020x%d" % max(800, min(980, _sh - 60)))
 
     C_BG, C_FG, C_DIM, C_OK, C_WARN, C_BAD = "#0d1117", "#e6edf3", "#7d8590", "#39c26e", "#d8a13a", "#d24b4b"
     F = ("Segoe UI" if os.name == "nt" else "DejaVu Sans", 10)
@@ -511,7 +647,10 @@ def main():
         v.pack(side="left")
         stat_vals[k] = v
 
-    logbox = tk.Text(right, height=8, bg="#010409", fg=C_DIM, font=("Consolas" if os.name=="nt" else "monospace", 9),
+    # height 6, not 8: this box is packed with expand=True, so it absorbs every
+    # spare pixel of window height -- including the ones the tab panels need.
+    # The log scrolls; the controls above it do not.
+    logbox = tk.Text(right, height=6, bg="#010409", fg=C_DIM, font=("Consolas" if os.name=="nt" else "monospace", 9),
                      relief="flat", highlightthickness=1, highlightbackground="#30363d")
     logbox.pack(fill="both", expand=True, pady=(10, 0), side="bottom")
     def log(msg):
@@ -649,11 +788,11 @@ def main():
     frame_wii = tk.Frame(tab_cam, bg=C_BG)   # packed on detect
 
     lab(frame_wii, "wiicam sensitivity (persisted in the OpenFIRE profile):",
-        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(6, 2))
-    roww = tk.Frame(frame_wii, bg=C_BG); roww.pack(fill="x", pady=2)
+        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(2, 1))
+    roww = tk.Frame(frame_wii, bg=C_BG); roww.pack(fill="x", pady=1)
     for sv, nm in ((0, "Default"), (1, "High"), (2, "Max")):
         tk.Button(roww, text=nm, font=F, bg="#161b22", fg=C_FG, relief="flat",
-                  padx=12, pady=6,
+                  padx=12, pady=4,
                   command=lambda v=sv: (link.send("~cam=sens:%d" % v),
                                         log("sensitivity -> %d" % v))
                   ).pack(side="left", padx=(0, 6))
@@ -665,7 +804,7 @@ def main():
     # when the fault turns out to be fixed.
     rowdg = tk.Frame(frame_wii, bg=C_BG); rowdg.pack(fill="x", pady=2)
     tk.Button(rowdg, text="Test sensor connection", font=FB, bg="#1f6feb",
-              fg="white", relief="flat", padx=12, pady=6,
+              fg="white", relief="flat", padx=12, pady=4,
               command=lambda: (link.send("~camdiag"),
                                log("~camdiag sent -- the gun answers with "
                                    "CAM: diag lines; the VERDICT line names "
@@ -685,7 +824,7 @@ def main():
     lab(frame_wii, "ambient light (a window or a lamp in view) -- read the "
         "sizes before setting a window:",
         (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(6, 1))
-    rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x", pady=2)
+    rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x", pady=1)
     fx_ext = tk.IntVar(value=0)
     def send_ext():
         link.send("~cam=ext:%d" % fx_ext.get())
@@ -707,20 +846,53 @@ def main():
                    activeforeground=C_FG, highlightthickness=0
                    ).pack(side="left")
     bgate = {}
+    bspin = {}
+
+    def gate_send(k, v):
+        """Send whatever is in the box, typed or stepped. A value the user
+        typed reached nothing before this: only the arrows had a command."""
+        try:
+            n = int(v.get())
+        except Exception:
+            return                      # mid-edit; the next event will do it
+        link.send("~cam=%s:%d" % (k, n))
+        link.send("~camblob?")
+
     for key, name in (("bmin", "keep from size"), ("bmax", "up to")):
         lab(rowb, name, (F[0], 9), C_DIM).pack(side="left", padx=(10, 2))
         gv = tk.IntVar(value=0 if key == "bmin" else 15)
         bgate[key] = gv
-        tk.Spinbox(rowb, from_=0, to=15, width=3, textvariable=gv, font=F,
-                   bg="#161b22", fg=C_FG, relief="flat",
-                   command=lambda k=key, v=gv: (link.send("~cam=%s:%d" % (k, v.get())),
-                                                link.send("~camblob?"))
-                   ).pack(side="left")
+        sp = tk.Spinbox(rowb, from_=0, to=15, width=3, textvariable=gv, font=F,
+                        bg="#161b22", fg=C_FG, relief="flat",
+                        command=lambda k=key, v=gv: gate_send(k, v))
+        sp.pack(side="left")
+        sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
+        bspin[key] = sp
     # wraplength, not hope: these two lines carry live numbers whose length is
     # not known in advance, and a label that overflows this tab is CLIPPED with
     # no sign that anything is missing.
-    blob_lbl = lab(frame_wii, "blob readout: tick 'report blob sizes' and watch "
-                   "this line while you aim at the screen and at the window",
+    rowb2 = tk.Frame(frame_wii, bg=C_BG); rowb2.pack(fill="x", pady=1)
+    # Odd-one-out: four identical emitters should look alike in one frame, so a
+    # blob that does not match the others is the suspect. Needs no distance
+    # tuning, which is what defeats the absolute window above.
+    lab(rowb2, "odd-one-out steps", (F[0], 9), C_DIM).pack(side="left")
+    for key, lo, hi, step in (("rtol", 0, 15, 1),
+                              ("hwmax", -1, 255, 5), ("hwmin", -1, 255, 1)):
+        if key != "rtol":
+            lab(rowb2, "sensor %s" % ("max" if key == "hwmax" else "min"),
+                (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
+        gv = tk.IntVar(value=lo)
+        bgate[key] = gv
+        sp = tk.Spinbox(rowb2, from_=lo, to=hi, increment=step, width=4,
+                        textvariable=gv, font=F, bg="#161b22", fg=C_FG,
+                        relief="flat",
+                        command=lambda k=key, v=gv: gate_send(k, v))
+        sp.pack(side="left", padx=(2, 0))
+        sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
+        bspin[key] = sp
+
+    blob_lbl = lab(frame_wii, "blob readout: tick 'report blob sizes' to fill "
+                   "this line",
                    (F[0], 8), C_DIM, justify="left", anchor="w", wraplength=560)
     blob_lbl.pack(fill="x", pady=(2, 0))
     blob_lbl2 = lab(frame_wii, "", (F[0], 8), C_DIM, justify="left", anchor="w",
@@ -738,7 +910,7 @@ def main():
                 lb.config(wraplength=w)
     frame_wii.bind("<Configure>", wrap_blob)
 
-    barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=6)
+    barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=4)
     tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
                                      log("~camsave sent -- the gun answers "
                                          "with a CAM: saved / SAVE FAILED line "
@@ -1262,16 +1434,47 @@ def main():
     # a live measurement of what the sensor is handing us, and the whole point
     # is to see it CHANGE as the gun swings past the window.
     blob_state = {"ref": {}, "line": "", "good": True}
+    blob_rate = FrameRate()
 
     def blob_tick():
+        # Everything is inside a try whose finally reschedules. A Spinbox the
+        # user cleared makes IntVar.get() raise TclError, and with the
+        # reschedule as the last statement that exception killed this tick --
+        # and with it the whole blob readout -- for the rest of the session,
+        # leaving only a traceback on a stderr nobody sees.
+        try:
+            blob_tick_body()
+        except Exception as e:
+            log("blob readout hiccup: %s" % e)
+        finally:
+            root.after(700, blob_tick)
+
+    def blob_tick_body():
         b = link.last.get("board") or ""
         # Compared as widget names, not tab indexes: an index silently means a
         # different tab the moment one is added.
         if "wiicam" in b and link.src and nb.select() == str(tab_cam):
             link.send("~camblob?")
+            blob_rate.feed(link.last.get("bframes"), link.last.get("bms"))
+            focused = None
+            try:
+                focused = root.focus_get()
+            except Exception:
+                pass
             for key, gv in bgate.items():
                 v = link.last.get(key)
-                if v is not None and gv.get() != v:
+                if v is None:
+                    continue
+                # Never overwrite a box the user is typing into: the 700 ms
+                # sync snapped a half-typed "120" back mid-keystroke, which
+                # made the control impossible to set by hand.
+                if focused is not None and focused is bspin.get(key):
+                    continue
+                try:
+                    cur = gv.get()
+                except Exception:
+                    continue            # mid-edit, not a number yet
+                if cur != v:
                     gv.set(v)
             e = link.last.get("ext")
             if e is not None and fx_ext.get() != e:
@@ -1305,20 +1508,34 @@ def main():
                     # Over EVERY frame, including the ones that saw nothing:
                     # a share taken only over the frames that went well is not
                     # a measure of how much the light is costing.
+                    # The drop counters are since-boot too; spliced raw into
+                    # a sentence about "the last N frames" they made a window
+                    # that had been fixed still read as dropping thousands.
+                    d_rej = []
+                    for k in ("brej", "brrej"):
+                        cur = link.last.get(k, 0)
+                        prev = blob_state["ref"].get(k, cur)
+                        d_rej.append(max(0, cur - prev))
+                        now.append(cur)
+                        keys = keys + (k,)
                     blob_state["ref"] = dict(zip(keys, now))
                     blob_state["good"] = d[0] * 10 >= tot * 8
+                    hz = blob_rate.hz
                     blob_state["line"] = (
                         "last %d frames: %d%% saw all four LEDs, %d%% only "
-                        "three, %d%% two or fewer   --   %d blobs dropped by "
-                        "the size window so far"
+                        "three, %d%% two or fewer   --   %s   dropped: %d by "
+                        "size, %d as odd-one-out"
                         % (tot, 100 * d[0] // tot, 100 * d[1] // tot,
                            100 * (d[2] + d[3] + d[4]) // tot,
-                           link.last.get("brej", 0)))
+                           ("camera %.0f new frames/s (we poll at 420)" % hz)
+                           if hz else "measuring camera rate...",
+                           d_rej[0], d_rej[1])
+                        + ("   SIZE WINDOW TOO TIGHT: it would drop nearly "
+                           "every blob" if link.last.get("bvalve") else ""))
                 if blob_state["line"]:
                     blob_lbl2.config(
                         text=blob_state["line"],
                         fg=C_OK if blob_state.get("good") else C_WARN)
-        root.after(700, blob_tick)
     root.after(1400, blob_tick)
 
     board_state = {"cur": None}

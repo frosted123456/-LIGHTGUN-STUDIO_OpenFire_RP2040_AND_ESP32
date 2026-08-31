@@ -1,6 +1,6 @@
 --- a/OpenFIREmain/OpenFIREmain.ino
 +++ b/OpenFIREmain/OpenFIREmain.ino
-@@ -23,6 +23,80 @@
+@@ -23,6 +23,141 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIREprefs.h"
  #include "OpenFIREconstant.h"
@@ -44,7 +44,39 @@
 +// While true, core 0 leaves the camera and its I2C bus alone. The serial
 +// pump runs on core 1 under DUAL_CORE, so a camdiag or a sensitivity write
 +// would otherwise race core 0's 420 Hz GetPosition on the same driver.
-+static volatile bool aim_cam_hold = false;
++// The hold flag and its acknowledgement live in the wiicam adapter, because
++// OpenFIRE's calibration and verification loops poll the camera too and have
++// to honour the same flag.
++//
++// Takes the camera bus. Returns false if core 0 never acknowledged, which means
++// it is wedged; callers that can afford to wait for a better moment should.
++static bool aim_cam_take()
++{
++    wiicam_aim_cam_hold(1);
++#if defined(ARDUINO_ARCH_RP2040) && defined(DUAL_CORE)
++    // ONLY the other core waits. Called from the core that owns the camera
++    // poll, this wait could never be satisfied -- the loop that would set the
++    // acknowledgement is the very loop being blocked -- and the gun dropped to
++    // about 6 Hz for good. DUAL_CORE is a build switch a user can turn off, so
++    // this is not hypothetical. On the polling core we are already between
++    // polls by construction: the pump runs in that same loop, after the tick.
++    //
++    // And only while core 0 is actually polling. It does so in Run,
++    // Calibration and Verification; anywhere else no acknowledgement is
++    // coming because nothing is reading the camera.
++    const bool polling = (FW_Common::gunMode == FW_Const::GunMode_Run
++                       || FW_Common::gunMode == FW_Const::GunMode_Calibration
++                       || FW_Common::gunMode == FW_Const::GunMode_Verification);
++    if(rp2040.cpuid() == 1 && polling) {
++        for(int i = 0; i < 150 && !wiicam_aim_cam_acked(); ++i) delay(1);
++        delay(1);
++        return wiicam_aim_cam_acked() != 0;
++    }
++#endif
++    delay(2);
++    return true;
++}
++static void aim_cam_give() { wiicam_aim_cam_hold(0); }
 +
 +static inline void aim_serial_pump()
 +{
@@ -62,13 +94,11 @@
 +    // milliseconds, and the poll that would end a strike lives on core 1 too,
 +    // so a shot in flight would hold the coil at full drive for the duration.
 +    fx_glue_shutdown();
-+    aim_cam_hold = true;
-+    // 20 ms, not 4: a GetPosition that is applying the camera's data format
-+    // sits inside a 10 ms library delay, and stealing the bus from underneath
-+    // it puts two masters on the wire.
-+    delay(20);                      // drain an in-flight GetPosition
++    aim_cam_take();
 +    FW_Common::SetIrSensitivity((uint32_t)v);
-+    aim_cam_hold = false;
++    aim_cam_give();
++    // (SetIrSensitivity itself marks the overlay's sensor thresholds for
++    // rewriting -- it rewrites register 0x06 from the preset table.)
 +}
 +static int  aim_sens_get(void)  { return (int)OF_Prefs::profiles[OF_Prefs::currentProfile].irSens; }
 +// Persists the profile (SetIrSensitivity alone does not write flash).
@@ -77,11 +107,42 @@
 +    FW_Common::stateFlags |= FW_Const::StateFlag_SavePreferencesEn;
 +    FW_Common::SavePreferences();
 +}
++// One raw sensor register write, for the blob-size thresholds MAXSIZE (0x06)
++// and MINSIZE (0x1B). The driver keeps its own register-write helper private
++// and offers no way to reach either individually -- sensitivityLevel() only
++// writes fixed presets, and never touches MINSIZE at all -- so this goes to
++// the bus directly, choosing it from the same pins CameraSet chose it from.
++//
++// Called from the serial-pump core, never from the camera poll: the sensor
++// wants settling time after a configuration write, and core 0 cannot spare it.
++static int aim_blobreg_set(int reg, int val)
++{
++    // No camera, nothing to configure. Reported as a refusal so the overlay
++    // keeps the request and tries again once there is one.
++    if(!FW_Common::dfrIRPos) return 0;
++    // The same bus CameraSet chose, from the same pins. (CameraSet also
++    // checks bit 0 of each pin and builds no driver when that fails, which is
++    // why the null check above is the real guard.)
++    TwoWire& w = (bitRead(OF_Prefs::pins[OF_Const::camSCL], 1) &&
++                  bitRead(OF_Prefs::pins[OF_Const::camSDA], 1)) ? Wire1 : Wire;
++    fx_glue_shutdown();             // this call blocks core 1 for tens of ms
++    if(!aim_cam_take()) {           // core 0 wedged mid-transaction
++        aim_cam_give();
++        return 0;                   // try again on a later tick
++    }
++    w.beginTransmission(0x58);      // 0xB0 >> 1, the sensor's 7-bit address
++    w.write((uint8_t)reg);
++    w.write((uint8_t)val);
++    const int ok = (w.endTransmission() == 0);
++    delay(10);                      // the driver's own settling delay
++    aim_cam_give();
++    return ok;
++}
 +#endif
  
  // Sets up the environment
  void setup() {
-@@ -141,7 +215,107 @@
+@@ -141,7 +276,108 @@
      #endif // LED_ENABLE
  
      // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
@@ -115,10 +176,10 @@
 +        // the recoil engine is silenced, or a diag mid-strike would freeze
 +        // the coil energised for the whole probe.
 +        fx_glue_shutdown();
-+        aim_cam_hold = true;
-+        // 20 ms: a GetPosition applying the camera's data format is inside a
-+        // 10 ms library delay, and the probe below takes the bus pins.
-+        delay(20);
++        // Waits for core 0 to acknowledge rather than guessing at a drain
++        // time: the probe below takes the bus PINS, so overlapping with a read
++        // in progress is exactly what must not happen.
++        aim_cam_take();
 +        // Judged by the PRE-probe flag: stealing the bus pins makes core 0's
 +        // in-flight reads fail, which flips camNotAvailable on a healthy gun.
 +        const bool was_down = FW_Common::camNotAvailable;
@@ -145,7 +206,7 @@
 +        // its clock wire dead, it just never produces a frame. This names
 +        // both cases apart.
 +        if(v == WD_ACK && !FW_Common::camNotAvailable && FW_Common::dfrIRPos) {
-+            // still under aim_cam_hold: this stream check must be the only
++            // still holding the camera bus: this stream check must be the only
 +            // master on the bus
 +            //
 +            // Always in BASIC format: this is a wiring test, and pinning the
@@ -178,10 +239,11 @@
 +        // no longer known to match what the overlay wants. Marking it dirty
 +        // makes core 0 write the register again before its next read.
 +        wiicam_aim_format_dirty();
-+        aim_cam_hold = false;
++        aim_cam_give();
 +        return v;
 +    });
 +    wiicam_set_sens_hooks(aim_sens_set, aim_sens_get, aim_sens_save);
++    wiicam_set_blobreg_hook(aim_blobreg_set);
 +    // Install sinks at boot so replies work before the Run loop starts.
 +    aim_set_out(aim_reply_sink);
 +    wiicam_set_reply_sink(aim_reply_sink);
@@ -190,7 +252,7 @@
  
      FW_Common::OpenFIREper.source(OF_Prefs::profiles[OF_Prefs::currentProfile].adjX,
                                    OF_Prefs::profiles[OF_Prefs::currentProfile].adjY);
-@@ -165,6 +339,18 @@
+@@ -165,6 +401,18 @@
          #endif // USES_DISPLAY
  
          while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
@@ -209,7 +271,7 @@
              // Check and process serial commands, in case user needs to change EEPROM settings.
              if(Serial.available())
                  OF_Serial::SerialProcessingDocked();
-@@ -210,7 +396,12 @@
+@@ -210,7 +458,12 @@
          // skip cali if we're prematurely set to run from the above loop
          // (i.e. cal'd from Desktop)
          if(FW_Common::gunMode != FW_Const::GunMode_Run)
@@ -222,7 +284,7 @@
      } else {
          // this will turn off the DotStar/RGB LED and ensure proper transition to Run
          FW_Common::SetMode(FW_Const::GunMode_Run);
-@@ -272,6 +463,12 @@
+@@ -272,6 +525,12 @@
          // All buttons' outputs except for the trigger are processed here.
          FW_Common::buttons.Poll(0);
  
@@ -235,29 +297,31 @@
          #ifdef USES_TEMP
              if(OF_Prefs::pins[OF_Const::tempPin] > -1)
                  OF_FFB::TemperatureUpdate();
-@@ -292,6 +489,10 @@
+@@ -292,6 +551,11 @@
              FW_Common::buttons.SendReports();
          }
  
 +#ifdef USE_AIM_PIPELINE
 +        aim_serial_pump();
 +        fx_glue_poll();
++        wiicam_aim_hw_tick();
 +#endif
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -369,6 +570,10 @@
+@@ -369,6 +633,11 @@
      }
  
      #ifdef MAMEHOOKER
 +#ifdef USE_AIM_PIPELINE
 +        aim_serial_pump();
 +        fx_glue_poll();
++        wiicam_aim_hw_tick();
 +#endif
          if(Serial.available()) OF_Serial::SerialProcessing();
      #endif // MAMEHOOKER
  
-@@ -648,6 +853,10 @@
+@@ -648,6 +917,10 @@
      #endif // ARDUINO_ARCH_RP2040 && DUAL_CORE
  
      for(;;) {
@@ -268,17 +332,22 @@
          // Setting the state of our toggles, if used.
          // Only sets these values if the switches are mapped to valid pins.
          #ifdef USES_SWITCHES
-@@ -684,7 +893,8 @@
+@@ -684,6 +957,14 @@
  
          if(FW_Common::irPosUpdateTick) {
              FW_Common::irPosUpdateTick = 0;
--            FW_Common::GetPosition();
-+            if(!aim_cam_hold)
-+                FW_Common::GetPosition();
++#ifdef USE_AIM_PIPELINE
++            // Core 1 holds the bus to write a configuration register; between
++            // polls is exactly when it may have it. Guarded like every other
++            // overlay call in this file: without the pipeline these symbols
++            // are not even declared.
++            if(wiicam_aim_cam_held()) wiicam_aim_cam_ack();
++            else
++#endif
+             FW_Common::GetPosition();
          }
          #ifdef USES_DISPLAY
-             else {
-@@ -723,6 +933,11 @@
+@@ -723,6 +1004,11 @@
  
          FW_Common::buttons.Poll(0);
  
@@ -290,28 +359,34 @@
          // For processing the trigger specifically.
          // (FW_Common::buttons.debounced is a binary variable intended to be read 1 bit at a time,
          // with the 0'th point == rightmost == decimal 1 == trigger, 3 = start, 4 = select)
-@@ -739,6 +954,10 @@
+@@ -739,6 +1025,11 @@
          }
  
          // Run through serial receive buffer once this run, if it has contents.
 +#ifdef USE_AIM_PIPELINE
 +        aim_serial_pump();
 +        fx_glue_poll();
++        wiicam_aim_hw_tick();
 +#endif
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -821,7 +1040,8 @@
+@@ -821,6 +1112,14 @@
  
          if(FW_Common::irPosUpdateTick) {
              FW_Common::irPosUpdateTick = 0;
--            FW_Common::GetPosition();
-+            if(!aim_cam_hold)
-+                FW_Common::GetPosition();
++#ifdef USE_AIM_PIPELINE
++            // Core 1 holds the bus to write a configuration register; between
++            // polls is exactly when it may have it. Guarded like every other
++            // overlay call in this file: without the pipeline these symbols
++            // are not even declared.
++            if(wiicam_aim_cam_held()) wiicam_aim_cam_ack();
++            else
++#endif
+             FW_Common::GetPosition();
          }
      }
- }
-@@ -934,8 +1154,14 @@
+@@ -934,8 +1233,14 @@
  // Handles events when trigger is pulled/held
  void TriggerFire()
  {

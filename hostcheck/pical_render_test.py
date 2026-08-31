@@ -12,6 +12,12 @@ import time
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+# Somewhere disposable, set BEFORE pical is imported (it resolves OUT_DIR at
+# import time). Without this every run of this test left a ~640 KB simulated
+# session in pical/calib_out -- 72 of them had accumulated in the release tree,
+# in the folder where a REAL capture from the stick is supposed to land.
+import tempfile
+os.environ.setdefault("PICAL_OUT", tempfile.mkdtemp(prefix="pical-test-"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -737,6 +743,67 @@ def main():
        "and it recovers by itself after the gun reboots its counters")
     app.step([], t + 9.4)
     ck(True, "camera screen renders with the blob readout")
+
+    # The readout must not be drawn ON TOP of the rows. The wiicam list grew to
+    # eleven entries and a fixed readout height landed over the last three.
+    row_bottom = max((r.rect.bottom for r in cam3.rows if r.rect), default=0)
+    txt_top = None
+    real_text = pical.Screen.text
+    def spy_text(self, x, y, msg, font=None, colour=None, centre=True):
+        r = real_text(self, x, y, msg, font, colour, centre)
+        if "blobs now" in str(msg) or "saw all four LEDs" in str(msg):
+            globals()["_spy_top"] = min(globals().get("_spy_top", 10**6), r.top)
+        return r
+    globals()["_spy_top"] = 10**6
+    pical.Screen.text = spy_text
+    app.step([], t + 9.45)
+    pical.Screen.text = real_text
+    txt_top = globals()["_spy_top"]
+    ck(txt_top == 10**6 or txt_top >= row_bottom,
+       "the blob readout sits below the last row, not over it (rows end %d, "
+       "readout starts %s)" % (row_bottom, txt_top))
+
+    # The sensor's own thresholds and the odd-one-out gate reach the gun.
+    for label, wire in (("Odd-one-out (size steps)", b"cam=rtol:"),
+                        ("Sensor max size (0x06)", b"cam=hwmax:"),
+                        ("Sensor min size (0x1B)", b"cam=hwmin:")):
+        ck(label in labels, "the camera screen offers '%s'" % label)
+        cam3.sel = labels.index(label)
+        n0 = len(ser.written)
+        app.step([key(pygame.K_RIGHT)], t + 9.5)
+        ck(any(wire in w for w in ser.written[n0:]),
+           "and nudging it sends %s to the gun" % wire.decode())
+
+    # The camera's true frame rate, from the gun's own clock. Nobody has ever
+    # measured it on this sensor, and it decides whether full mode is
+    # affordable -- so it has to appear on the screen the user is looking at.
+    app.link.last.update({"bframes": 1000, "bms": 10000})
+    cam3._rate.feed(1000, 10000)
+    app.link.last.update({"bframes": 1100, "bms": 11000})
+    cam3._rate.feed(1100, 11000)
+    ck("new frames/s" in "\n".join(cam3.blob_lines()),
+       "the camera's measured frame rate is on screen")
+
+    # Logging to the stick: the Pi has no console and the bad light is only at
+    # the TV, so a session has to leave a file behind.
+    cam3.log_toggle()
+    ck(cam3._log is not None, "logging starts")
+    app.link.last["bframes"] = 1101
+    app.step([], t + 12.0)                # poll + sample happen in handle()
+    logpath = cam3._log.path
+    ck("LOGGING" in "\n".join(cam3.blob_lines()),
+       "and says so on screen while it runs")
+    cam3.log_toggle()
+    ck(cam3._log is None and os.path.isfile(logpath),
+       "stopping closes the file, and the file is really there")
+    with open(logpath) as f:
+        head = f.readline().strip()
+    ck(head.startswith("wall,gun_ms,bframes,hz"),
+       "with a header a PC can read months later")
+    # And a screen that was logging must not keep the file open once it is gone.
+    cam3.log_toggle()
+    app.to_menu()
+    ck(cam3._log is None, "leaving the screen closes the log")
 
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on
