@@ -360,14 +360,16 @@ bool aim_gate_clear(void)
 #endif
 }
 
-bool aim_gate2_store(int pxmax, int armax)
+bool aim_gate2_store(int pxmax, int armax, int bhmax)
 {
     if (pxmax < 0)  pxmax = 0;
     if (pxmax > 63) pxmax = 63;
     if (armax < 0)  armax = 0;
     if (armax > 63) armax = 63;
-    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)pxmax << 6)
-                     | (uint32_t)armax;
+    if (bhmax < 0)  bhmax = 0;
+    if (bhmax > 63) bhmax = 63;
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)bhmax << 12)
+                     | ((uint32_t)pxmax << 6) | (uint32_t)armax;
 #if defined(AIM_HAVE_STORE)
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
@@ -380,10 +382,10 @@ bool aim_gate2_store(int pxmax, int armax)
 #endif
 }
 
-bool aim_gate2_load(int* out_pxmax, int* out_armax)
+bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax)
 {
 #if defined(AIM_HAVE_STORE)
-    if (!out_pxmax || !out_armax) return false;
+    if (!out_pxmax || !out_armax || !out_bhmax) return false;
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     uint32_t v = 0;
@@ -393,9 +395,10 @@ bool aim_gate2_load(int* out_pxmax, int* out_armax)
     if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
     *out_pxmax = (int)((v >> 6) & 0x3F);
     *out_armax = (int)(v & 0x3F);
+    *out_bhmax = (int)((v >> 12) & 0x3F);
     return true;
 #else
-    (void)out_pxmax; (void)out_armax; return false;
+    (void)out_pxmax; (void)out_armax; (void)out_bhmax; return false;
 #endif
 }
 

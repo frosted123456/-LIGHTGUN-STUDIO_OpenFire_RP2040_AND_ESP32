@@ -8,7 +8,7 @@ Order matters: aim error scales with blob noise, so the calibration step stays
 locked until step 2 reports a usable noise floor. Step 3 only matters when the
 camera does not wear the stock 66-degree lens. F9 freezes the cursor while the
 window is open; steps that need the gun release it and put it back."""
-import os, sys, subprocess, threading, queue, time
+import os, re, sys, subprocess, threading, queue, time
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -34,7 +34,13 @@ from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
 #      copied onto a stick beside an older tools/ would show the two new rows
 #      as "--" for ever and never raise the false-negative warning -- with
 #      nothing anywhere to say why.
-LINK_API = 7
+#   8  the height gate (bhmax) and the NINE-field blob tuple: the box origin
+#      xmn,ymn joins the width, height and pixel count a full report already
+#      carried. An older tools/ drops a nine-field blob on the floor entirely
+#      -- parse_blobs only ever accepted 4 and 7 -- so a pical beside one
+#      shows "no blobs" on a gun that is sending four of them, which reads as
+#      a dead sensor rather than as a version skew.
+LINK_API = 8
 
 SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
 # Board-scaled noise gates: the wiicam's 33-deg lens has ~2.2x less screen
@@ -146,9 +152,12 @@ def parse_blobs(line):
     """The per-blob list from a '~camblob?' reply.
 
     Four fields per blob -- (x, y, size, kept) -- in basic and extended mode,
-    and seven in full mode, where the sensor also reports the blob's bounding
-    box and its pixel count: (x, y, size, kept, boxw, boxh, px). Wiibrew calls
-    that last field an intensity; measured against the box it is plainly a
+    and NINE in full mode, where the sensor also reports the blob's bounding
+    box and its pixel count:
+
+        (x, y, size, kept, boxw, boxh, px, xmn, ymn)
+
+    Wiibrew calls px an intensity; measured against the box it is plainly a
     count of lit pixels -- it never once exceeded the bounding box across 340
     blobs, and a 2x2 box reads exactly 4 every single time, which a brightness
     would not. The wire name is kept because the CSVs already carry it. The box
@@ -159,24 +168,99 @@ def parse_blobs(line):
     compared without scaling -- but by 1.9, not by the 8 that reading them as
     1024x768 would imply.
 
+    SEVEN is the same full report before the box ORIGIN was added to it, and it
+    is still accepted: the guns in the field are reflashed one at a time, and a
+    tools/ that refused the older report would show "no blobs" on a gun that is
+    sending four of them -- which reads as a dead sensor. Everything that needs
+    the origin asks for it by length instead (see blob_shape).
+
     Fields are positional and belong together, so they are parsed as a unit
     rather than scattered into the key/value store. The tuple keeps whatever
-    length the gun sent: padding a four-field blob out to seven would hand
-    every caller a 0x0 box that reads exactly like a measured one. Any other
-    length is a line the gun's send buffer cut short -- that blob is dropped
-    and the whole ones before it are kept, because a truncated tail is not a
-    reason to throw away a good frame."""
+    length the gun sent: padding a four-field blob out to nine would hand
+    every caller a 0x0 box at the origin that reads exactly like a measured
+    one. Any other length is a line the gun's send buffer cut short -- that
+    blob is dropped and the whole ones before it are kept, because a truncated
+    tail is not a reason to throw away a good frame."""
     out = []
     if not line:
         return out
     for tok in line.replace("CAM: blobs", "").split():
         f = tok.split(",")
-        if len(f) not in (4, 7):
+        if len(f) not in (4, 7, 9):
             continue
         try:
             out.append(tuple(int(v) for v in f))
         except ValueError:
             pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# what the sensor actually sees, as a shape
+# ---------------------------------------------------------------------------
+# The sensor's own pixel array. Everything the preview draws lives in it: the
+# box fields are 7-bit numbers in this space, and the reported position is
+# mapped into it so the two can be compared at all.
+NATIVE_W, NATIVE_H = 128.0, 96.0
+# How far the box centre may sit from the reported position before the UNITS
+# are the suspect rather than the blob. The two are measured differently -- the
+# position is an intensity centroid and the centre is the middle of a bounding
+# box -- so they never coincide exactly, and a smeared blob at sensitivity 2
+# can put a pixel or two between them. Ten times that is not a blob being
+# lopsided, it is the box fields not being in this array at all, and the whole
+# shape analysis would then be built on a unit nobody has checked.
+SHAPE_OFF_MAX = 3.0
+
+
+def blob_shape(b):
+    """One blob's geometry for the preview, in the sensor's native 128x96 array.
+
+    Returns a dict, or None for a blob with no shape in it at all:
+
+      kept     the gun's own verdict, so the drawing can separate the blobs it
+               kept from the ones a gate dropped
+      cross    the REPORTED position, mapped out of the 240x176 pipeline into
+               this array. This is the measurement the preview exists to make:
+               if the box fields really are in the sensor's 128x96 array then
+               the box centre lands on it, and if they are not, nothing else
+               about the shape numbers can be trusted either.
+      box      (left, top, w, h) of the bounding box, in the same array. The
+               wire carries xmx-xmn, so a one-pixel blob reports 0 and the drawn
+               extent is w+1 by h+1 -- the same +1 the density is divided by.
+      origin   True when the gun sent xmn,ymn. On the seven-field report there
+               is no origin, so the box is centred on the crosshair instead:
+               that is an ASSUMPTION and the drawing has to say so, because a
+               box parked on the crosshair agrees with it by construction and
+               would read as the measurement passing.
+      density  px / ((w+1)*(h+1)) -- how much of its own box the blob fills. A
+               point source fills nearly all of it; a window reflection or a
+               smear does not.
+      off      how far the box centre sits from the crosshair, in this array's
+               pixels, or None when there is no origin to measure it from.
+    """
+    if not b or len(b) < 4:
+        return None
+    cross = (b[0] * NATIVE_W / FRAME_W, b[1] * NATIVE_H / FRAME_H)
+    out = {"kept": b[3] == 1, "cross": cross, "box": None, "origin": False,
+           "density": None, "off": None}
+    if len(b) < 7:
+        return out
+    w, h, px = b[4], b[5], b[6]
+    # Divided by the drawn extent, not by w*h: the wire's width is a
+    # difference of two coordinates, so a 1x1 blob arrives as 0x0 and a
+    # density of px/0 is either a crash or an infinity, on the single
+    # commonest blob this sensor produces.
+    area = (w + 1) * (h + 1)
+    out["density"] = px / float(area)
+    if len(b) >= 9:
+        out["box"] = (float(b[7]), float(b[8]), float(w), float(h))
+        out["origin"] = True
+        cx = b[7] + w / 2.0
+        cy = b[8] + h / 2.0
+        out["off"] = ((cx - cross[0]) ** 2 + (cy - cross[1]) ** 2) ** 0.5
+    else:
+        out["box"] = (cross[0] - w / 2.0, cross[1] - h / 2.0,
+                      float(w), float(h))
     return out
 
 
@@ -218,7 +302,20 @@ class BlobLog:
             # ...and the settings those counts were taken under. A pixel-count
             # and roundness limit read months later mean nothing unless the
             # row says which limits were in force when it was written.
-            "pxmax", "armax")
+            "pxmax", "armax",
+            # The box ORIGIN, which is what turns w,h from a size into a
+            # place. Without it a capture cannot be checked against the
+            # position beside it, so "are these fields really in the sensor's
+            # 128x96 array?" -- the question every conclusion drawn from the
+            # box depends on -- is unanswerable from the file afterwards.
+            # On the end, behind the shape-gate columns, for the same reason
+            # everything else is: the captures already taken are read by index.
+            "xm0", "ym0", "xm1", "ym1", "xm2", "ym2", "xm3", "ym3",
+            # The gate that actually works, and therefore the one setting a
+            # row most needs to name. It belongs beside pxmax and armax and it
+            # is nowhere near them, because moving those two down one column
+            # would silently reinterpret every capture on the stick.
+            "bhmax")
 
     def __init__(self, path):
         self.path = path
@@ -262,13 +359,22 @@ class BlobLog:
         # measurement of nothing from a measurement that never happened.
         for i in range(4):
             b = blobs[i] if i < len(blobs) else ()
-            vals.extend(b[4:7] if len(b) == 7 else ("", "", ""))
+            vals.extend(b[4:7] if len(b) in (7, 9) else ("", "", ""))
         # Blank, not zero, on a gun too old to send them: a counter that reads
         # 0 for a whole capture is indistinguishable from a gate that never
         # fired, and "bnear stayed at zero" is exactly the conclusion this
         # column is used to draw.
         for k in ("bfar", "bnear", "bsrej", "pxmax", "armax"):
             vals.append(last.get(k, ""))
+        # The origin, and blank on the seven-field report for a harder reason
+        # than the others: 0,0 is a real corner of the array. Written as zeros,
+        # a whole capture off a gun that never sent the origin would pile every
+        # blob into the top-left of any plot drawn from it, and the plot would
+        # look like a sensor fault rather than like a missing column.
+        for i in range(4):
+            b = blobs[i] if i < len(blobs) else ()
+            vals.extend(b[7:9] if len(b) == 9 else ("", ""))
+        vals.append(last.get("bhmax", ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
         # an empty file, because the writes are still in the page cache.
@@ -457,6 +563,55 @@ def write_shape_csv(path, hs):
                                    str(led), str(rej)] + bins) + "\n")
                 n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# naming a capture so the next one cannot land on it
+# ---------------------------------------------------------------------------
+# Files used to be named from the wall clock alone. Two captures inside the
+# same second overwrite each other in silence -- and one second is not a
+# hypothetical here, because the way these get taken is press, look, press
+# again. The rest of the time the clock is merely unhelpful: it does not say
+# which capture came first when the run crossed midnight, and it gives the two
+# people in this conversation nothing shorter to say than fourteen digits.
+#
+# So every file also carries a sequence number, scanned off the directory it
+# is about to land in: highest existing + 1. That makes the name sort in
+# creation order, gives the user a "number 4" to ask for, and -- with the
+# existence check below -- cannot name a file that is already there.
+SEQ_DIGITS = 3
+# Anchored, and no more than six digits before the dash, so the older
+# wall-clock names are NOT read as sequence numbers: 'shape-20260901-1131.csv'
+# would otherwise be capture number twenty million, and every file after it
+# would carry that number too once the widths stopped matching.
+_SEQ_RE = r"^%s-(\d{1,6})-"
+
+
+def seq_path(outdir, prefix, ext=".csv", now=None):
+    """(path, number) for the next capture in `outdir`. Never an existing file.
+
+    The clock stays in the name because it is what identifies the moment; the
+    number is what orders it. `now` is for the tests, which cannot wait a
+    second to prove that two captures do not collide."""
+    n = 0
+    try:
+        for f in os.listdir(outdir):
+            m = re.match(_SEQ_RE % re.escape(prefix), f)
+            if m:
+                n = max(n, int(m.group(1)))
+    except OSError:
+        pass                    # no directory yet, so this is number 1
+    stamp = now if now is not None else time.strftime("%H%M%S")
+    # Nothing here may return a path that exists. The scan above is enough on
+    # its own for files this app wrote, but the directory is a FAT partition
+    # somebody else also copies into, and overwriting a capture that cannot be
+    # taken again is the one failure this whole scheme exists to prevent.
+    while True:
+        n += 1
+        p = os.path.join(outdir, "%s-%0*d-%s%s"
+                         % (prefix, SEQ_DIGITS, n, stamp, ext))
+        if not os.path.exists(p):
+            return p, n
 
 
 def port_is_free(port):
@@ -692,7 +847,15 @@ class Link:
                                                  # would both be permanently
                                                  # blank with nothing on the
                                                  # wire to blame for it.
-                                                 "pxmax", "armax",
+                                                 # bhmax is the gate that
+                                                 # actually works, so it is
+                                                 # also the one whose spinbox
+                                                 # would sit at 'off' while
+                                                 # the gun was gating -- and
+                                                 # the next click would then
+                                                 # send the gun a setting the
+                                                 # user never chose.
+                                                 "bhmax", "pxmax", "armax",
                                                  "bsrej", "bfar", "bnear"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
@@ -840,13 +1003,43 @@ def main():
     # scrollbar and no sign that anything is missing.
     try:
         _sh = root.winfo_screenheight()
+        _sw = root.winfo_screenwidth()
     except Exception:
-        _sh = 800
+        _sh, _sw = 800, 1020
     # The tab panels have grown enough that 800 no longer holds the tallest of
     # them. Take what the screen offers, up to 980, and keep 800 as the floor
     # for a 768p laptop -- trimming the panels instead only shrinks the tab
     # area with them, which is a race that cannot be won.
-    root.geometry("1020x%d" % max(800, min(980, _sh - 60)))
+    #
+    # WIDTH now adapts the same way, and for a measured reason. On a 768p
+    # laptop the tab area stops growing at 313 px and the wiicam camera panel
+    # already asks for 268 of them: there is no room on that tab for anything
+    # taller than about 25 px, and the shape preview -- a 128x96 sensor frame
+    # drawn big enough to see a 12x10 box in -- needs the better part of 230.
+    # Height cannot be found. Width can: the window was pinned at 1020 on
+    # screens that are 1366 or 1400 wide, so the preview goes in the 320 px
+    # that were being thrown away, beside the controls rather than under them.
+    # 1020 stays the floor, and on a screen too narrow to widen into, the
+    # preview falls back to a tab of its own (see PREVIEW_W below).
+    _ww = max(1020, min(1340, _sw - 30))
+    root.geometry("%dx%d" % (_ww, max(800, min(980, _sh - 60))))
+    # What the widening actually bought, which is what the preview may spend.
+    # Measured from the layout that already fitted at 1020 rather than from a
+    # fraction of the window, because every pixel under 1020 belongs to a row
+    # of the camera panel that is already 562 px wide and cannot give any back.
+    #
+    # Capped as well as floored, and the cap is a HEIGHT measurement wearing a
+    # width's clothes: the canvas keeps the sensor's 4:3 so a round blob draws
+    # round, which makes 288 px wide 216 px tall -- and 216 plus the heading
+    # and the four-line verdict under it is 299 of the 313 px the tab area
+    # allows. Wider would draw a bigger picture and cut the verdict off the
+    # bottom of it, and the verdict is the part that says whether any of the
+    # numbers on this tab mean anything.
+    PREVIEW_W = min(288, _ww - 1020 - 14)
+    # Below this the box for a real LED -- 12 wide by 10 tall at sensitivity 2
+    # -- draws smaller than a spinbox arrow, and a preview nobody can read is
+    # worse than a tab they have to click.
+    PREVIEW_MIN = 180
 
     C_BG, C_FG, C_DIM, C_OK, C_WARN, C_BAD = "#0d1117", "#e6edf3", "#7d8590", "#39c26e", "#d8a13a", "#d24b4b"
     F = ("Segoe UI" if os.name == "nt" else "DejaVu Sans", 10)
@@ -1063,57 +1256,252 @@ def main():
     # camera panel cannot have.
     nb.pack(fill="x", pady=(6, 0))
 
+    # ---- the shape preview -------------------------------------------------
+    # What the gun actually SEES, drawn in the sensor's own 128x96 array. Until
+    # this existed the panel could only print coordinates, and coordinates
+    # cannot answer the question the whole shape gate rests on -- is the thing
+    # in slot 2 a point of light or a window?
+    #
+    # It goes BESIDE the controls, not under them. Measured on a 768p laptop:
+    # the tab area stops growing at 313 px and the wiicam panel already asked
+    # for 268 of them, so 25 px was everything on offer in the height -- and a
+    # canvas tall enough to see a 12x10 box in needs the better part of 220.
+    # Height cannot be bought at any price. Width could: the window was pinned
+    # at 1020 on a screen 1366 or 1400 wide, so widening it to 1340 buys 320
+    # px, of which the preview column takes 290 and the camera panel keeps the
+    # rest. On a screen too narrow to widen into, the preview gets a tab of
+    # its own: worse, because the gate spinboxes are then not on screen beside
+    # it, but still better than not drawing it.
+    if PREVIEW_W >= PREVIEW_MIN:
+        prev_host = tk.Frame(tab_cam, bg=C_BG)
+        prev_host.pack(side="right", fill="y", padx=(12, 0))
+        prev_page = tab_cam
+    else:
+        prev_host = tk.Frame(nb, bg=C_BG)
+        nb.add(prev_host, text="  Shape  ")
+        prev_page = prev_host
+        PREVIEW_W = 288
+    PREVIEW_H = int(PREVIEW_W * NATIVE_H / NATIVE_W)
+    # wraplength, not hope. Without it this heading is 303 px of natural width
+    # and the COLUMN grows to hold it -- which on a 1280 px screen takes 87 px
+    # straight off the camera panel beside it and pushes its widest row off
+    # the edge. A label may never be what decides how wide this column is.
+    lab(prev_host, "%d x %d sensor pixels, shaded by density"
+        % (NATIVE_W, NATIVE_H), (F[0], 8), C_DIM, anchor="w",
+        justify="left", wraplength=PREVIEW_W).pack(fill="x")
+    shape_cv = tk.Canvas(prev_host, width=PREVIEW_W, height=PREVIEW_H,
+                         bg="#010409", highlightthickness=1,
+                         highlightbackground="#30363d")
+    shape_cv.pack()
+    # A FIXED number of lines, so the canvas above cannot jump up and down as
+    # the verdict changes length -- a picture that moves while you are reading
+    # a number off it is worse than a smaller picture. The count is measured
+    # rather than typed: the longest message below is about this many pixels
+    # of text, and a narrow column simply gets more lines of it. Too few and
+    # the sentence that says the units are wrong is the one cut off.
+    SHAPE_MSG_PX = 900
+    shape_lbl = lab(prev_host, "", (F[0], 8), C_DIM, justify="left",
+                    anchor="nw", wraplength=PREVIEW_W,
+                    height=max(3, -(-SHAPE_MSG_PX // PREVIEW_W)))
+    shape_lbl.pack(fill="x", pady=(2, 0))
+
+    # Density as a fill colour: dark when a blob rattles around inside its own
+    # bounding box, hot when it fills it. A point source fills nearly all of
+    # its box; a reflection off a window frame does not, and that difference is
+    # invisible in a list of numbers and obvious in a picture.
+    SHAPE_RAMP = ((0.0, (22, 42, 66)), (0.55, (31, 111, 235)),
+                  (1.0, (216, 161, 58)))
+
+    def heat(d):
+        """A density in 0..1 as a hex colour. Clamped, because px can exceed
+        the box area -- and when it does, that is itself the units being wrong
+        rather than a blob to shade differently."""
+        d = 0.0 if d is None else max(0.0, min(1.0, d))
+        for (a, ca), (b, cb) in zip(SHAPE_RAMP, SHAPE_RAMP[1:]):
+            if d <= b or b >= 1.0:
+                t = 0.0 if b <= a else (d - a) / (b - a)
+                return "#%02x%02x%02x" % tuple(
+                    int(round(ca[i] + (cb[i] - ca[i]) * t)) for i in range(3))
+        return "#000000"
+
+    def draw_shapes():
+        """Draw the last '~camblob?' reply as shapes.
+
+        The crosshair is a MEASUREMENT, not decoration. We are not certain the
+        box fields are in the sensor's 128x96 array -- they are 7-bit numbers
+        that could be in some other space entirely -- and the only way to
+        settle it from outside the gun is to map the reported position into the
+        same array and see whether the box lands on it. Agreeing is quiet;
+        disagreeing is drawn as a red line between the two and said in words
+        underneath, because a mismatch means every conclusion drawn from the
+        box so far is in unknown units."""
+        shape_cv.delete("all")
+        W, H = PREVIEW_W, PREVIEW_H
+        sx, sy = W / NATIVE_W, H / NATIVE_H
+        # The array's own edge. Without it a blob has nothing to be large or
+        # small against, and "how much of the frame is this thing" is the first
+        # question asked of a suspected window.
+        shape_cv.create_rectangle(1, 1, W, H, outline="#30363d")
+        # The OV2640 build finds its blobs in software and answers no
+        # '~camblob?' at all. Left saying "waiting", this canvas would accuse
+        # a perfectly healthy ESP32 gun of not answering, for ever.
+        board = link.last.get("board") or ""
+        if board and "wiicam" not in board:
+            shape_cv.create_text(W / 2, H / 2, text="not this board",
+                                 fill=C_DIM, font=(F[0], 9))
+            shape_lbl.config(text="%s finds its blobs in software and reports "
+                                  "no shapes -- this preview is for the "
+                                  "wiicam sensor" % board, fg=C_DIM)
+            return
+        raw = getattr(link, "blobs", "")
+        blobs = parse_blobs(raw)
+        bh_gate = link.last.get("bhmax") or 0
+        kept = drop = 0
+        worst = None
+        assumed = 0
+        boxed = 0
+        for b in blobs:
+            s = blob_shape(b)
+            if s is None:
+                continue
+            if s["kept"]:
+                kept += 1
+            else:
+                drop += 1
+            col = C_OK if s["kept"] else C_BAD
+            cx = 1 + s["cross"][0] * sx
+            cy = 1 + s["cross"][1] * sy
+            if s["box"]:
+                boxed += 1
+                x0, y0, bw, bh = s["box"]
+                # +1 because the wire's width is xmx-xmn: a single-pixel blob
+                # reports 0x0, and a rectangle drawn with no extent is a blob
+                # that vanishes at exactly the size the sensor sees most often.
+                X0, Y0 = 1 + x0 * sx, 1 + y0 * sy
+                X1, Y1 = 1 + (x0 + bw + 1) * sx, 1 + (y0 + bh + 1) * sy
+                # Kept and dropped differ in TWO ways, not one: a red outline
+                # and a hatched fill. Colour alone is the whole verdict on a
+                # picture whose other channel is already a colour ramp, and
+                # "which of these did the gate throw away" is the question the
+                # preview is being looked at to answer.
+                box_kw = {"fill": heat(s["density"]), "outline": col,
+                          "width": 2}
+                if not s["kept"]:
+                    box_kw["stipple"] = "gray50"
+                if not s["origin"]:
+                    # No origin on the wire, so this box is parked on the
+                    # crosshair. Dashed, and said in the line below: a box
+                    # drawn at the position agrees with the position by
+                    # construction, and would otherwise read as the units
+                    # having been confirmed when nothing was measured.
+                    assumed += 1
+                    box_kw["width"] = 1
+                    box_kw["dash"] = (3, 2)
+                shape_cv.create_rectangle(X0, Y0, X1, Y1, **box_kw)
+                # Height, because height is what the gate that works judges.
+                # Red when this blob is over the limit the gun is holding, so
+                # the picture says WHICH blobs the setting is about to cost.
+                shape_cv.create_text(
+                    X0, Y0 - 1, text="h%d" % int(bh), anchor="sw",
+                    font=(F[0], 7),
+                    fill=C_BAD if (bh_gate and bh > bh_gate) else C_DIM)
+                if s["off"] is not None and (worst is None or s["off"] > worst):
+                    worst = s["off"]
+                if s["off"] is not None and s["off"] > SHAPE_OFF_MAX:
+                    shape_cv.create_line(1 + (x0 + bw / 2.0) * sx,
+                                         1 + (y0 + bh / 2.0) * sy, cx, cy,
+                                         fill=C_BAD, width=2)
+            # Drawn last so it is never hidden under a box fill.
+            shape_cv.create_line(cx - 5, cy, cx + 5, cy, fill="#ffd24a")
+            shape_cv.create_line(cx, cy - 5, cx, cy + 5, fill="#ffd24a")
+        if not blobs:
+            # An empty reply and no reply at all are different faults, and the
+            # empty frame looks identical either way. Saying "the sensor sees
+            # nothing" before the gun has answered once sends the user hunting
+            # for an LED problem that is really a connection problem.
+            waiting = not raw
+            shape_cv.create_text(W / 2, H / 2,
+                                 text="waiting" if waiting else "no blobs",
+                                 fill=C_DIM if waiting else C_BAD,
+                                 font=(F[0], 9))
+            shape_lbl.config(
+                text=("waiting for the gun's first blob report"
+                      if waiting else
+                      "the sensor is reporting nothing at all -- no LEDs in "
+                      "view, or the camera is not answering"),
+                fg=C_DIM if waiting else C_BAD)
+            return
+        txt = "%d kept, %d dropped." % (kept, drop)
+        col = C_DIM
+        if not boxed:
+            txt += ("  Positions only -- set blob detail to 'full detail' and "
+                    "the boxes appear.")
+        elif assumed:
+            txt += ("  No box ORIGIN from this gun, so every box is drawn AT "
+                    "its crosshair: the shape is real, the placement is not.")
+            col = C_WARN
+        elif worst is not None and worst > SHAPE_OFF_MAX:
+            txt += ("  MISMATCH: box centre %.1f px off the position, so the "
+                    "box fields are NOT in this array and the shape numbers "
+                    "are in unknown units." % worst)
+            col = C_BAD
+        elif worst is not None:
+            txt += ("  Box centre sits %.1f px from the position, so the box "
+                    "fields ARE in this 128x96 array." % worst)
+            col = C_OK
+        shape_lbl.config(text=txt, fg=col)
+
     # ESP32 (OV2640) tuning widgets live in one frame, wiicam's in another;
-    # the gun's own ~ping board tag decides which is shown.
-    frame_esp = tk.Frame(tab_cam, bg=C_BG); frame_esp.pack(fill="x")
+    # the gun's own ~ping board tag decides which is shown. Both take the
+    # LEFT of the tab and whatever width the preview beside them leaves.
+    frame_esp = tk.Frame(tab_cam, bg=C_BG)
+    frame_esp.pack(side="left", fill="both", expand=True)
     frame_wii = tk.Frame(tab_cam, bg=C_BG)   # packed on detect
 
     # Every line this panel spends is a line the Save row at the bottom does
     # not get: the window is 800 px tall on a 768p laptop and the tab area
-    # under it is 307 px, no matter how tall the panel asks to be. It went
+    # under it is 313 px, no matter how tall the panel asks to be. It went
     # over once already -- "Save to gun" rendered four pixels high and could
     # not be clicked -- so headings ride ON the row they name rather than
     # above it, and the paddings here are deliberately mean.
+    #
+    # WHAT IS ON THIS PANEL is now a separate question from how much fits on
+    # it. Everything above the Advanced button is something a user touches
+    # while a test is running; everything below it is something set once, or
+    # not at all. That is not tidying: the two rows that used to sit between
+    # 'blob detail' and the live readout carried seven spinboxes and a pair of
+    # radios, two of them superseded by the height gate and two of them raw
+    # sensor registers, and hunting for the sensitivity buttons through that
+    # mid-test is how a session gets abandoned. Measured, the split also buys
+    # back the height it needed for the new gate: front alone asks for 179 px
+    # of the 313, front plus Advanced 277, and the render test's 20 px margin
+    # holds in both.
     roww = tk.Frame(frame_wii, bg=C_BG); roww.pack(fill="x", pady=1)
-    lab(roww, "wiicam sensitivity (persisted in the OpenFIRE profile):",
-        (F[0], 9), C_DIM).pack(side="left", padx=(0, 8))
+    lab(roww, "wiicam sensitivity", (F[0], 9), C_DIM).pack(side="left",
+                                                           padx=(0, 8))
     for sv, nm in ((0, "Default"), (1, "High"), (2, "Max")):
         tk.Button(roww, text=nm, font=F, bg="#161b22", fg=C_FG, relief="flat",
                   padx=10, pady=2,
                   command=lambda v=sv: (link.send("~cam=sens:%d" % v),
                                         log("sensitivity -> %d" % v))
                   ).pack(side="left", padx=(0, 6))
-    lab(frame_wii, "Default fits most rigs. The noise floor above still "
-        "measures on this board.",
-        (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(1, 1))
-    # Sensor connection test: which of power, wiring and the sensor itself is
-    # broken, straight from the gun's own pins -- and a live camera restart
-    # when the fault turns out to be fixed.
-    rowdg = tk.Frame(frame_wii, bg=C_BG); rowdg.pack(fill="x", pady=1)
-    tk.Button(rowdg, text="Test sensor connection", font=FB, bg="#1f6feb",
-              fg="white", relief="flat", padx=12, pady=2,
-              command=lambda: (link.send("~camdiag"),
-                               log("~camdiag sent -- the gun answers with "
-                                   "CAM: diag lines; the VERDICT line names "
-                                   "what is broken"))).pack(side="left")
-    # Two lines, deliberately: on one line this sentence is 490 px wide and
-    # the panel is 585, which leaves the button no room -- and it costs no
-    # height, because the button beside it is the taller of the two anyway.
-    lab(rowdg, "checks power, both data wires, swapped\n"
-        "lines and the sensor itself",
-        (F[0], 8), C_DIM, justify="left").pack(side="left", padx=8)
-    # ---- ambient light -----------------------------------------------------
+    # What used to have a line of its own, riding on this row instead: a line
+    # here costs 20 px of a panel that has 313, and measured, four words fit
+    # in the 254 px the three buttons leave. The rest of what that line said
+    # -- that the setting lives in the OpenFIRE profile, and that the noise
+    # floor above still measures on this board -- goes to the log when the
+    # board is detected, which is where this panel already sends the
+    # reasoning that will not fit beside a control.
+    lab(roww, "Default fits most rigs", (F[0], 8), C_DIM).pack(side="left")
+
+    # ---- what the sensor reports, and the gate that judges it --------------
     # The wiicam finds blobs in HARDWARE and reports four slots. A bright
     # window does not add a fifth point: it TAKES one, and an LED goes missing,
     # which is why "too much light" shows up as a quad that keeps breaking.
     # Nothing in software can recover a point the sensor never sent. What CAN
     # be done is refuse the impostor, so the resolver rebuilds the missing
     # corner from the three real ones instead of trusting four points one of
-    # which is a lie -- and the only fact that separates them is blob size,
-    # which the sensor leaves out of its basic report.
-    lab(frame_wii, "ambient light (a window or a lamp in view) -- read the "
-        "sizes before setting a window:",
-        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(4, 1))
+    # which is a lie.
     rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x", pady=1)
     # Three report formats, not a switch: each one costs a longer read per
     # frame, so the question is how much detail is worth the bus time and not
@@ -1121,6 +1509,7 @@ def main():
     # sensor's words -- "extended" and "full" are the datasheet's names for
     # two read lengths, and neither of them says which one anybody wants.
     cam_fmt = tk.IntVar(value=0)
+
     def send_fmt():
         n = cam_fmt.get()
         # 'ext' for the two formats that predate full mode, 'fmt' only for
@@ -1133,8 +1522,9 @@ def main():
         link.send("~cam=%s:%d" % ("fmt" if n == 2 else "ext", n))
         link.send("~camblob?")
         if n == 0:
-            log("blob detail off -- the sensor reports position only, and the "
-                "size window and odd-one-out gate have nothing to judge")
+            log("blob detail off -- the sensor reports position only, so the "
+                "shape preview has nothing but crosshairs to draw and every "
+                "gate has nothing to judge")
             return
         # The full reasoning goes in the log rather than on the panel: it
         # is read once, and the panel has to stay short enough to fit.
@@ -1146,25 +1536,24 @@ def main():
             "separate them -- a curtain, an angle change or moving the LED "
             "bar is the only real fix.")
         if n == 2:
-            log("full detail also reports each blob's bounding box and its "
-                "brightness. The box is in the sensor's own 128x96 pixels, "
-                "while the positions beside it are already normalised into "
-                "the gun's 240x176 pipeline space -- nearly two position "
-                "units to the box pixel -- so the box is a shape, not a "
-                "distance. If those numbers do not move with the LEDs, the "
-                "mode register below is the thing to try.")
-            # Said HERE, because this is the only moment the two shape
-            # controls stop being inert -- and there is no room beside them
-            # for the numbers behind the recommendation. Over 52,624
-            # confirmed LED blobs the pixel count ran 4-12 and 99.9% of the
-            # boxes were 2:1 or rounder, so both defaults are the measured
-            # envelope with a step of margin on it.
-            log("full detail is also what the 'biggest blob' and 'roundness' "
-                "limits need: in any other format the gun is sent no box and "
-                "the gate stands down. Measured over 52,624 confirmed LED "
-                "blobs, an LED is 4-12 pixels and 99.9% of them are 2:1 or "
-                "rounder -- so 14 px and 2.5:1 refuse only shapes no LED here "
-                "has ever made.")
+            log("full detail also reports each blob's bounding box, its pixel "
+                "count and where the box sits. That is what the preview "
+                "beside this panel draws, and what the height gate needs: in "
+                "any other format the gun is sent no box and the gate stands "
+                "down. The box is in the sensor's own 128x96 pixels while the "
+                "positions beside it are already normalised into the gun's "
+                "240x176 pipeline space, so if the crosshair in the preview "
+                "does not land inside its box, the mode register under "
+                "Advanced is the thing to try.")
+            # Said HERE, because this is the only moment the shape controls
+            # stop being inert -- and there is no room beside them for the
+            # numbers behind the recommendation.
+            log("measured over 11,996 confirmed blobs in daylight at "
+                "sensitivity 2: 99.73% of LEDs come in at a box height of 7 "
+                "or less and every stray ran 15 to 56, so a height limit of "
+                "10 caught 84% of the strays and cost ZERO LEDs. That is why "
+                "'biggest blob height' is the gate on this panel and the two "
+                "under Advanced are not.")
     lab(rowb, "blob detail", (F[0], 9), C_DIM).pack(side="left")
     for fv, nm in ((0, "off"), (1, "sizes"), (2, "full detail")):
         tk.Radiobutton(rowb, text=nm, value=fv, variable=cam_fmt,
@@ -1185,111 +1574,18 @@ def main():
         link.send("~cam=%s:%d" % (k, n))
         link.send("~camblob?")
 
-    for key, name in (("bmin", "keep from size"), ("bmax", "up to")):
-        lab(rowb, name, (F[0], 9), C_DIM).pack(side="left", padx=(10, 2))
-        gv = tk.IntVar(value=0 if key == "bmin" else 15)
-        bgate[key] = gv
-        sp = tk.Spinbox(rowb, from_=0, to=15, width=3, textvariable=gv, font=F,
-                        bg="#161b22", fg=C_FG, relief="flat",
-                        command=lambda k=key, v=gv: gate_send(k, v))
-        sp.pack(side="left")
-        sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
-        bspin[key] = sp
-    # Which byte selects full mode is the one thing about it nobody can look
-    # up: the driver's own working constants for the other two formats are the
-    # doubled nibble (0x11, 0x33), which makes 0x55 the consistent choice,
-    # while the published tables say the mode is simply 5. Both readings can be
-    # right, so the switch is here rather than in a reflash -- a user who sees
-    # full detail come back as nonsense has something to try.
-    #
-    # On a row of its own, and it has to be: the detail radios above already
-    # need 500 px of the 585 this panel gets at the fixed 1020 px window
-    # width, and this label and its two radios need 228 more. The line this
-    # would have saved was taken off the headings instead.
-    rowfr = tk.Frame(frame_wii, bg=C_BG); rowfr.pack(fill="x", pady=1)
-    cam_fullreg = tk.IntVar(value=85)
-    def send_fullreg():
-        v = cam_fullreg.get()
-        link.send("~cam=fullreg:%d" % v)
-        link.send("~camblob?")
-        log("full-mode register -> 0x%02x. Which byte this sensor wants for "
-            "full mode is not documented anywhere we trust, so it is a "
-            "setting rather than a reflash: if 'full detail' reports boxes "
-            "and brightness that do not follow the LEDs, the other value is "
-            "the thing to try. Not saved -- 0x55 comes back on the next "
-            "power-cycle." % v)
-    lab(rowfr, "full-mode register", (F[0], 9), C_DIM).pack(side="left")
-    for rv, nm in ((85, "0x55"), (5, "0x05")):
-        tk.Radiobutton(rowfr, text=nm, value=rv, variable=cam_fullreg,
-                       command=send_fullreg, font=(F[0], 9), bg=C_BG, fg=C_FG,
-                       selectcolor="#161b22", activebackground=C_BG,
-                       activeforeground=C_FG, highlightthickness=0, bd=0
-                       ).pack(side="left")
-    # The two SENSOR thresholds ride on this row now, not on the gate row
-    # below. Not for tidiness: the shape gate needs two more controls, and
-    # measured at 768p this panel has 21 px of vertical slack in a tab area
-    # that stops growing at 313 -- while a new row of spinboxes costs 25. The
-    # space had to come out of rows that already existed, and it is the WIDTH
-    # that was free. Measured: the register label and its radios take 234 px
-    # of 585, this pair takes 288, and the hint that used to follow the radios
-    # took 256. Two of those three fit here; three never did.
-    #
-    # The hint is the one that goes, because it is the one with a second copy:
-    # send_fullreg() logs the same advice, at greater length, the moment the
-    # register is touched. It also reads better this way -- everything on this
-    # row is a byte written straight into a camera register, and everything on
-    # the row below is judged on this side of the wire.
-    for key, lo, hi, step in (("hwmax", -1, 255, 5), ("hwmin", -1, 255, 1)):
-        lab(rowfr, "sensor %s" % ("max" if key == "hwmax" else "min"),
-            (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
-        gv = tk.IntVar(value=lo)
-        bgate[key] = gv
-        sp = tk.Spinbox(rowfr, from_=lo, to=hi, increment=step, width=4,
-                        textvariable=gv, font=F, bg="#161b22", fg=C_FG,
-                        relief="flat",
-                        command=lambda k=key, v=gv: gate_send(k, v))
-        sp.pack(side="left", padx=(2, 0))
-        sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
-        bspin[key] = sp
-    # wraplength, not hope: these two lines carry live numbers whose length is
-    # not known in advance, and a label that overflows this tab is CLIPPED with
-    # no sign that anything is missing.
-    rowb2 = tk.Frame(frame_wii, bg=C_BG); rowb2.pack(fill="x", pady=1)
-    # The three gates the GUN's own code applies, in one place -- 492 px of
-    # the 585 this panel has, measured with all three on it.
-    #
-    # Odd-one-out: four identical emitters should look alike in one frame, so a
-    # blob that does not match the others is the suspect. Needs no distance
-    # tuning, which is what defeats the absolute window above.
-    lab(rowb2, "odd-one-out steps", (F[0], 9), C_DIM).pack(side="left")
-    gv = tk.IntVar(value=0)
-    bgate["rtol"] = gv
-    sp = tk.Spinbox(rowb2, from_=0, to=15, increment=1, width=4,
-                    textvariable=gv, font=F, bg="#161b22", fg=C_FG,
-                    relief="flat",
-                    command=lambda k="rtol", v=gv: gate_send(k, v))
-    sp.pack(side="left", padx=(2, 0))
-    sp.bind("<Return>", lambda _e, k="rtol", v=gv: gate_send(k, v))
-    bspin["rtol"] = sp
-
-    # ---- the shape gate ----------------------------------------------------
-    # The 4-bit size the gates above judge is nearly useless on this rig:
-    # 52,624 confirmed LED blobs came in at size 1 or 2 and did not move for a
-    # 1.8x change of distance. Full mode reports a bounding box and a pixel
-    # count, which are a real measurement, and these two gate on that. They
-    # need 'full detail' to do anything at all -- in any other format the gun
-    # has no box to judge and the gate stands down.
-    #
-    # Both are a ONE-CLASS envelope: the bounds come from what an LED has
-    # actually looked like, with a step of margin, so the gate can only refuse
-    # something outside everything we have ever measured. The firmware REFUSES
-    # a pxmax of 1..11 and an armax of 1..15 outright rather than clamping, so
-    # the spinboxes step through a fixed list of legal values instead of a
-    # range -- an increment of 1 from 0 would send pxmax:1 and get a refusal
-    # the user has to read the log to find out about.
+    # The firmware REFUSES a bhmax of 1..7, a pxmax of 1..11 and an armax of
+    # 1..15 outright rather than clamping, so all three spinboxes step through
+    # a fixed list of legal values instead of a range -- an increment of 1
+    # from 0 would send bhmax:1 and get a refusal the user has to read the log
+    # to find out about.
     #
     # Shown in the units the user thinks in, not the wire's: armax is eighths
     # of a ratio, and "20" on a panel means nothing at all next to "2.5:1".
+    # bhmax is in sensor ROWS to keep it apart from pxmax, which is a count of
+    # pixels -- two different things that would otherwise both read "12 px".
+    BHMAX_STEPS = (("off", 0), ("8 rows", 8), ("10 rows", 10),
+                   ("12 rows", 12), ("16 rows", 16), ("24 rows", 24))
     PXMAX_STEPS = (("off", 0), ("12 px", 12), ("13 px", 13), ("14 px", 14),
                    ("16 px", 16), ("20 px", 20), ("24 px", 24))
     ARMAX_STEPS = (("off", 0), ("2:1", 16), ("2.5:1", 20), ("3:1", 24),
@@ -1309,10 +1605,10 @@ def main():
             return                      # not one of the rungs; ignore it
         link.send("~cam=%s:%d" % (k, n))
         link.send("~camblob?")
-        # There is no room beside these two for a hint saying so, and without
-        # one a gate set outside full mode does nothing at all with nothing to
-        # say why -- the same trap the shape capture has, answered the same
-        # way. Only when the gate is being turned ON: saying it while somebody
+        # There is no room beside these for a hint saying so, and without one
+        # a gate set outside full mode does nothing at all with nothing to say
+        # why -- the same trap the shape capture has, answered the same way.
+        # Only when the gate is being turned ON: saying it while somebody
         # switches one off is noise.
         if n and cam_fmt.get() != 2:
             log("the shape gate only acts in 'full detail'. In the other "
@@ -1320,20 +1616,49 @@ def main():
                 "so there is nothing to judge and the gate stands down -- set "
                 "blob detail to 'full detail' above, or this setting does "
                 "nothing.")
+        # Said only when it is switched ON, and said at length because the
+        # panel has room for two words. At sensitivity 2 the sensor smears
+        # horizontally -- the same LEDs went from a 2x2 box to 12x3 when the
+        # gain went up, width x5.5 against height x1.5 -- so a roundness limit
+        # measures the gain rather than the source, and the LEDs are what it
+        # starts refusing. 'biggest blob height' is the same idea on the one
+        # axis the smear leaves alone.
+        if n and k == "armax":
+            log("roundness (armax) is NOT recommended. At sensitivity 2 the "
+                "sensor smears a 2x2 blob out to 12x3, so the ratio it "
+                "measures is the gain and not the LED -- and it is the LEDs "
+                "that get refused. Use 'biggest blob height' instead: height "
+                "is the axis the smear does not touch.")
 
-    for key, name, steps in (("pxmax", "biggest blob", PXMAX_STEPS),
-                             ("armax", "roundness", ARMAX_STEPS)):
-        lab(rowb2, name, (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
+    def shape_box(parent, key, name, steps, note=None, width=5):
+        """One rung-stepping gate control, label and all.
+
+        The width is in characters and it is not cosmetic: every one of these
+        rows is within 30 px of the panel's edge, and a box two characters
+        wider than its longest rung is two characters of a row that then runs
+        off the side with nothing to say so."""
+        lab(parent, name, (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
         sv = tk.StringVar(value=steps[0][0])
         shape_var[key] = (sv, {s: w for s, w in steps},
                           {w: s for s, w in steps})
-        sp = tk.Spinbox(rowb2, values=tuple(s for s, _ in steps), width=5,
+        sp = tk.Spinbox(parent, values=tuple(s for s, _ in steps), width=width,
                         textvariable=sv, font=F, bg="#161b22", fg=C_FG,
                         relief="flat", state="readonly",
                         readonlybackground="#161b22",
                         command=lambda k=key: shape_send(k))
         sp.pack(side="left", padx=(2, 0))
         bspin[key] = sp
+        if note:
+            lab(parent, note, (F[0], 8), C_DIM).pack(side="left", padx=(4, 0))
+        return sp
+
+    # THE gate, on the front of the panel, beside the format it needs. Height
+    # rather than width, area or pixel count because at sensitivity 2 the
+    # sensor smears horizontally -- the same LEDs went from a 2x2 box to 12x3
+    # when the gain went up -- so width stops measuring the source and starts
+    # measuring the gain. Height is the axis the smear does not touch.
+    shape_box(rowb, "bhmax", "biggest blob height", BHMAX_STEPS,
+              "10 recommended", width=7)
 
     blob_lbl = lab(frame_wii, "blob readout: set blob detail to 'sizes' to "
                    "fill this line",
@@ -1354,8 +1679,6 @@ def main():
                 lb.config(wraplength=w)
     frame_wii.bind("<Configure>", wrap_blob)
 
-    # No padding under the last row: the tab page adds its own inset, and this
-    # is the row that gets squeezed to nothing when the panel overruns.
     barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=(2, 0))
     tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
                                      log("~camsave sent -- the gun answers "
@@ -1372,13 +1695,11 @@ def main():
     # nothing here is a gate being taught by its own decisions.
     #
     # On THIS bar, and not on a row of its own, because there is no room for a
-    # row: measured at 768 px of screen, the wiicam panel asks for 278 px of a
-    # tab area that stops growing at 313, and a button row costs 29 of the 35
-    # that leaves -- which would put the panel back inside the margin the
-    # render test guards. The bar had 297 px of unused width, so the pair goes
-    # at its right-hand end where it reads as its own group. Everything these
-    # two have to explain goes to the log, which is where this panel already
-    # sends the reasoning that will not fit beside a control.
+    # row: the panel has to hold the Advanced disclosure under it as well, and
+    # a button row costs 30 px of a tab area that stops growing at 313.
+    # Everything these two have to explain goes to the log, which is where
+    # this panel already sends the reasoning that will not fit beside a
+    # control.
     learn_state = {"on": False}
 
     def learn_label():
@@ -1411,15 +1732,22 @@ def main():
         outdir = os.path.join(HERE, "calib_out")
         try:
             os.makedirs(outdir, exist_ok=True)
-            path = os.path.join(outdir,
-                                time.strftime("shape-%Y%m%d-%H%M%S.csv"))
+            # Numbered, not just stamped. Two of these get written inside the
+            # same second -- press, look, press again -- and the wall clock
+            # alone silently overwrote the first one, which is a capture off a
+            # rig that has since been moved.
+            path, seq = seq_path(outdir, "shape")
             n = write_shape_csv(path, hs)
         except Exception as e:
             log("could not write the shape CSV: %s" % e)
             return
         frames, led, rej = hs.counts()
-        log("wrote %d rows to %s -- %d confirmed frames, %d LED blobs, %d "
-            "rejected blobs" % (n, path, frames, led, rej))
+        # The NUMBER is said out loud and first: it is the whole point of
+        # having one, and it is what the user has to be able to repeat back
+        # down a phone line to say which file to send.
+        log("capture %d: wrote %d rows to %s -- %d confirmed frames, %d LED "
+            "blobs, %d rejected blobs"
+            % (seq, n, os.path.basename(path), frames, led, rej))
         if not led:
             log("...and every bin in it is empty: no confirmed LED blobs were "
                 "measured. Either the capture was never on, or the resolver "
@@ -1454,13 +1782,161 @@ def main():
               bg="#161b22", fg=C_FG, relief="flat", padx=12,
               pady=3).pack(side="right")
     # A fixed width in characters, so the label swapping between "Learn LED
-    # shape" and "Stop learning" cannot change how wide this row is: the panel
-    # is 585 px and its widest row already needs 571, and a row that grows past
-    # the panel runs off the right-hand edge with nothing to say so.
+    # shape" and "Stop learning" cannot change how wide this row is: a row that
+    # grows past the panel runs off the right-hand edge with nothing to say so.
     btn_learn = tk.Button(barw, text=learn_label(), command=learn_toggle,
                           font=F, width=15, bg="#161b22", fg=C_FG,
                           relief="flat", padx=6, pady=3)
     btn_learn.pack(side="right", padx=(0, 8))
+
+    # ---- everything set once, or not at all --------------------------------
+    # Hidden by default, and not because any of it is dangerous: it is because
+    # the panel is read under time pressure with a gun in one hand. Two of the
+    # controls below are superseded by the height gate on the front, two are
+    # raw sensor registers nobody touches twice, one is the undocumented mode
+    # byte, one is a diagnostic run when nothing works at all, and the size
+    # window and odd-one-out are set once for a room. Collapsed they cost the
+    # 25 px of this button; open they add 98, and the panel still fits the
+    # 313 px tab area a 768p laptop allows with the render test's margin to
+    # spare -- which the front rows and these together would NOT.
+    adv_state = {"on": False}
+
+    def adv_label():
+        return ("▾  Advanced settings" if adv_state["on"]
+                else "▸  Advanced settings")
+
+    def adv_toggle():
+        adv_state["on"] = not adv_state["on"]
+        btn_adv.config(text=adv_label())
+        if adv_state["on"]:
+            frame_adv.pack(fill="x")
+        else:
+            frame_adv.pack_forget()
+
+    rowadv = tk.Frame(frame_wii, bg=C_BG); rowadv.pack(fill="x", pady=(2, 0))
+    btn_adv = tk.Button(rowadv, text=adv_label(), command=adv_toggle,
+                        font=(F[0], 9), bg="#161b22", fg=C_DIM, relief="flat",
+                        anchor="w", padx=8, pady=1)
+    btn_adv.pack(side="left")
+    # The list is what makes a disclosure findable rather than a place things
+    # go to hide, and it is measured to the width the panel actually has: 154
+    # px of button and 8 of gap leave 421, and this is 392 of them.
+    lab(rowadv, "size window, odd-one-out, superseded limits, sensor "
+        "registers/test", (F[0], 8), C_DIM).pack(side="left", padx=(8, 0))
+    # Packed only when the button says so. Built now so nothing here has to be
+    # created on a click -- a widget built inside a Tk callback that raises
+    # leaves the disclosure permanently empty with only a traceback on a
+    # stderr the user does not have.
+    frame_adv = tk.Frame(frame_wii, bg=C_BG)
+
+    # No pady between these four rows, unlike every row on the front: 2 px a
+    # row is 8 px of the 36 the panel has left over with this open, and these
+    # are spinboxes set once rather than a readout scanned mid-test.
+    rowsz = tk.Frame(frame_adv, bg=C_BG); rowsz.pack(fill="x")
+    for key, name in (("bmin", "keep from size"), ("bmax", "up to")):
+        lab(rowsz, name, (F[0], 9), C_DIM).pack(side="left", padx=(0, 2))
+        gv = tk.IntVar(value=0 if key == "bmin" else 15)
+        bgate[key] = gv
+        sp = tk.Spinbox(rowsz, from_=0, to=15, width=3, textvariable=gv, font=F,
+                        bg="#161b22", fg=C_FG, relief="flat",
+                        command=lambda k=key, v=gv: gate_send(k, v))
+        sp.pack(side="left", padx=(0, 10))
+        sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
+        bspin[key] = sp
+    # Odd-one-out: four identical emitters should look alike in one frame, so a
+    # blob that does not match the others is the suspect. Needs no distance
+    # tuning, which is what defeats the absolute window beside it.
+    lab(rowsz, "odd-one-out steps", (F[0], 9), C_DIM).pack(side="left",
+                                                           padx=(4, 2))
+    gv = tk.IntVar(value=0)
+    bgate["rtol"] = gv
+    sp = tk.Spinbox(rowsz, from_=0, to=15, increment=1, width=4,
+                    textvariable=gv, font=F, bg="#161b22", fg=C_FG,
+                    relief="flat",
+                    command=lambda k="rtol", v=gv: gate_send(k, v))
+    sp.pack(side="left", padx=(2, 0))
+    sp.bind("<Return>", lambda _e, k="rtol", v=gv: gate_send(k, v))
+    bspin["rtol"] = sp
+
+    # The two shape limits the height gate replaced. Kept because a gun in the
+    # field may still be set on them and the panel must be able to say so and
+    # turn them off -- not because either is a good idea now.
+    rowsh = tk.Frame(frame_adv, bg=C_BG); rowsh.pack(fill="x")
+    lab(rowsh, "superseded by blob height:", (F[0], 8), C_DIM).pack(side="left")
+    shape_box(rowsh, "pxmax", "pixel count", PXMAX_STEPS)
+    # The one short clause there is room for. WHY it is wrong -- at
+    # sensitivity 2 the sensor smears a 2x2 blob out to 12x3, so the ratio
+    # measures the gain and not the LED -- goes to the log the moment anybody
+    # switches it on, which is the only moment it is worth reading.
+    shape_box(rowsh, "armax", "roundness", ARMAX_STEPS, "not recommended")
+
+    # Which byte selects full mode is the one thing about it nobody can look
+    # up: the driver's own working constants for the other two formats are the
+    # doubled nibble (0x11, 0x33), which makes 0x55 the consistent choice,
+    # while the published tables say the mode is simply 5. Both readings can be
+    # right, so the switch is here rather than in a reflash -- a user whose
+    # preview shows crosshairs outside their boxes has something to try.
+    rowfr = tk.Frame(frame_adv, bg=C_BG); rowfr.pack(fill="x")
+    cam_fullreg = tk.IntVar(value=85)
+
+    def send_fullreg():
+        v = cam_fullreg.get()
+        link.send("~cam=fullreg:%d" % v)
+        link.send("~camblob?")
+        log("full-mode register -> 0x%02x. Which byte this sensor wants for "
+            "full mode is not documented anywhere we trust, so it is a "
+            "setting rather than a reflash: if the preview draws boxes that "
+            "do not follow the LEDs, or crosshairs that miss their boxes, the "
+            "other value is the thing to try. Not saved -- 0x55 comes back on "
+            "the next power-cycle." % v)
+    lab(rowfr, "full-mode register", (F[0], 9), C_DIM).pack(side="left")
+    for rv, nm in ((85, "0x55"), (5, "0x05")):
+        tk.Radiobutton(rowfr, text=nm, value=rv, variable=cam_fullreg,
+                       command=send_fullreg, font=(F[0], 9), bg=C_BG, fg=C_FG,
+                       selectcolor="#161b22", activebackground=C_BG,
+                       activeforeground=C_FG, highlightthickness=0, bd=0
+                       ).pack(side="left")
+    # The two SENSOR thresholds ride on the register row: everything on it is
+    # a byte written straight into a camera register, and everything on the
+    # rows above it is judged on this side of the wire.
+    for key, lo, hi, step in (("hwmax", -1, 255, 5), ("hwmin", -1, 255, 1)):
+        lab(rowfr, "sensor %s" % ("max" if key == "hwmax" else "min"),
+            (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
+        gv = tk.IntVar(value=lo)
+        bgate[key] = gv
+        sp = tk.Spinbox(rowfr, from_=lo, to=hi, increment=step, width=4,
+                        textvariable=gv, font=F, bg="#161b22", fg=C_FG,
+                        relief="flat",
+                        command=lambda k=key, v=gv: gate_send(k, v))
+        sp.pack(side="left", padx=(2, 0))
+        sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
+        bspin[key] = sp
+
+    # Sensor connection test: which of power, wiring and the sensor itself is
+    # broken, straight from the gun's own pins -- and a live camera restart
+    # when the fault turns out to be fixed. Run once, when nothing works at
+    # all, which is exactly why it does not belong on the front of the panel.
+    rowdg = tk.Frame(frame_adv, bg=C_BG); rowdg.pack(fill="x")
+    tk.Button(rowdg, text="Test sensor connection", font=FB, bg="#1f6feb",
+              fg="white", relief="flat", padx=12, pady=2,
+              command=lambda: (link.send("~camdiag"),
+                               log("~camdiag sent -- the gun answers with "
+                                   "CAM: diag lines; the VERDICT line names "
+                                   "what is broken"))).pack(side="left")
+    # One line and a short one: measured, the button takes 229 px of the 590
+    # this panel gets and a Tk label that overruns its frame is clipped in
+    # silence -- the reader simply never sees the end of the sentence.
+    lab(rowdg, "checks power, both wires, swapped lines and the sensor",
+        (F[0], 8), C_DIM, justify="left").pack(side="left", padx=8)
+
+    # Which notebook pages the blob poll has to keep running for. Two names
+    # when the preview has a tab of its own, the same name twice when it does
+    # not -- and the poll is what feeds it, so a page missing from here is a
+    # preview frozen on whatever it happened to be showing.
+    cam_pages = (str(tab_cam), str(prev_page))
+    # Once now, so the canvas says what it is waiting for instead of sitting
+    # empty until the first reply arrives on a gun that may never send one.
+    draw_shapes()
 
     sliders = {}
     for k in CAM_KEYS:
@@ -1610,8 +2086,11 @@ def main():
                 try:
                     outdir = os.path.join(HERE, "calib_out")
                     os.makedirs(outdir, exist_ok=True)
-                    sweep_path = os.path.join(outdir,
-                        time.strftime("lenssweep-%Y%m%d-%H%M%S.log"))
+                    # Numbered like the captures, and for the same reason: a
+                    # sweep that failed and a sweep repeated straight away are
+                    # the pair most worth comparing, and the wall clock alone
+                    # let the second one land on the first.
+                    sweep_path, _seq = seq_path(outdir, "lenssweep", ".log")
                     with open(sweep_path, "w") as fh:
                         for i, q in enumerate(snap):
                             fh.write("Q,%d,4," % (i * 7) +
@@ -1999,8 +2478,11 @@ def main():
     def blob_tick_body():
         b = link.last.get("board") or ""
         # Compared as widget names, not tab indexes: an index silently means a
-        # different tab the moment one is added.
-        if "wiicam" in b and link.src and nb.select() == str(tab_cam):
+        # different tab the moment one is added. The preview is on this same
+        # page on a wide enough screen and on a page of its own otherwise, and
+        # it is fed from here -- left out, the fallback layout would draw one
+        # frame and then freeze on it for as long as its own tab was in front.
+        if "wiicam" in b and link.src and nb.select() in cam_pages:
             link.send("~camblob?")
             blob_rate.feed(link.last.get("bframes"), link.last.get("bms"))
             focused = None
@@ -2069,11 +2551,11 @@ def main():
                 unfed = "(sizes need fmt:1)" in raw
                 shown = []
                 for b in parse_blobs(raw):
-                    # Box and brightness only exist in full mode, so they are
+                    # Box and pixel count only exist in full mode, so they are
                     # shown only when the gun actually sent them -- a "box 0x0"
                     # printed in extended mode reads as a measured shape.
                     txt = "%d,%d size %d" % (b[0], b[1], b[2])
-                    if len(b) == 7:
+                    if len(b) in (7, 9):
                         txt += " box %dx%d %dpx" % (b[4], b[5], b[6])
                     if b[3] != 1:
                         txt += " DROPPED"
@@ -2085,6 +2567,9 @@ def main():
                     + ("   (size -1: nothing measured it -- set blob detail "
                        "to 'sizes')" if unfed else ""),
                     fg=C_FG if shown else C_BAD)
+            # Outside the `if raw`, because a gun that has answered nothing is
+            # the state the preview most needs to be honest about.
+            draw_shapes()
             keys = ("br4", "br3", "br2", "br1", "br0")
             now = [link.last.get(k) for k in keys]
             if None not in now:
@@ -2178,11 +2663,22 @@ def main():
             board_state["cur"] = b
             if "wiicam" in b:
                 frame_esp.pack_forget()
-                frame_wii.pack(fill="x")
-                log("board: %s -- camera tab switched to sensitivity" % b)
+                # side/expand, not a bare fill="x": the shape preview owns the
+                # right of this tab, and a panel packed to the top would sit
+                # under it and take the whole width back.
+                frame_wii.pack(side="left", fill="both", expand=True)
+                log("board: %s -- camera tab switched to sensitivity. That "
+                    "setting is kept in the OpenFIRE profile, not by 'Save to "
+                    "gun', and the blob noise figure above still measures on "
+                    "this board: the sensitivity buttons do not replace it."
+                    % b)
             else:
                 frame_wii.pack_forget()
-                frame_esp.pack(fill="x")
+                frame_esp.pack(side="left", fill="both", expand=True)
+            # The preview is fed from the blob poll, which never runs on a
+            # board that has no blob report -- so this is the only moment it
+            # can be told which board it is looking at.
+            draw_shapes()
         root.after(500, board_tick)
     root.after(500, board_tick)
 

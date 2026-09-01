@@ -108,8 +108,8 @@ bool aim_gate_clear(void);
 // the shape gate is off, which is also its default.
 //   pxmax  largest blob PIXEL COUNT kept, 0 = off
 //   armax  longest/shortest side, in EIGHTHS (8 = 1:1, 16 = 2:1), 0 = off
-bool aim_gate2_load(int* out_pxmax, int* out_armax);
-bool aim_gate2_store(int pxmax, int armax);
+bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax);
+bool aim_gate2_store(int pxmax, int armax, int bhmax);
 bool aim_gate2_clear(void);
 
 // The capture layer owns the lead value and how much of the quad was really

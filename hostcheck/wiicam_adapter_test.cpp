@@ -1001,42 +1001,115 @@ int main()
            "...and still writes nothing");
         g_ffail_on = 0;
 
-        // The box and the intensity are REPORTED, not gated: a discriminator
-        // invented before anyone has seen a real number out of it is the same
-        // guess the size window would have been. So '~camblob?' is the only
-        // way they reach anyone, and in full mode each tuple grows by three.
+        // The box, the intensity and the box ORIGIN are REPORTED, not gated: a
+        // discriminator invented before anyone has seen a real number out of
+        // it is the same guess the size window would have been. So
+        // '~camblob?' is the only way they reach anyone, and in full mode each
+        // tuple grows by five.
         ck(wiicam_aim_full_poll(fpx, fpy, fsz, &fseen) == 1, "a clean frame again");
         wiicam_cam_command("cam=fmt:2");
         t += DT;
         wiicam_aim_process_sz(fpx, fpy, fsz, fseen, t, &sx, &sy);
         g_replies.clear();
         wiicam_cam_command("camblob?");
-        int f[21];
+        int f[27];
         int got = 0;
         if (g_replies.size() >= 2)
             got = sscanf(g_replies[1].c_str(),
-                         "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                         " %d,%d,%d,%d,%d,%d,%d"
-                         " %d,%d,%d,%d,%d,%d,%d",
-                         &f[0],&f[1],&f[2],&f[3],&f[4],&f[5],&f[6],
-                         &f[7],&f[8],&f[9],&f[10],&f[11],&f[12],&f[13],
-                         &f[14],&f[15],&f[16],&f[17],&f[18],&f[19],&f[20]);
-        ck(got == 21,
-           "in full mode every blob tuple carries SEVEN fields: the four the "
-           "other formats have, plus box width, box height and intensity");
-        ck(got == 21 && f[2] == 3 && f[3] == 1,
+                         "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                         " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                         " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                         &f[0],&f[1],&f[2],&f[3],&f[4],&f[5],&f[6],&f[7],&f[8],
+                         &f[9],&f[10],&f[11],&f[12],&f[13],&f[14],&f[15],&f[16],&f[17],
+                         &f[18],&f[19],&f[20],&f[21],&f[22],&f[23],&f[24],&f[25],&f[26]);
+        ck(got == 27,
+           "in full mode every blob tuple carries NINE fields: the four the "
+           "other formats have, plus box width, box height, intensity and the "
+           "box origin's two coordinates");
+        ck(got == 27 && f[2] == 3 && f[3] == 1,
            "the first four are still position, size and the gate's verdict, "
            "in that order -- the extras are appended, not inserted");
-        ck(got == 21 && f[4] == 8 && f[5] == 12 && f[6] == 200,
+        ck(got == 27 && f[4] == 8 && f[5] == 12 && f[6] == 200,
            "object 0's box is 8x12 at intensity 200: its xMax arrived as 0x92 "
            "and the corners are SEVEN bit, so read as eight it would be a "
            "136-wide box on a blob three pixels across");
-        ck(got == 21 && f[11] == 4 && f[12] == 7 && f[13] == 255,
+        ck(got == 27 && f[13] == 4 && f[14] == 7 && f[15] == 255,
            "object 1's yMin arrived as 0x82; masked to 2 it still gives a "
            "positive height instead of collapsing to zero");
-        ck(got == 21 && f[18] == 0 && f[19] == 3 && f[20] == 1,
+        ck(got == 27 && f[22] == 0 && f[23] == 3 && f[24] == 1,
            "and a box whose xMax is BELOW its xMin reads as zero width, not "
            "as the 252 an unsigned subtraction wraps to");
+        // The ORIGIN is the same two bytes the width and the height are
+        // derived FROM, published raw. It is what settles what the box fields
+        // actually mean -- centre against reported position decides whether
+        // they are 7-bit native or something else -- so it has to arrive
+        // exactly as the sensor sent it, masked and not otherwise touched.
+        ck(got == 27 && f[7] == 10 && f[8] == 20,
+           "object 0's origin is its xMin,yMin, in that order -- 10,20 and not "
+           "20,10, which a transposed pair would be indistinguishable from on "
+           "a square box");
+        ck(got == 27 && f[16] == 1 && f[17] == 2,
+           "object 1's yMin arrived as 0x82 and is published as 2: the origin "
+           "is masked to seven bits like the corners it comes from, or the box "
+           "the report draws sits 128 rows down the frame from the blob");
+        ck(got == 27 && f[25] == 44 && f[26] == 50,
+           "and object 2 keeps its origin even though its xMax is BELOW its "
+           "xMin -- the width collapses to zero, the corner the sensor sent "
+           "does not");
+
+        // The same nine columns again on a frame where NO TWO FIELDS SHARE A
+        // VALUE, keep flags aside. The origin is two bytes of a nine-byte
+        // object, sitting immediately before the two corners it is subtracted
+        // from to make the width and the height -- so an index one byte off,
+        // a transposed pair, or a corner published in place of the origin are
+        // all arithmetic slips that produce a perfectly plausible box in a
+        // perfectly plausible place. Every one of them lands on a number that
+        // belongs to another column, and with all twenty-four distinct there
+        // is no column a wrong read can hide in.
+        static const FullObj UNIQ[4] = {
+        //     x     y  sz   xmn   ymn  xmx  ymx  inten
+            {  100, 200,  3,   71,   62,  80,  76, 181 },  // box  9x14 at 71,62
+            {  400, 300,  5,   88,   97, 110, 127, 203 },  // box 22x30 at 88,97
+            {  700, 500, 11, 0xC1, 0x93,  72,  53, 250 },  // box  7x34 at 65,19
+            { 1023,1023, 15,    0,    0,   0,   0,   0 },  // empty
+        };
+        memcpy(g_fobj, UNIQ, sizeof(g_fobj));
+        ck(wiicam_aim_full_poll(fpx, fpy, fsz, &fseen) == 1 && fseen == 0x7u,
+           "three more objects, and no number in the frame appears twice");
+        t += DT;
+        wiicam_aim_process_sz(fpx, fpy, fsz, fseen, t, &sx, &sy);
+        g_replies.clear();
+        wiicam_cam_command("camblob?");
+        int u[27];
+        int gotu = 0;
+        if (g_replies.size() >= 2)
+            gotu = sscanf(g_replies[1].c_str(),
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &u[0],&u[1],&u[2],&u[3],&u[4],&u[5],&u[6],&u[7],&u[8],
+                          &u[9],&u[10],&u[11],&u[12],&u[13],&u[14],&u[15],&u[16],&u[17],
+                          &u[18],&u[19],&u[20],&u[21],&u[22],&u[23],&u[24],&u[25],&u[26]);
+        ck(gotu == 27
+           && u[0] == 216 && u[1] == 46 && u[2] == 3 && u[3] == 1
+           && u[4] == 9 && u[5] == 14 && u[6] == 181
+           && u[7] == 71 && u[8] == 62,
+           "blob 0 reads 216,46,3,1,9,14,181,71,62 -- nine fields, the origin "
+           "the last two of them, xMin before yMin");
+        ck(gotu == 27
+           && u[9] == 146 && u[10] == 69 && u[11] == 5 && u[12] == 1
+           && u[13] == 22 && u[14] == 30 && u[15] == 203
+           && u[16] == 88 && u[17] == 97,
+           "blob 1 reads 146,69,5,1,22,30,203,88,97 -- its yMax is 127, the "
+           "largest a 7-bit corner holds, and the origin under it is still 97 "
+           "and not the 30 it was subtracted to make");
+        ck(gotu == 27
+           && u[18] == 76 && u[19] == 115 && u[20] == 11 && u[21] == 1
+           && u[22] == 7 && u[23] == 34 && u[24] == 250
+           && u[25] == 65 && u[26] == 19,
+           "and blob 2 reads 76,115,11,1,7,34,250,65,19 -- both origin bytes "
+           "arrived with the top bit set, 0xC1 and 0x93, and both come out "
+           "masked to seven bits rather than as 193 and 147");
 
         // Both reply lines come from ONE read of the count. Read separately,
         // the count came from one frame and the list from the next: 1.4% of
@@ -1078,7 +1151,7 @@ int main()
            "and in basic format it says why there are no sizes, naming the "
            "key that turns them on");
 
-        // ---- the box must travel with its own blob -------------------------
+        // ---- the box and its origin must travel with their own blob --------
         // The poll fills its box arrays by HARDWARE SLOT, 0..3 as the sensor
         // numbers them. Everything else in the report -- position, size, kept
         // -- is indexed by the blob's place in the COMPACTED seen list,
@@ -1087,6 +1160,13 @@ int main()
         // the empty slot is the LAST one: any other gap and blob 0 is printed
         // with slot 0's box, which belongs to no blob on screen and may be
         // left over from an earlier frame entirely.
+        //
+        // The ORIGIN arrives through the same two arrays and the same
+        // compaction, so it can go wrong in exactly the same way and has to be
+        // checked in exactly the same place. Every fixture below therefore
+        // gives each slot its OWN origin as well as its own box: with all four
+        // sharing one origin the columns would agree no matter which index
+        // they were read by, and the check would be measuring nothing.
         //
         // Which is the whole point of the instrumentation: a slot goes empty
         // exactly when a bright window has taken it, so the readout would
@@ -1115,41 +1195,55 @@ int main()
             wiicam_cam_command("camblob?");
             return g_replies.size() >= 2 ? g_replies[1] : std::string();
         };
-        int fb[28];
+        int fb[36];
         int gotb = 0;
 
-        // Slot ZERO empty. Every box and intensity below is distinct, so a
-        // tuple wearing the wrong one says which slot it was taken from.
+        // Slot ZERO empty. Every box, origin and intensity below is distinct,
+        // so a tuple wearing the wrong one says which slot it was taken from.
         static const FullObj GAP0[4] = {
         //    x     y  sz  xmn  ymn  xmx  ymx  inten
             { 1023,1023, 15,  0,   0,   0,   0,   0 },  // EMPTY
-            {  100, 200,  3, 10,  20,  18,  32, 111 },  // box  8x12
-            {  300, 250,  4, 10,  20,  30,  41, 122 },  // box 20x21
-            {  500, 300,  5, 10,  20,  50,  61, 133 },  // box 40x41
+            {  100, 200,  3, 10,  20,  18,  32, 111 },  // box  8x12 at 10,20
+            {  300, 250,  4, 31,  42,  51,  63, 122 },  // box 20x21 at 31,42
+            {  500, 300,  5, 53,  64,  93, 105, 133 },  // box 40x41 at 53,64
         };
         {
             const std::string ln = full_report(GAP0, 0xEu);
             gotb = sscanf(ln.c_str(),
-                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d",
-                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                          &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                          &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20]);
-            ck(qseen == 0xEu && gotb == 21,
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26]);
+            ck(qseen == 0xEu && gotb == 27,
                "slot 0 empty: the report lists the three blobs that are there");
-            ck(gotb == 21 && fb[2] == 3 && fb[4] == 8 && fb[5] == 12
+            ck(gotb == 27 && fb[2] == 3 && fb[4] == 8 && fb[5] == 12
                && fb[6] == 111,
                "and the FIRST tuple carries slot 1's box, because slot 1 is "
                "the first blob -- slot 0's box belongs to no blob on screen");
-            ck(gotb == 21 && fb[9] == 4 && fb[11] == 20 && fb[12] == 21
-               && fb[13] == 122,
+            ck(gotb == 27 && fb[11] == 4 && fb[13] == 20 && fb[14] == 21
+               && fb[15] == 122,
                "the second carries slot 2's, not slot 1's -- every entry after "
                "a gap is off by one the moment the box is read by slot");
-            ck(gotb == 21 && fb[16] == 5 && fb[18] == 40 && fb[19] == 41
-               && fb[20] == 133,
+            ck(gotb == 27 && fb[20] == 5 && fb[22] == 40 && fb[23] == 41
+               && fb[24] == 133,
                "and the third slot 3's, so the last real blob's box is printed "
                "at all rather than falling off the end of the list");
+            // The origin, through the same compaction. A LEADING empty slot is
+            // the arrangement the earlier slot/index bug hid in and the one it
+            // shipped in: read by the compacted index the first tuple gets
+            // slot 0's origin, which the poll cleared to 0,0 -- a box drawn at
+            // the top-left corner of the sensor for a blob that is nowhere
+            // near it, and 0,0 is exactly the value that reads as plausible.
+            ck(gotb == 27 && fb[7] == 10 && fb[8] == 20,
+               "the first tuple's origin is slot 1's 10,20 and not the empty "
+               "slot 0's cleared 0,0");
+            ck(gotb == 27 && fb[16] == 31 && fb[17] == 42
+               && fb[25] == 53 && fb[26] == 64,
+               "and the other two carry slot 2's and slot 3's -- the origin is "
+               "compacted through the same slot map as the box it belongs to, "
+               "not published one blob out of step with it");
         }
 
         // A gap in the MIDDLE shifts only the tail, so the first entries look
@@ -1157,34 +1251,40 @@ int main()
         // this bug that survives a glance at the readout.
         static const FullObj GAP2[4] = {
         //    x     y  sz  xmn  ymn  xmx  ymx  inten
-            {  110, 210,  6,  1,   2,  10,  15, 144 },  // box  9x13
-            {  310, 260,  7,  1,   2,  23,  25, 155 },  // box 22x23
+            {  110, 210,  6,  1,   2,  10,  15, 144 },  // box  9x13 at  1,2
+            {  310, 260,  7, 17,  23,  39,  46, 155 },  // box 22x23 at 17,23
             { 1023,1023, 15,  0,   0,   0,   0,   0 },  // EMPTY
-            {  510, 310,  8,  1,   2,  45,  47, 166 },  // box 44x45
+            {  510, 310,  8, 35,  41,  79,  86, 166 },  // box 44x45 at 35,41
         };
         {
             const std::string ln = full_report(GAP2, 0xBu);
             gotb = sscanf(ln.c_str(),
-                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d",
-                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                          &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                          &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20]);
-            ck(qseen == 0xBu && gotb == 21, "slot 2 empty: three blobs again");
-            ck(gotb == 21 && fb[4] == 9 && fb[5] == 13 && fb[6] == 144
-               && fb[11] == 22 && fb[12] == 23 && fb[13] == 155,
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26]);
+            ck(qseen == 0xBu && gotb == 27, "slot 2 empty: three blobs again");
+            ck(gotb == 27 && fb[4] == 9 && fb[5] == 13 && fb[6] == 144
+               && fb[13] == 22 && fb[14] == 23 && fb[15] == 155,
                "the two blobs BEFORE the gap keep their own boxes -- this is "
                "the shape of the bug that reads as fine until the tail");
-            ck(gotb == 21 && fb[16] == 8 && fb[18] == 44 && fb[19] == 45
-               && fb[20] == 166,
+            ck(gotb == 27 && fb[20] == 8 && fb[22] == 44 && fb[23] == 45
+               && fb[24] == 166,
                "and the one after it carries slot 3's box, not the empty "
                "slot 2's zeroes");
+            ck(gotb == 27 && fb[7] == 1 && fb[8] == 2
+               && fb[16] == 17 && fb[17] == 23 && fb[25] == 35 && fb[26] == 41,
+               "and the origins follow the same three blobs, the one past the "
+               "gap included -- a mid-frame gap shifts only the tail, which is "
+               "the version of this that survives a glance at the readout");
         }
 
-        // Leaving full mode. The box columns stop being printed, and there is
-        // nowhere for the last full frame's numbers to hide in a four-field
-        // tuple -- so count the commas rather than trusting the first one.
+        // Leaving full mode. The box and origin columns stop being printed,
+        // and there is nowhere for the last full frame's numbers to hide in a
+        // four-field tuple -- so count the commas rather than trusting the
+        // first one.
         wiicam_cam_command("cam=fmt:1");
         g_replies.clear();
         wiicam_cam_command("camblob?");
@@ -1199,7 +1299,8 @@ int main()
             }
             ck(commas == 9,
                "back in extended the three tuples carry four fields each and "
-               "nothing more: nine commas, not eighteen");
+               "nothing more: nine commas, not the twenty-four a full-mode "
+               "line of the same three blobs would carry");
         }
         // And going back to full mode must not resurrect them. The moment the
         // format is 2 again the box columns reappear, and until a full frame
@@ -1214,66 +1315,80 @@ int main()
         gotb = 0;
         if (g_replies.size() >= 2)
             gotb = sscanf(g_replies[1].c_str(),
-                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d",
-                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                          &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                          &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20]);
-        ck(gotb == 21 && fb[4] == 0 && fb[5] == 0 && fb[6] == 0
-           && fb[11] == 0 && fb[12] == 0 && fb[13] == 0
-           && fb[18] == 0 && fb[19] == 0 && fb[20] == 0,
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26]);
+        ck(gotb == 27 && fb[4] == 0 && fb[5] == 0 && fb[6] == 0
+           && fb[13] == 0 && fb[14] == 0 && fb[15] == 0
+           && fb[22] == 0 && fb[23] == 0 && fb[24] == 0,
            "a format round trip through extended leaves every box at zero "
            "until a full frame is read again");
+        // The ORIGIN arrays are cleared by the same leave-full-mode path, and
+        // they have to be: 1,2 and 17,23 left behind from the last full frame
+        // are a box drawn at a real place on the sensor for blobs measured in
+        // a format that never sent one, which is a more convincing lie than a
+        // stale width. Zero at least admits it knows nothing.
+        ck(gotb == 27 && fb[7] == 0 && fb[8] == 0
+           && fb[16] == 0 && fb[17] == 0 && fb[25] == 0 && fb[26] == 0,
+           "...and every origin with them, rather than the last full frame's "
+           "corners surviving the trip out of full mode and back");
 
         // An unseen slot reads as NO BOX, never as the box it had last frame.
         static const FullObj FOUR[4] = {
         //    x     y  sz  xmn  ymn  xmx  ymx  inten
-            { 120, 220,  2,  1,   2,  12,  15,  77 },   // box 11x13
-            { 320, 270,  6,  1,   2,  27,  35,  88 },   // box 26x33
-            { 520, 320,  9,  1,   2,  61,  66,  99 },   // box 60x64
-            { 720, 370, 11,  1,   2,  71,  76, 210 },   // box 70x74
+            { 120, 220,  2,  1,   2,  12,  15,  77 },   // box 11x13 at  1,2
+            { 320, 270,  6, 14,  19,  40,  52,  88 },   // box 26x33 at 14,19
+            { 520, 320,  9, 26,  31,  86,  95,  99 },   // box 60x64 at 26,31
+            { 720, 370, 11, 37,  43, 107, 117, 210 },   // box 70x74 at 37,43
         };
         static const FullObj THREE[4] = {
             { 120, 220,  2,  1,   2,  12,  15,  77 },
-            { 320, 270,  6,  1,   2,  27,  35,  88 },
-            { 520, 320,  9,  1,   2,  61,  66,  99 },
+            { 320, 270,  6, 14,  19,  40,  52,  88 },
+            { 520, 320,  9, 26,  31,  86,  95,  99 },
             { 1023,1023, 15, 0,   0,   0,   0,   0 },   // slot 3 goes dark
         };
         {
             const std::string ln = full_report(FOUR, 0xFu);
             gotb = sscanf(ln.c_str(),
-                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d",
-                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                          &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                          &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20],
-                          &fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],&fb[27]);
-            ck(qseen == 0xFu && gotb == 28,
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],
+                          &fb[27],&fb[28],&fb[29],&fb[30],&fb[31],&fb[32],&fb[33],&fb[34],&fb[35]);
+            ck(qseen == 0xFu && gotb == 36,
                "with no gap at all, four tuples and four boxes");
-            ck(gotb == 28 && fb[4] == 11 && fb[11] == 26 && fb[18] == 60
-               && fb[25] == 70,
+            ck(gotb == 36 && fb[4] == 11 && fb[13] == 26 && fb[22] == 60
+               && fb[31] == 70,
                "each the box of the blob it is printed beside -- the case "
                "where slot order and report order happen to be the same");
+            ck(gotb == 36 && fb[7] == 1 && fb[16] == 14 && fb[25] == 26
+               && fb[34] == 37,
+               "...and each its own origin, so the one arrangement where the "
+               "two indexings agree is on record as agreeing rather than "
+               "merely never having been looked at");
         }
         {
-            // Same three blobs, slot 3 dark. Nothing of slot 3's 70x74 at 210
-            // may appear anywhere in this frame's report.
+            // Same three blobs, slot 3 dark. Nothing of slot 3's 70x74 at 210,
+            // origin 37,43, may appear anywhere in this frame's report.
             const std::string ln = full_report(THREE, 0x7u);
             gotb = sscanf(ln.c_str(),
-                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d %d",
-                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                          &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                          &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20],
-                          &fb[21]);
-            ck(qseen == 0x7u && gotb == 21,
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d %d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],
+                          &fb[27]);
+            ck(qseen == 0x7u && gotb == 27,
                "the slot that went dark is dropped from the list, and no "
                "fourth tuple is printed from the frame before it");
-            ck(gotb == 21 && fb[4] == 11 && fb[11] == 26 && fb[18] == 60,
+            ck(gotb == 27 && fb[4] == 11 && fb[13] == 26 && fb[22] == 60,
                "the three that remain still wear their own boxes");
         }
         {
@@ -1285,19 +1400,83 @@ int main()
             // one row, and nothing downstream could tell.
             const std::string ln = full_report(THREE, 0xFu);
             gotb = sscanf(ln.c_str(),
-                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d"
-                          " %d,%d,%d,%d,%d,%d,%d",
-                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                          &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                          &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20],
-                          &fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],&fb[27]);
-            ck(gotb == 28 && fb[25] == 0 && fb[26] == 0 && fb[27] == 0,
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],
+                          &fb[27],&fb[28],&fb[29],&fb[30],&fb[31],&fb[32],&fb[33],&fb[34],&fb[35]);
+            ck(gotb == 36 && fb[31] == 0 && fb[32] == 0 && fb[33] == 0,
                "an unseen slot reads as no box at all -- 0x0 at intensity 0 "
                "-- rather than as the box it measured on the frame before");
-            ck(gotb == 28 && fb[4] == 11 && fb[11] == 26 && fb[18] == 60,
+            ck(gotb == 36 && fb[34] == 0 && fb[35] == 0,
+               "...and as no origin either: last frame's 37,43 printed beside "
+               "this frame's stale position is two moments in one row, and a "
+               "corner that really is on the sensor reads as more trustworthy "
+               "than a stale width does");
+            ck(gotb == 36 && fb[4] == 11 && fb[13] == 26 && fb[22] == 60,
                "and the blobs that ARE there are untouched by that");
+        }
+
+        // ---- the line at its WIDEST -----------------------------------------
+        // Four blobs, every field as many characters as the sensor can make
+        // it: a position at the far edge of 240x176 space, a size filling the
+        // nibble, a box origin up in three figures with a two-figure side
+        // beside it -- the two trade off inside the 7-bit corner, so this is
+        // the widest a real box gets -- and the intensity byte at 255.
+        //
+        // The tuple went from four fields to seven and then to nine, and each
+        // time the per-blob RESERVE the loop keeps back had to grow with it.
+        // Get that reserve wrong, or leave the buffer where it was, and the
+        // loop stops early: the fourth blob's tuple is simply not printed, the
+        // line is still well-formed, and every log drawn from it is quietly
+        // short a row in exactly the frames where all four corners were seen.
+        static const FullObj WIDEST[4] = {
+        //    x    y  sz  xmn  ymn  xmx  ymx  inten
+            {   0, 700, 15, 100, 104, 127, 127, 255 },   // box 27x23 at 100,104
+            { 100, 730, 15, 101, 105, 127, 127, 255 },   // box 26x22 at 101,105
+            { 200, 750, 15, 102, 106, 127, 127, 255 },   // box 25x21 at 102,106
+            { 300, 760, 15, 103, 107, 127, 127, 255 },   // box 24x20 at 103,107
+        };
+        {
+            const std::string ln = full_report(WIDEST, 0xFu);
+            gotb = sscanf(ln.c_str(),
+                          "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                          " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                          &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                          &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                          &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],
+                          &fb[27],&fb[28],&fb[29],&fb[30],&fb[31],&fb[32],&fb[33],&fb[34],&fb[35]);
+            ck(gotb == 36,
+               "four maximum-width blobs still print all four nine-field "
+               "tuples: 36 numbers, none of them lost to the buffer");
+            ck(gotb == 36 && fb[27] == 169 && fb[28] == 174 && fb[29] == 15
+               && fb[30] == 1 && fb[31] == 24 && fb[32] == 20 && fb[33] == 255
+               && fb[34] == 103 && fb[35] == 107,
+               "...and the LAST tuple is complete down to its final ymn, which "
+               "is the character a line one byte too long loses first");
+            ck(!ln.empty() && ln[ln.size() - 1] == '\n',
+               "...and the line still ends where it should: a reply cut off by "
+               "its own buffer loses the newline before it loses anything a "
+               "parser would notice");
+        }
+        {
+            // Line 1 grew with the same change -- three more gate keys since
+            // it was last sized -- and it is the longer of the two by far.
+            // Its last field is the one a short buffer eats.
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            const std::string l1 = g_replies.empty() ? std::string() : g_replies[0];
+            ck(l1.find("br0=") != std::string::npos
+               && !l1.empty() && l1[l1.size() - 1] == '\n',
+               "the counter line reaches br0, its last field, and ends in a "
+               "newline -- with bhmax added it is the longest reply the '~cam' "
+               "surface emits, and a truncated one drops the frame buckets the "
+               "percentages are computed from");
         }
         // The two reply lines go out back to back, and the camera poll does
         // not stop between them. Snapshotting the COUNT stopped the two lines
@@ -1330,22 +1509,23 @@ int main()
                 const char* pb = strstr(g_replies[0].c_str(), "bn=");
                 if (pb) sscanf(pb, "bn=%lu", &rbn);
                 gotb = sscanf(g_replies[1].c_str(),
-                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                              " %d,%d,%d,%d,%d,%d,%d"
-                              " %d,%d,%d,%d,%d,%d,%d %d",
-                              &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],
-                              &fb[7],&fb[8],&fb[9],&fb[10],&fb[11],&fb[12],&fb[13],
-                              &fb[14],&fb[15],&fb[16],&fb[17],&fb[18],&fb[19],&fb[20],
-                              &fb[21]);
+                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d %d",
+                              &fb[0],&fb[1],&fb[2],&fb[3],&fb[4],&fb[5],&fb[6],&fb[7],&fb[8],
+                              &fb[9],&fb[10],&fb[11],&fb[12],&fb[13],&fb[14],&fb[15],&fb[16],&fb[17],
+                              &fb[18],&fb[19],&fb[20],&fb[21],&fb[22],&fb[23],&fb[24],&fb[25],&fb[26],
+                              &fb[27]);
             }
-            ck(rbn == 3 && gotb == 21,
+            ck(rbn == 3 && gotb == 27,
                "a frame landing mid-reply changes neither line: still three "
                "counted and three listed, not four");
-            ck(gotb == 21 && fb[2] == 3 && fb[4] == 8
-               && fb[9] == 4 && fb[11] == 20
-               && fb[16] == 5 && fb[18] == 40,
-               "and they are the SAME three -- sizes and boxes from the frame "
-               "line 1 counted, not the one that arrived between the lines");
+            ck(gotb == 27 && fb[2] == 3 && fb[4] == 8 && fb[7] == 10
+               && fb[11] == 4 && fb[13] == 20 && fb[16] == 31
+               && fb[20] == 5 && fb[22] == 40 && fb[25] == 53,
+               "and they are the SAME three -- sizes, boxes and origins from "
+               "the frame line 1 counted, not the one that arrived between the "
+               "lines");
         }
         wiicam_cam_command("cam=fmt:0");
 
@@ -1436,7 +1616,7 @@ int main()
     // The 4-bit size is nearly useless on this rig: 52,624 confirmed LED blobs
     // came in at size 1 or 2 with no response to a 1.8x change of distance.
     // Full mode's bounding box and pixel count are a real measurement, and
-    // these two knobs gate on them -- as a ONE-CLASS envelope, both bounds
+    // these three knobs gate on them -- as a ONE-CLASS envelope, every bound
     // taken from what an LED has actually looked like, so the gate can only
     // ever refuse something outside everything anyone has measured.
     //
@@ -1450,7 +1630,7 @@ int main()
         wiicam_set_fullread_hook(full_hook);
         g_ffail_on = 0; g_fdrift = 0; g_fhdrdrift = 0;
         wiicam_cam_command("cam=res:0,dash:2,dashhz:0,mirx:1");
-        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,pxmax:0,armax:0");
+        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0");
         wiicam_cam_command("cam=fmt:2");
 
         int gpx[4] = {0, 0, 0, 0}, gpy[4] = {0, 0, 0, 0};
@@ -1505,6 +1685,166 @@ int main()
             { 256, 528, 1,  10, 20, 14, 24, 12 },
             { 768, 528, 1,  10, 20, 14, 24, 12 },
         };
+
+        // ---- bhmax: box HEIGHT, and the axis is the whole point ------------
+        // Measured over 11,996 confirmed blobs in daylight at sensitivity 2:
+        // 99.73% of LEDs come in at a box height of 7 or less and every stray
+        // in that capture ran 15 to 56. A cut at 10 caught 84% of them and
+        // cost ZERO LEDs -- a gap, not a trade-off. It is the first thing the
+        // shape gate looks at, before the pixel count and the ratio.
+        wiicam_cam_command("cam=bhmax:8,pxmax:0,armax:0");
+        static const FullObj AT_H8[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 14, 28, 12 },   // 4 wide, 8 tall
+            { 768, 240, 1,  10, 20, 14, 28, 12 },
+            { 256, 528, 1,  10, 20, 14, 28, 12 },
+            { 768, 528, 1,  10, 20, 14, 28, 12 },
+        };
+        ck(shape_n(AT_H8) == 4,
+           "a blob at EXACTLY bhmax is kept: 8 is the first height a user is "
+           "allowed to set and it has to admit a blob of that height, or the "
+           "tightest legal cut is one step tighter than it says it is");
+        static const FullObj OVER_H8[4] = {
+            { 256, 240, 1,  10, 20, 14, 28, 12 },
+            { 768, 240, 1,  10, 20, 14, 28, 12 },
+            { 256, 528, 1,  10, 20, 14, 28, 12 },
+            { 768, 528, 1,  10, 20, 14, 29, 12 },   // 9 tall -- one row over
+        };
+        {
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(OVER_H8) == 3,
+               "and one row over it the blob is dropped before the resolver -- "
+               "the whole knob is that boundary");
+            ck(blobstat("bsrej=") == s0 + 1,
+               "...counted once, in the shape gate's own counter");
+        }
+
+        // HEIGHT, not width, and not either-side-will-do. At sensitivity 2 the
+        // sensor smears HORIZONTALLY: the same LEDs went from a 2x2 box to
+        // 12x3 when the gain went up -- width x5.5, height x1.5. So width
+        // measures the gain and height measures the source, which is why this
+        // knob replaced the aspect gate rather than joining it. Judge the
+        // wrong axis and the gate throws away the smeared LEDs it was set to
+        // protect while the tall strays it exists for sail through.
+        //
+        // The blob COUNT cannot show this: one blob goes either way. Which one
+        // can, so that is what is read.
+        static const FullObj WIDE_VS_TALL[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 50, 23, 12 },   // 40 wide, 3 tall: an LED
+            { 768, 240, 1,  10, 20, 14, 32, 12 },   // 4 wide, 12 tall: a stray
+            { 256, 528, 1,  10, 20, 14, 24, 12 },   // an ordinary 4x4
+            { 768, 528, 1,  10, 20, 14, 24, 12 },
+        };
+        ck(shape_n(WIDE_VS_TALL) == 3, "a wide-and-short blob beside a tall "
+           "narrow one, and exactly one of them goes");
+        {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            int hb[27];
+            int goth = 0;
+            if (g_replies.size() >= 2)
+                goth = sscanf(g_replies[1].c_str(),
+                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                              &hb[0],&hb[1],&hb[2],&hb[3],&hb[4],&hb[5],&hb[6],&hb[7],&hb[8],
+                              &hb[9],&hb[10],&hb[11],&hb[12],&hb[13],&hb[14],&hb[15],&hb[16],&hb[17],
+                              &hb[18],&hb[19],&hb[20],&hb[21],&hb[22],&hb[23],&hb[24],&hb[25],&hb[26]);
+            ck(goth == 27 && hb[4] == 40 && hb[5] == 3 && hb[3] == 1,
+               "the 40-wide, 3-tall blob SURVIVES a height cut of 8 -- ten "
+               "times over the limit on the axis the gate does not judge, and "
+               "that is a smeared LED, which is the blob this knob exists to "
+               "keep");
+            ck(goth == 27 && hb[13] == 4 && hb[14] == 12 && hb[12] == 0,
+               "...and the 4-wide, 12-tall one is the one that goes: height is "
+               "what is measured, so the narrow blob fails the cut the wide "
+               "one passed. Judge width instead and this test still drops "
+               "exactly one blob -- the wrong one");
+        }
+
+        // ---- the height gate reaches the box through the SAME compaction ---
+        // Same bug as the pixel count's, and this is the one that shipped: the
+        // box arrays are filled by HARDWARE SLOT and everything the report
+        // shows walks the COMPACTED seen list, so a LEADING empty slot puts
+        // the two out of step. Slot 0 goes empty exactly when a bright source
+        // has taken it, which is the case the gate exists for.
+        static const FullObj GAP_TALL[4] = {
+        //    x     y  sz  xmn ymn xmx ymx  px
+            { 1023,1023, 15,  0,  0,  0,  0,  0 },   // EMPTY
+            {  256, 240,  1, 10, 20, 14, 32, 12 },   // the offender: 12 tall
+            {  768, 240,  1, 10, 20, 14, 24, 12 },
+            {  256, 528,  1, 10, 20, 14, 24, 12 },
+        };
+        ck(shape_n(GAP_TALL) == 2,
+           "with slot 0 empty and one of the three remaining blobs too tall, "
+           "two survive");
+        {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            int hb[27];
+            int goth = 0;
+            if (g_replies.size() >= 2)
+                goth = sscanf(g_replies[1].c_str(),
+                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                              &hb[0],&hb[1],&hb[2],&hb[3],&hb[4],&hb[5],&hb[6],&hb[7],&hb[8],
+                              &hb[9],&hb[10],&hb[11],&hb[12],&hb[13],&hb[14],&hb[15],&hb[16],&hb[17],
+                              &hb[18],&hb[19],&hb[20],&hb[21],&hb[22],&hb[23],&hb[24],&hb[25],&hb[26]);
+            ck(goth == 27 && hb[5] == 12 && hb[14] == 4 && hb[23] == 4,
+               "the FIRST listed blob is slot 1, and it is the one carrying "
+               "the 12-row box -- without that this check is measuring the "
+               "report's compaction rather than the gate's");
+            ck(goth == 27 && hb[3] == 0 && hb[12] == 1 && hb[21] == 1,
+               "...and it is the first listed blob the gate rejected. Read by "
+               "the compacted index instead, slot 0's cleared height of 0 "
+               "acquits it and the innocent blob one place down the list takes "
+               "the verdict -- two blobs wrong, the same count, and the "
+               "earlier version of exactly this bug shipped once already");
+        }
+
+        // Outside full mode there is no box, so there is nothing to judge and
+        // the gate stands down -- knob still set, box still sitting in the
+        // arrays from the last 37-byte read, because the poll on the other
+        // core goes on doing them until it notices the new epoch.
+        wiicam_cam_command("cam=fmt:1");
+        ck(shape_n(WIDE_VS_TALL) == 4,
+           "in extended the height gate does nothing at all, bhmax still set "
+           "and a freshly unpacked box sitting in the arrays");
+        wiicam_cam_command("cam=fmt:0");
+        ck(shape_n(WIDE_VS_TALL) == 4, "nor in basic, for the same reason");
+        wiicam_cam_command("cam=fmt:2");
+        ck(shape_n(WIDE_VS_TALL) == 3,
+           "...and full mode turns it straight back on, so what stood it down "
+           "was the format and not some latch it never got out of");
+
+        // The size window gets first refusal here too. A blob it has already
+        // thrown out is not the height gate's to throw out again: double
+        // counted, bsrej reads as evidence that bhmax is earning its place
+        // when the window did all the work, and bsrej is the number the knob
+        // gets tuned from.
+        wiicam_cam_command("cam=bmin:0,bmax:8");
+        static const FullObj TALL_AND_BIG[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240,  1, 10, 20, 14, 24, 12 },
+            { 768, 240,  1, 10, 20, 14, 24, 12 },
+            { 256, 528,  1, 10, 20, 14, 24, 12 },
+            { 768, 528, 14, 10, 20, 14, 32, 12 },   // size 14 AND 12 tall
+        };
+        {
+            const unsigned long w0 = blobstat("brej=");
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(TALL_AND_BIG) == 3,
+               "a blob that fails the size window and the height cut is "
+               "dropped -- once");
+            ck(blobstat("brej=") == w0 + 1,
+               "...by the window, which saw it first");
+            ck(blobstat("bsrej=") == s0,
+               "...and NOT counted again by the height gate, which never looks "
+               "at a blob that is already gone");
+        }
+        wiicam_cam_command("cam=bmin:0,bmax:15,bhmax:0");
 
         // ---- pxmax, and which side of it the bound falls on ----------------
         wiicam_cam_command("cam=pxmax:12,armax:0");
@@ -1607,29 +1947,29 @@ int main()
         {
             g_replies.clear();
             wiicam_cam_command("camblob?");
-            int gb[21];
+            int gb[27];
             int gotg = 0;
             if (g_replies.size() >= 2)
                 gotg = sscanf(g_replies[1].c_str(),
-                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
-                              " %d,%d,%d,%d,%d,%d,%d"
-                              " %d,%d,%d,%d,%d,%d,%d",
-                              &gb[0],&gb[1],&gb[2],&gb[3],&gb[4],&gb[5],&gb[6],
-                              &gb[7],&gb[8],&gb[9],&gb[10],&gb[11],&gb[12],&gb[13],
-                              &gb[14],&gb[15],&gb[16],&gb[17],&gb[18],&gb[19],&gb[20]);
-            ck(gotg == 21 && gb[6] == 40 && gb[13] == 12 && gb[20] == 12,
+                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d,%d,%d",
+                              &gb[0],&gb[1],&gb[2],&gb[3],&gb[4],&gb[5],&gb[6],&gb[7],&gb[8],
+                              &gb[9],&gb[10],&gb[11],&gb[12],&gb[13],&gb[14],&gb[15],&gb[16],&gb[17],
+                              &gb[18],&gb[19],&gb[20],&gb[21],&gb[22],&gb[23],&gb[24],&gb[25],&gb[26]);
+            ck(gotg == 27 && gb[6] == 40 && gb[15] == 12 && gb[24] == 12,
                "the FIRST listed blob is slot 1, and it is the one carrying "
                "the 40 pixels -- without that this check is measuring the "
                "report's compaction rather than the gate's");
-            ck(gotg == 21 && gb[3] == 0 && gb[10] == 1 && gb[17] == 1,
+            ck(gotg == 27 && gb[3] == 0 && gb[12] == 1 && gb[21] == 1,
                "...and it is the first listed blob the gate rejected: judged "
                "by the compacted index instead, slot 0's cleared box would "
                "have acquitted it and an innocent blob further down the list "
                "would have taken the verdict in its place");
         }
 
-        // ---- both knobs at once, and then the format that switches them off -
-        wiicam_cam_command("cam=pxmax:12,armax:16");
+        // ---- two knobs at once, and then the format that switches them off --
+        wiicam_cam_command("cam=bhmax:0,pxmax:12,armax:16");
         static const FullObj MIXED[4] = {
         //    x    y  sz  xmn ymn xmx ymx  px
             { 256, 240, 1,  10, 20, 14, 24, 12 },   // an LED
@@ -1662,14 +2002,81 @@ int main()
            "...and full mode turns it straight back on, so what stood the "
            "gate down was the format and not some latch it never got out of");
 
-        // Off is off. Both knobs at 0 is the shipped state, and it has to be
-        // the state a user can get back to by hand.
-        wiicam_cam_command("cam=pxmax:0,armax:0");
+        // ---- all THREE knobs live at once -----------------------------------
+        // Three tests in one pass over the same keep[], and the failure worth
+        // catching is not that one of them stops working -- it is that they
+        // interfere. A blob one knob condemned and another quietly acquitted
+        // looks exactly like a knob that is simply set too loose, and a blob
+        // counted once per knob it fails inflates bsrej by most on the frames
+        // where the strays are worst.
+        //
+        // One offender per frame, of a different kind each time, with all
+        // three knobs set the whole way through. Each blob is built to fail
+        // ONE test and pass the other two: the 12x12 is perfectly square and
+        // 12 pixels, so only its height is out; the 4x4 at 40 pixels is short
+        // and round; the 20x4 is short and 12 pixels.
+        wiicam_cam_command("cam=bhmax:8,pxmax:12,armax:16");
+        static const FullObj TALL_ONE[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 22, 32, 12 },   // 12x12: too TALL only
+        };
+        static const FullObj FAT_ONE[4] = {
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 14, 24, 40 },   // 4x4 at 40px: too FAT only
+        };
+        static const FullObj LONG_ONE[4] = {
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 30, 24, 12 },   // 20x4, 5:1: too LONG only
+        };
         {
             const unsigned long s0 = blobstat("bsrej=");
-            ck(shape_n(MIXED) == 4,
-               "with both knobs at 0 the gate is inert, in full mode, on the "
-               "frame it had just been shredding");
+            ck(shape_n(TALL_ONE) == 3,
+               "with all three knobs set, the height cut drops its own blob "
+               "and neither of the other two rescues it");
+            ck(shape_n(FAT_ONE) == 3,
+               "...the pixel count drops its own, past a height cut that is "
+               "perfectly happy with a 4x4");
+            ck(shape_n(LONG_ONE) == 3,
+               "...and the ratio drops its own, past a height cut that is "
+               "perfectly happy with a 20x4 -- which is also why the ratio is "
+               "still worth having beside a knob that only looks at height");
+            ck(blobstat("bsrej=") == s0 + 3,
+               "three frames, three rejections, all in the one counter the "
+               "shape gate is tuned from");
+        }
+        static const FullObj TALL_AND_FAT[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 22, 32, 40 },   // 12x12 AND 40 pixels
+        };
+        {
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(TALL_AND_FAT) == 3,
+               "and a blob that fails TWO of the three is still one blob");
+            ck(blobstat("bsrej=") == s0 + 1,
+               "...counted ONCE. Counted per knob it fails, bsrej would run "
+               "ahead of the number of blobs there were, and the readout the "
+               "gate is set from would say the shape knobs were catching more "
+               "than the sensor ever sent");
+        }
+
+        // Off is off. All three knobs at 0 is the shipped state, and it has to
+        // be the state a user can get back to by hand.
+        wiicam_cam_command("cam=bhmax:0,pxmax:0,armax:0");
+        {
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(TALL_AND_FAT) == 4,
+               "with all three knobs at 0 the gate is inert, in full mode, on "
+               "the frame it had just been shredding");
             ck(blobstat("bsrej=") == s0,
                "...and counts nothing either: a gate that is off must not be "
                "reporting rejections it did not make");
@@ -1755,15 +2162,16 @@ int main()
 
         // ---- the refusals ----------------------------------------------------
         // Refused BELOW the measured envelope rather than clamped up to it. A
-        // pxmax under 12 or an armax under 16 would reject blobs we have
-        // watched 52,624 real LEDs produce, and a gate that can do that is not
-        // a gate, it is an outage waiting for the right angle. Clamping would
-        // hide the mistake; refusing by name puts it on the wire.
-        // Standing at 14 and 20 rather than at the bound itself, so "the value
-        // did not move" can tell a refusal apart from a silent clamp up to the
-        // bound -- which is the shape this mistake actually takes, and which
-        // would look identical from a gate standing at 12 and 16.
-        wiicam_cam_command("cam=pxmax:14,armax:20");
+        // bhmax under 8, a pxmax under 12 or an armax under 16 would reject
+        // blobs we have watched real LEDs produce, and a gate that can do that
+        // is not a gate, it is an outage waiting for the right angle. Clamping
+        // would hide the mistake; refusing by name puts it on the wire.
+        // Standing at 10, 14 and 20 rather than at the bounds themselves, so
+        // "the value did not move" can tell a refusal apart from a silent
+        // clamp up to the bound -- which is the shape this mistake actually
+        // takes, and which would look identical from a gate standing at 8, 12
+        // and 16.
+        wiicam_cam_command("cam=bhmax:10,pxmax:14,armax:20");
         g_replies.clear();
         wiicam_cam_command("cam=pxmax:11");
         ck(!g_replies.empty()
@@ -1790,30 +2198,69 @@ int main()
            && g_replies[0].find("armax=20 ") != std::string::npos,
            "...and it stays where it was, at 20 and not at the bound");
 
+        // bhmax's floor is 8, and it is not arbitrary: across 11,996 confirmed
+        // blobs in daylight 99.73% of LEDs came in at a box height of 7 or
+        // less, and the strays ran 15 to 56. Seven is one step into the LEDs
+        // and it is the value a spinner walking down from 8 lands on.
+        g_replies.clear();
+        wiicam_cam_command("cam=bhmax:7");
+        ck(!g_replies.empty()
+           && g_replies[0].find("bhmax below 8") != std::string::npos,
+           "bhmax:7 is refused BY NAME -- one row under the envelope starts "
+           "eating the measured LEDs, and the whole reason this knob is worth "
+           "having is that at 8 and above it costs none of them");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=10 ") != std::string::npos,
+           "...and the value does not move -- not to 7, and not quietly up to "
+           "8 either: standing at 10 is what tells a refusal apart from a "
+           "clamp, and a clamp would leave behind the tightest legal gate on "
+           "a gun whose user was trying to loosen it");
+
         // The envelope itself is the first legal value on each knob.
         g_replies.clear();
-        wiicam_cam_command("cam=pxmax:12,armax:16");
+        wiicam_cam_command("cam=bhmax:8,pxmax:12,armax:16");
         ck(g_replies.size() == 1
            && g_replies[0].find("CMD ok (tune)") != std::string::npos,
-           "12 and 16 -- the envelope itself -- are accepted with no refusal "
-           "line at all");
+           "8, 12 and 16 -- the envelope itself -- are accepted with no "
+           "refusal line at all");
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=8 ") != std::string::npos
            && g_replies[0].find("pxmax=12 ") != std::string::npos
            && g_replies[0].find("armax=16 ") != std::string::npos,
-           "...and they really land, which is also what says the two refusals "
-           "above left 14 and 20 in place rather than never writing at all");
-        wiicam_cam_command("cam=pxmax:14,armax:20");
+           "...and they really land, which is also what says the refusals "
+           "above left 10, 14 and 20 in place rather than never writing at "
+           "all");
+        // The two values a tool's own ladder offers above the bound. 10 is the
+        // cut the capture actually recommends -- 84% of the strays, zero LEDs
+        // -- so it had better be typeable.
+        g_replies.clear();
+        wiicam_cam_command("cam=bhmax:10");
+        ck(g_replies.size() == 1
+           && g_replies[0].find("not set") == std::string::npos
+           && g_replies[0].find("bhmax=10 ") != std::string::npos,
+           "bhmax:10, the cut the daylight capture recommends, is accepted");
+        g_replies.clear();
+        wiicam_cam_command("cam=bhmax:12");
+        ck(g_replies.size() == 1
+           && g_replies[0].find("not set") == std::string::npos
+           && g_replies[0].find("bhmax=12 ") != std::string::npos,
+           "and so is bhmax:12 -- the refusal is a floor, not a whitelist of "
+           "the two values someone happened to try");
+        wiicam_cam_command("cam=bhmax:10,pxmax:14,armax:20");
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=10 ") != std::string::npos
            && g_replies[0].find("pxmax=14 ") != std::string::npos
            && g_replies[0].find("armax=20 ") != std::string::npos,
-           "and so are 14 and 20, a step of margin outside it -- the gate is "
-           "only ever allowed to be LOOSER than what was measured");
+           "and so are 10, 14 and 20, a step of margin outside it -- the gate "
+           "is only ever allowed to be LOOSER than what was measured");
 
-        // Zero is always legal, on both knobs, from any value. It is off, and
+        // Zero is always legal, on every knob, from any value. It is off, and
         // off is the state a user reaches for when the gate is the suspect.
         g_replies.clear();
         wiicam_cam_command("cam=pxmax:0");
@@ -1826,53 +2273,76 @@ int main()
            && g_replies[0].find("not set") == std::string::npos,
            "and neither is armax:0");
         g_replies.clear();
-        wiicam_cam_command("cam?");
-        ck(!g_replies.empty()
-           && g_replies[0].find("pxmax=0 ") != std::string::npos
-           && g_replies[0].find("armax=0 ") != std::string::npos,
-           "...and both really do land, so the one way out of a bad shape "
-           "gate is reachable by hand");
-
-        // Out of range at the top clamps rather than wrapping: both fields are
-        // six bits in the stored word, and an unclamped 200 comes back as 8.
-        wiicam_cam_command("cam=pxmax:999,armax:1000");
+        wiicam_cam_command("cam=bhmax:0");
+        ck(g_replies.size() == 1
+           && g_replies[0].find("not set") == std::string::npos,
+           "nor bhmax:0 -- 0 is below 8 arithmetically and it is the one value "
+           "below 8 that must never be refused, because it is how the knob is "
+           "switched off");
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=0 ") != std::string::npos
+           && g_replies[0].find("pxmax=0 ") != std::string::npos
+           && g_replies[0].find("armax=0 ") != std::string::npos,
+           "...and all three really do land, so the one way out of a bad shape "
+           "gate is reachable by hand");
+
+        // Out of range at the top clamps rather than wrapping: all three
+        // fields are six bits in the stored word, and an unclamped 200 comes
+        // back as 8.
+        wiicam_cam_command("cam=bhmax:99,pxmax:999,armax:1000");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=63 ") != std::string::npos
            && g_replies[0].find("pxmax=63 ") != std::string::npos
            && g_replies[0].find("armax=63 ") != std::string::npos,
            "a value past the top clamps to 63, the widest the stored field "
            "holds -- wrapping it would turn an absurdly loose gate into a "
            "tight one nobody asked for");
-        wiicam_cam_command("cam=pxmax:-5,armax:-5");
+        wiicam_cam_command("cam=bhmax:-5,pxmax:-5,armax:-5");
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=0 ") != std::string::npos
            && g_replies[0].find("pxmax=0 ") != std::string::npos
            && g_replies[0].find("armax=0 ") != std::string::npos,
            "and a negative one is off, not a refusal: the clamp runs first, so "
-           "typing a minus to mean 'no limit' does what it looks like");
+           "typing a minus to mean 'no limit' does what it looks like, on "
+           "bhmax as well -- a -5 that reached the floor check would be "
+           "refused for being under 8 and the minus would do nothing");
 
-        // ---- where the two knobs are reported --------------------------------
-        wiicam_cam_command("cam=pxmax:14,armax:20");
+        // ---- where the three knobs are reported ------------------------------
+        // Position, not just presence. The tools read these lines by name AND
+        // positionally, so a key inserted anywhere but where it is documented
+        // shifts every column after it in every log drawn from them. bhmax
+        // goes immediately before pxmax on all three lines.
+        wiicam_cam_command("cam=bhmax:10,pxmax:14,armax:20");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=10 pxmax=14 armax=20 ")
+              != std::string::npos,
+           "cam? carries all three, bhmax first and immediately before pxmax");
         g_replies.clear();
         wiicam_cam_command("camblob?");
         ck(!g_replies.empty()
-           && g_replies[0].find("pxmax=14 ") != std::string::npos
-           && g_replies[0].find("armax=20 ") != std::string::npos,
-           "the blob line carries both knobs, so the capture a gate is chosen "
-           "from records the gate that was in force while it was taken");
+           && g_replies[0].find("bhmax=10 pxmax=14 armax=20 ")
+              != std::string::npos,
+           "so does the blob line, in the same order, so the capture a gate is "
+           "chosen from records the gate that was in force while it was taken");
         g_replies.clear();
         wiicam_cam_command("cam=armax:20");
         ck(!g_replies.empty()
            && g_replies.back().find("CMD ok (tune)") != std::string::npos
-           && g_replies.back().find("pxmax=14 ") != std::string::npos
-           && g_replies.back().find("armax=20 ") != std::string::npos,
+           && g_replies.back().find("bhmax=10 pxmax=14 armax=20 ")
+              != std::string::npos,
            "and so does the tune echo, which is the only reply a tool gets "
            "back from a 'cam=' line and therefore the only place it can read "
            "what actually took");
 
-        wiicam_cam_command("cam=pxmax:0,armax:0,fmt:0");
+        wiicam_cam_command("cam=bhmax:0,pxmax:0,armax:0,fmt:0");
         wiicam_set_fullread_hook(0);
     }
 
@@ -2003,32 +2473,66 @@ int main()
     // is most of what is checked here: neither may answer for the other, erase
     // the other, or be readable out of the other's bits.
     {
-        int gp = -1, ga = -1;
-        ck(aim_gate2_store(12, 20), "the shape gate stores as one word");
-        ck(aim_gate2_load(&gp, &ga), "and loads back");
-        ck(gp == 12 && ga == 20,
-           "with both knobs intact and not swapped -- pxmax and armax are the "
-           "same width, so an exchanged pair is two plausible numbers");
+        int gp = -1, ga = -1, gb = -1;
+        ck(aim_gate2_store(12, 20, 34), "the shape gate stores as one word");
+        ck(aim_gate2_load(&gp, &ga, &gb), "and loads back");
+        ck(gp == 12 && ga == 20 && gb == 34,
+           "with all three knobs intact and none of them swapped -- bhmax, "
+           "pxmax and armax are the same width and none of the three values is "
+           "out of range for the other two, so any permutation of them is "
+           "three plausible numbers");
         // Six bits each, so an unclamped value does not merely come back
         // wrong: it bleeds into the field above it.
-        ck(aim_gate2_store(-3, 99), "an out-of-range pair still stores");
-        ck(aim_gate2_load(&gp, &ga) && gp == 0 && ga == 63,
-           "clamped on the way in, so an armax of 99 cannot land a carry bit "
-           "in the pxmax field above it and turn a gate nobody set into one "
+        ck(aim_gate2_store(-3, 99, 200), "an out-of-range triple still stores");
+        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 0 && ga == 63 && gb == 63,
+           "clamped on the way in, each on its own, so an armax of 99 cannot "
+           "land a carry bit in the pxmax field above it -- nor a bhmax of 200 "
+           "spill out of the top field -- and turn a gate nobody set into one "
            "that rejects blobs");
+        // Aliasing, one field at a time. Three fields packed into one word can
+        // come back right on a store of three DIFFERENT values and still be
+        // wrong: two of them sharing bits reads correctly whenever the shared
+        // bits happen to agree. A one-hot store cannot hide that -- the value
+        // has to appear in its own slot and in NEITHER of the other two.
+        ck(aim_gate2_store(9, 0, 0)
+           && aim_gate2_load(&gp, &ga, &gb) && gp == 9 && ga == 0 && gb == 0,
+           "a pxmax on its own reads back as a pxmax on its own");
+        ck(aim_gate2_store(0, 9, 0)
+           && aim_gate2_load(&gp, &ga, &gb) && gp == 0 && ga == 9 && gb == 0,
+           "...and an armax on its own as an armax");
+        ck(aim_gate2_store(0, 0, 9)
+           && aim_gate2_load(&gp, &ga, &gb) && gp == 0 && ga == 0 && gb == 9,
+           "...and a bhmax on its own as a bhmax: the field added last is the "
+           "one that could have been laid on top of an existing one, and a gun "
+           "with only bhmax set would then boot with a pixel-count gate it was "
+           "never given");
         // A stale or foreign word must read as NOTHING STORED. The tag is the
         // only thing that can tell the difference, and it is the whole reason
         // the second key could be added without disturbing the first.
         nvs_set_u32(1, "gate1", 0x00005678u);
-        gp = ga = -1;
-        ck(!aim_gate2_load(&gp, &ga),
+        gp = ga = gb = -1;
+        ck(!aim_gate2_load(&gp, &ga, &gb),
            "an untagged word is 'nothing stored', not a shape gate");
-        ck(gp == -1 && ga == -1,
+        ck(gp == -1 && ga == -1 && gb == -1,
            "and the caller's own defaults are left exactly where they were -- "
-           "wiicam_aim_begin passes in the shipped 0,0 and a load that wrote "
+           "wiicam_aim_begin passes in the shipped 0,0,0 and a load that wrote "
            "before it failed would gate a gun that never asked for it");
+        // A gun flashed while the shape gate had only TWO fields. Its 'gate1'
+        // is tagged and perfectly valid; the top field simply was not written,
+        // so it reads as zero. That has to come out as the two knobs it saved
+        // and NO height gate -- read as garbage, or refused for not carrying a
+        // third value, a gun that had a working shape gate either boots with a
+        // height cut nobody set or loses the gate it did set.
+        nvs_set_u32(1, "gate1", 0x6A000000u | (12u << 6) | 20u);
+        gp = ga = gb = -1;
+        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20,
+           "an old two-field word still loads its pxmax and its armax");
+        ck(gb == 0,
+           "...with bhmax reading 0 -- off, which is what a gun that never had "
+           "the knob was running, and not whatever the bits above the old "
+           "payload happen to hold");
         ck(aim_gate2_clear(), "clearing it succeeds");
-        ck(!aim_gate2_load(&gp, &ga), "after which nothing is stored");
+        ck(!aim_gate2_load(&gp, &ga, &gb), "after which nothing is stored");
         ck(aim_gate2_clear(),
            "and clearing an ALREADY absent key is not a failure -- camreset "
            "erases both gates on every gun it runs on, including the ones that "
@@ -2036,25 +2540,26 @@ int main()
 
         // ---- the two keys do not touch each other --------------------------
         int sf = -1, smn = -1, smx = -1, srt = -1;
-        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20),
+        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34),
            "a gun with both gates saved");
         ck(aim_gate_load(&sf, &smn, &smx, &srt)
            && sf == 1 && smn == 4 && smx == 11 && srt == 6,
            "the size window reads back its own four fields with a shape gate "
            "written after it");
-        ck(aim_gate2_load(&gp, &ga) && gp == 12 && ga == 20,
-           "and the shape gate its own two -- one key never answers for the "
+        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
+           "and the shape gate its own three -- one key never answers for the "
            "other, which sharing a key is precisely how they would");
         ck(aim_gate2_clear(), "clear the shape gate on its own");
-        ck(!aim_gate2_load(&gp, &ga), "...it is gone");
+        ck(!aim_gate2_load(&gp, &ga, &gb), "...it is gone");
         sf = smn = smx = srt = -1;
         ck(aim_gate_load(&sf, &smn, &smx, &srt)
            && sf == 1 && smn == 4 && smx == 11 && srt == 6,
            "...and the size window is untouched: erasing one gate must not "
            "take the other down with it");
-        ck(aim_gate2_store(12, 20) && aim_gate_clear(), "now the other way up");
+        ck(aim_gate2_store(12, 20, 34) && aim_gate_clear(),
+           "now the other way up");
         ck(!aim_gate_load(&sf, &smn, &smx, &srt), "the size window is gone");
-        ck(aim_gate2_load(&gp, &ga) && gp == 12 && ga == 20,
+        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
            "...and the shape gate outlives it");
         // Corruption travels no further than its own key either. A word that
         // fails its tag check is one unreadable setting, not two.
@@ -2062,11 +2567,11 @@ int main()
         nvs_set_u32(1, "gate0", 0x00001234u);
         ck(!aim_gate_load(&sf, &smn, &smx, &srt),
            "a corrupt size-gate word reads as nothing stored");
-        ck(aim_gate2_load(&gp, &ga) && gp == 12 && ga == 20,
+        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
            "...and the shape gate beside it is still perfectly readable");
         ck(aim_gate_store(1, 4, 11, 6), "repair the size gate");
         nvs_set_u32(1, "gate1", 0x00005678u);
-        ck(!aim_gate2_load(&gp, &ga),
+        ck(!aim_gate2_load(&gp, &ga, &gb),
            "and a corrupt shape-gate word reads as nothing stored too");
         sf = smn = smx = srt = -1;
         ck(aim_gate_load(&sf, &smn, &smx, &srt) && smn == 4 && smx == 11,
@@ -2079,7 +2584,7 @@ int main()
         // out of the other key's bits, the perfectly ordinary saved gate
         // fmt:1 bmin:4 bmax:11 rtol:6 spells pxmax=18 armax=54 -- a shape gate
         // on a gun that has never had one, dropping blobs nobody asked it to.
-        wiicam_cam_command("cam=pxmax:0,armax:0");   // as the statics ship
+        wiicam_cam_command("cam=bhmax:0,pxmax:0,armax:0");   // as the statics ship
         ck(aim_gate_store(1, 4, 11, 6), "an old gun's saved size window");
         ck(aim_gate2_clear(), "...and nothing at all under the second key");
         wiicam_aim_begin();
@@ -2092,41 +2597,48 @@ int main()
            && g_replies[0].find("rtol=6") != std::string::npos,
            "it boots with its size window exactly as it was saved");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=0 ") != std::string::npos
            && g_replies[0].find("pxmax=0 ") != std::string::npos
            && g_replies[0].find("armax=0 ") != std::string::npos,
-           "...and the shape gate off: an absent 'gate1' means no shape gate, "
-           "never a gate of zeroes and never one read out of gate0");
+           "...and the shape gate off, height cut included: an absent 'gate1' "
+           "means no shape gate, never a gate of zeroes and never one read out "
+           "of gate0");
 
         // ---- end to end through the serial surface ---------------------------
-        wiicam_cam_command("cam=pxmax:14,armax:20");
+        wiicam_cam_command("cam=bhmax:10,pxmax:14,armax:20");
         g_replies.clear();
         wiicam_cam_command("camsave");
         ck(!g_replies.empty()
-           && g_replies[0].find("pxmax=14") != std::string::npos
-           && g_replies[0].find("armax=20") != std::string::npos,
-           "camsave names the shape gate it wrote alongside the size one, so a "
-           "tool can VERIFY what landed rather than assume it");
-        ck(aim_gate2_load(&gp, &ga) && gp == 14 && ga == 20,
-           "...and the second word really holds both knobs -- the reply is not "
-           "the thing that decides what the next boot does");
+           && g_replies[0].find("bhmax=10 pxmax=14 armax=20")
+              != std::string::npos,
+           "camsave names all three shape knobs it wrote alongside the size "
+           "one, bhmax immediately before pxmax as everywhere else, so a tool "
+           "can VERIFY what landed rather than assume it");
+        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 14 && ga == 20 && gb == 10,
+           "...and the second word really holds all three knobs -- the reply "
+           "is not the thing that decides what the next boot does");
         {
             int cf = -1, cmn = -1, cmx = -1, crt = -1;
             ck(aim_gate_load(&cf, &cmn, &cmx, &crt) && cmn == 4 && cmx == 11,
                "...and the size window it was saved beside is still there, "
                "written to its own key in the same camsave");
         }
-        wiicam_cam_command("cam=pxmax:0,armax:0");   // forget the live copy
+        // Forget the live copy. bhmax goes to a DIFFERENT wrong value from the
+        // other two, so a reboot that restored the three fields in the wrong
+        // order could not be mistaken for one that restored them at all.
+        wiicam_cam_command("cam=bhmax:0,pxmax:0,armax:0");
         wiicam_aim_begin();
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
-           && g_replies[0].find("pxmax=14 ") != std::string::npos
-           && g_replies[0].find("armax=20 ") != std::string::npos,
-           "a reboot brings the shape gate back, which is the only reason it "
-           "is worth saving and also the only reason camreset has to erase it");
+           && g_replies[0].find("bhmax=10 pxmax=14 armax=20 ")
+              != std::string::npos,
+           "a reboot brings the shape gate back with all three knobs in their "
+           "own slots, which is the only reason it is worth saving and also "
+           "the only reason camreset has to erase it");
         g_replies.clear();
         wiicam_cam_command("camreset");
-        ck(!aim_gate2_load(&gp, &ga),
+        ck(!aim_gate2_load(&gp, &ga, &gb),
            "camreset erases the saved shape gate too: a gate that stops the "
            "gun aiming would otherwise come back on the next boot and the one "
            "command a user reaches for when nothing works would fix the "
@@ -2134,14 +2646,17 @@ int main()
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=0 ") != std::string::npos
            && g_replies[0].find("pxmax=0 ") != std::string::npos
            && g_replies[0].find("armax=0 ") != std::string::npos,
-           "...and the LIVE knobs go to 0 with it, so the recovery command "
-           "does not leave the gate running until the next power cycle");
+           "...and the LIVE knobs go to 0 with it, the height cut included, so "
+           "the recovery command does not leave the gate running until the "
+           "next power cycle");
         wiicam_aim_begin();
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
+           && g_replies[0].find("bhmax=0 ") != std::string::npos
            && g_replies[0].find("pxmax=0 ") != std::string::npos
            && g_replies[0].find("armax=0 ") != std::string::npos,
            "so the boot after that one comes up with no shape gate either");

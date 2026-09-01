@@ -17,6 +17,7 @@ controller, a mouse or a keyboard.
 """
 import math
 import os
+import re
 import sys
 import textwrap
 import threading
@@ -46,7 +47,7 @@ from gun_studio import (BlobLog, CAM_KEYS, CAM_RANGE, FrameRate, LENS_KEYS,
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
 # every feature whose parsing lives in tools/ stops working -- silently, in a
 # way that looks exactly like a broken screen. So it is checked, out loud.
-LINK_API_NEEDED = 7
+LINK_API_NEEDED = 8
 LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
@@ -61,6 +62,22 @@ COV_GATE = 0.55           # fraction of the frame half-extent the LEDs must reac
 SPAN_GATE = 25.0          # px, smallest quad that carries usable distortion
 CX, CY = calib_lens.CX, calib_lens.CY
 
+# The sensor's OWN pixel array, which is NOT the space a blob's position is
+# reported in. A full-mode blob carries both at once: x,y have already been
+# scaled into the pipeline's 240x176 by the gun (wiicam_aim.cpp, x = nx * SX),
+# while the bounding box -- w, h and the origin xmn,ymn -- is left in the
+# 7-bit numbers the sensor produced. Drawing them together means converting
+# one of them, and the panel converts the POSITION, because the box is the
+# thing under suspicion and a suspect measurement should not set the scale.
+SENSOR_W, SENSOR_H = 128.0, 96.0
+
+# How far a box centre may sit from its own reported position before the shape
+# panel calls it a disagreement, in sensor pixels. A real blob is lopsided, so
+# its centroid and the middle of its bounding box differ by a fraction of a
+# pixel honestly. Two pixels is far more than that, and far less than the
+# factor of nearly two that reading the box in the wrong array would produce.
+BOX_MATCH_PX = 2.0
+
 C_BG = (10, 12, 16)
 C_FG = (230, 237, 243)
 C_DIM = (125, 133, 144)
@@ -74,6 +91,145 @@ C_SEL = (31, 111, 235)
 def wrap(text, width=72):
     """A refusal reason is a sentence, not a caption: show all of it."""
     return textwrap.wrap(str(text), width) or [""]
+
+
+# ---------------------------------------------------------------------------
+# naming what gets recorded onto the stick
+# ---------------------------------------------------------------------------
+def next_recording(out_dir):
+    """The number the next file written to the stick should carry.
+
+    The Pi has NO real-time clock. Every boot starts its clock at the same
+    value, so a capture taken today and one taken next week are both stamped
+    with the same second -- and a name built from the clock alone SILENTLY
+    replaced the earlier one. The recordings from the TV are the whole reason
+    these files exist, and losing one to a name collision leaves nothing
+    behind to show it ever happened.
+
+    A number scanned from what is already there only ever counts up, so the
+    files also sort in the order they were made, and it is short enough to say
+    down a phone: "send me number 4".
+    """
+    n = 0
+    try:
+        for f in os.listdir(out_dir):
+            # Only our own numbered names. Everything else this directory
+            # holds is stamped '<name>-20260901-013038.<ext>', and read as a
+            # sequence number that date would make the next recording number
+            # 20,260,902. The digit count is BOUNDED for exactly that reason:
+            # at five it cannot reach the eight a date needs, so a datestamped
+            # name never matches at any length.
+            m = re.match(r"[a-z]+-(\d{1,5})-", f)
+            if m:
+                n = max(n, int(m.group(1)))
+    except OSError:
+        # An unreadable OUT_DIR is not a reason to refuse to record. The
+        # collision check in recording_path still stops anything being
+        # overwritten, which is the part that matters.
+        pass
+    return n + 1
+
+
+def recording_path(prefix, ext=".csv"):
+    """A path on the stick that is certainly free, and the number in it.
+
+    The clock time stays in the name because it still orders files within one
+    boot and costs nothing; the NUMBER is what makes the name unique. Every
+    candidate is checked against the directory as well, because with no clock
+    and a directory that may have failed to list, "highest + 1" is a good
+    guess rather than a proof -- and overwriting a capture taken at the TV is
+    the one failure this cannot have.
+    """
+    if not os.path.isdir(OUT_DIR):
+        os.makedirs(OUT_DIR)
+    n = next_recording(OUT_DIR)
+    for k in range(1000):
+        path = os.path.join(OUT_DIR, "%s-%03d-%s%s"
+                            % (prefix, n + k, time.strftime("%H%M%S"), ext))
+        if not os.path.exists(path):
+            return path, n + k
+    # Both callers already turn an exception here into a toast. A thousand
+    # taken names in a row is a stick that needs looking at, not something to
+    # paper over by picking a name that would destroy one of them.
+    raise IOError("no free name for a %s file in %s" % (prefix, OUT_DIR))
+
+
+# ---------------------------------------------------------------------------
+# what a blob actually looked like, in the sensor's own pixels
+# ---------------------------------------------------------------------------
+def blob_shape(b):
+    """One parsed blob, converted into the sensor's own 128x96 pixels.
+
+    Hands back (x, y, box, px, dens, placed):
+      x, y    the REPORTED position, scaled out of the pipeline's 240x176
+      box     (x0, y0, w, h) of the bounding box, in sensor pixels, or None
+      px      the blob's lit-pixel count, or None outside full mode
+      dens    px / box area -- how full the box is -- or None
+      placed  True when the box's own origin came off the wire (nine fields),
+              False when there was none and the box had to be hung on the
+              position instead (seven fields, the previous firmware)
+
+    Sizes are w+1 by h+1 on purpose: the gun sends xmx-xmn, a DIFFERENCE, so a
+    blob one pixel across reports 0 and a box drawn 0 wide is an LED that
+    vanishes off the panel entirely.
+    """
+    x = b[0] * SENSOR_W / FRAME_W
+    y = b[1] * SENSOR_H / FRAME_H
+    if len(b) < 7:
+        return x, y, None, None, None, False
+    w = max(1, b[4] + 1)
+    h = max(1, b[5] + 1)
+    px = b[6]
+    dens = px / float(w * h)
+    if len(b) >= 9:
+        return x, y, (float(b[7]), float(b[8]), w, h), px, dens, True
+    return x, y, (x - w / 2.0, y - h / 2.0, w, h), px, dens, False
+
+
+def box_position_gap(blobs):
+    """Worst distance between a box centre and its own reported position.
+
+    In sensor pixels, or None when no blob carried a box origin to compare.
+    This is the one number that says whether the box fields mean what this
+    panel draws them as: the position and the box come from different parts of
+    the same report, so if the box really is in the sensor's 128x96 array the
+    two land on top of each other. If they do not, the units are wrong and
+    every shape gate on this screen is judging a number nobody understands.
+    """
+    worst = None
+    for b in blobs:
+        x, y, box, _px, _dens, placed = blob_shape(b)
+        if box is None or not placed:
+            continue
+        g = math.hypot(box[0] + box[2] / 2.0 - x, box[1] + box[3] / 2.0 - y)
+        worst = g if worst is None else max(worst, g)
+    return worst
+
+
+def heat(t):
+    """A density as a colour: cold blue for a box that is mostly empty,
+    bright amber for one that is solid.
+
+    A ramp rather than a number, because the boxes are 30 px across on the
+    Pi's screen and nobody reads a number that size from a sofa -- but "that
+    one is the wrong colour" carries across a room.
+
+    The hot end stops at amber and never reaches white on purpose. The
+    crosshair drawn on top of it is white, and a solid blob -- the very case
+    this panel is used to look at -- would otherwise swallow the one mark the
+    whole measurement depends on.
+    """
+    try:
+        t = max(0.0, min(1.0, float(t)))
+    except (TypeError, ValueError):
+        return (60, 66, 74)
+    stops = ((0.0, (28, 52, 104)), (0.55, (176, 96, 40)),
+             (1.0, (236, 176, 64)))
+    for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+        if t <= t1:
+            f = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+            return tuple(int(a + (b - a) * f) for a, b in zip(c0, c1))
+    return stops[-1][1]
 
 
 # Where a settings screen draws the selected row's hint, as a fraction of the
@@ -506,9 +662,13 @@ class Camera(RowScreen):
                                    # between one gun reply and the next
         self._rate = FrameRate()   # the camera's own new-frame rate
         self._log = None           # CSV on the stick, when logging
+        self._log_seq = 0          # ...and the number in its name
         self._learn_t = 0.0        # last '~camlearn?' poll, monotonic
         self._blob_last = ""       # keeps the last percentage on screen while
                                    # the next window fills, so it stops flashing
+        self.advanced = False      # which of the two row pages is built
+        self.shape_rect = None     # what the sensor panel last covered, so
+                                   # hostcheck can measure it against the rows
         self.build()
         self._built_wii = self.wiicam()
 
@@ -517,21 +677,36 @@ class Camera(RowScreen):
         return "wiicam" in b
 
     def build(self):
+        """The row list for whichever of the two pages is showing.
+
+        Sixteen rows on one page was more than anybody could find anything in
+        while a test was running, so the list is split: the things a test
+        actually needs stay here, and the gates and registers that are set
+        once and left alone move to the second page. Which one is built is
+        just a flag, because a real second screen would be a second Camera
+        with its own blob log, its own shape-capture poll and its own idea of
+        which counters it had already seen -- and the log started on page one
+        would go on writing into an object nothing could reach to close.
+        """
         link = self.app.link
         self.rows = []
+        # An ESP32 gun has no second page. Left set, the flag would send a
+        # gun that reconnected as an ESP32 to a page that does not exist.
+        if not self.wiicam():
+            self.advanced = False
+        if self.advanced:
+            self.build_advanced()
+            return
+        self.title = Camera.title
         if self.wiicam():
             self.subtitle = ("the wiicam finds blobs in hardware -- "
-                             "sensitivity, and what to do about stray light")
+                             "sensitivity, shape, and what the sensor sees")
             self.rows.append(Row(
                 "Sensitivity", "spin",
                 get=lambda: link.last.get("sens", 0),
                 set=lambda v: link.send("~cam=sens:%d" % v),
                 lo=0, hi=2, step=1,
                 hint="0 default, 2 highest. Use at least 1-2 with a wide lens."))
-            self.rows.append(Row(
-                "Sensor connection test", act=self.diag,
-                hint="checks power, wiring, swapped lines and the sensor "
-                     "itself; the log shows the verdict"))
             # Ambient light. The wiicam finds blobs in HARDWARE and reports
             # four slots: a bright window does not add a fifth point, it TAKES
             # one, and an LED goes missing. The only hardware fact that tells
@@ -556,99 +731,35 @@ class Camera(RowScreen):
                 set=lambda v: link.send("~cam=%s:%d"
                                         % ("fmt" if v == 2 else "ext", v)),
                 lo=0, hi=2, step=1,
-                hint="0 position only, 1 adds each blob's size for the gates "
-                     "below, 2 adds its box and pixel count. Save to keep it"))
-            # Directly under the row that turns full detail on, because this
-            # is the only thing to try when full detail comes back as
-            # nonsense: which byte the sensor wants for that mode is the one
-            # part of it nobody can look up, so it is a setting rather than a
-            # reflash.
-            self.rows.append(Row(
-                "Full-mode register (0x33)", "spin",
-                get=lambda: link.last.get("fullreg"),
-                set=lambda v: link.send("~cam=fullreg:%d" % v),
-                vals=(85, 5), fmt="0x%02x",
-                # "NOT saved" belongs in the hint, not only in the firmware's
-                # camsave reply that nobody on the TV can read: ~camsave
-                # writes fmt, the size window, rtol and the shape gate and
-                # stops there, so a user who found the byte that works,
-                # pressed Save and power-cycled would come back to nonsense
-                # and no idea why.
-                hint="the byte that asks for full mode -- nobody is sure "
-                     "which. Try the other if 2 shows nonsense; NOT saved"))
-            self.rows.append(Row(
-                "Smallest blob kept", "spin",
-                get=lambda: link.last.get("bmin"),
-                set=lambda v: link.send("~cam=bmin:%d" % v),
-                lo=0, hi=15, step=1,
-                hint="drops specks below this size; 0 keeps everything"))
-            self.rows.append(Row(
-                "Largest blob kept", "spin",
-                get=lambda: link.last.get("bmax"),
-                set=lambda v: link.send("~cam=bmax:%d" % v),
-                lo=0, hi=15, step=1,
-                hint="drops blobs bigger than this -- a window is usually "
-                     "much larger than an LED; 15 keeps everything"))
-            self.rows.append(Row(
-                "Odd-one-out (size steps)", "spin",
-                get=lambda: link.last.get("rtol"),
-                set=lambda v: link.send("~cam=rtol:%d" % v),
-                lo=0, hi=15, step=1,
-                hint="drops a blob more than this many size steps from the "
-                     "other three. Needs no distance tuning; 0 is off, 3 is "
-                     "a fair start"))
-            # The shape gate. The 4-bit size the three rows above judge barely
-            # moves on this rig -- 52,624 confirmed LED blobs came in at size 1
-            # or 2 and did not respond to a 1.8x change of distance -- while
-            # full mode's bounding box and pixel count are a real measurement.
+                hint="0 position only, 1 adds each blob's size, 2 adds its box "
+                     "and pixel count and fills the panel. Save to keep it"))
+            # THE gate, and the reason the other two are on the second page.
+            # Height is the one axis that still measures the SOURCE at every
+            # sensitivity: turn the gain up and the sensor smears a blob
+            # sideways -- the same LEDs went from a 2x2 box to 12x3 -- so
+            # width, area, pixel count and roundness all start measuring the
+            # gain instead. Height does not move, and an LED's box has never
+            # been taller than 7 rows over 11,996 sampled blobs.
             #
-            # Both ladders are the MEASURED LED envelope with a step of margin,
-            # and both start at the firmware's own floor. That matters here
-            # more than anywhere: the gun REFUSES a pxmax of 1..11 and an armax
-            # of 1..15 rather than clamping them, so a plain lo/hi step of 1
-            # would spend its first eleven presses sending values the gun
-            # throws away -- on a screen with no console, that is a row whose
-            # arrows visibly do nothing and no way at all to find out why.
+            # In ROWS, not pixels, and never "12 px": pxmax on the next page
+            # is a count of lit pixels and would read identically. Same units
+            # and same ladder as Studio's own row, so the two front ends
+            # cannot describe the same gate two different ways.
             #
-            # Labelled and shown in what they physically reject, not in the
-            # wire's units: 'armax 20' is unreadable, '2.5:1' is a shape.
+            # The ladder starts at the firmware's own floor and never leaves
+            # it: the gun REFUSES a bhmax of 1..7 outright rather than
+            # clamping, so a plain step of 1 would spend its first seven
+            # presses sending values the gun throws away -- which from the
+            # sofa is a row whose arrows visibly do nothing.
             self.rows.append(Row(
-                "Biggest blob (pixels)", "spin",
-                get=lambda: link.last.get("pxmax"),
-                set=lambda v: link.send("~cam=pxmax:%d" % v),
-                vals=(0, 12, 13, 14, 16, 20, 24),
-                fmt=lambda v: "off" if not v else "%d px" % v,
-                hint="drops a blob of more pixels than this; measured LEDs "
-                     "are 4-12, so 14 px leaves a step. Needs Blob detail 2"))
-            self.rows.append(Row(
-                "Roundness limit", "spin",
-                get=lambda: link.last.get("armax"),
-                set=lambda v: link.send("~cam=armax:%d" % v),
-                vals=(0, 16, 20, 24, 32),
-                fmt=lambda v: "off" if not v else "%g:1" % (v / 8.0),
-                hint="drops a blob longer than this beside its width; 99.9% "
-                     "of measured LEDs are 2:1 or rounder. Needs Blob "
+                "Biggest blob (height)", "spin",
+                get=lambda: link.last.get("bhmax"),
+                set=lambda v: link.send("~cam=bhmax:%d" % v),
+                vals=(0, 8, 10, 12, 16, 24),
+                fmt=lambda v: "off" if not v else "%d rows" % v,
+                hint="drops a blob taller than this -- the gate to use. LEDs "
+                     "measure 7 rows, so 10 is recommended. Needs Blob "
                      "detail 2"))
-            # The sensor's own thresholds. These gate INSIDE the camera, before
-            # it hands out its four slots, so they are the only ones that stop
-            # a stray source from costing a corner rather than being noticed
-            # after it already has.
-            self.rows.append(Row(
-                "Sensor max size (0x06)", "spin",
-                get=lambda: link.last.get("hwmax"),
-                set=lambda v: link.send("~cam=hwmax:%d" % v),
-                vals=(-1, 60, 80, 100, 120, 140, 160, 180, 200, 224, 255),
-                hint="the camera's OWN ceiling; -1 leaves it alone. Nintendo "
-                     "used 100-200. Safe knob: our LEDs can never be large"))
-            self.rows.append(Row(
-                "Sensor min size (0x1B)", "spin",
-                get=lambda: link.last.get("hwmin"),
-                set=lambda v: link.send("~cam=hwmin:%d" % v),
-                vals=(-1, 0, 1, 2, 3, 4, 5, 6, 8, 10),
-                hint="never written by the stock driver, so it sits at an "
-                     "unknown default. Risky knob: our LEDs are already small"))
-            self.rows.append(Row("Log blobs to the stick", act=self.log_toggle,
-                                 hint=self.log_hint))
             # Measuring what an LED actually looks like on this rig, from the
             # couch. The gun does the accumulating; both of these exist
             # because the Pi has no console and the LED bar is at the TV, so
@@ -656,6 +767,8 @@ class Camera(RowScreen):
             # could never be taken from where the light actually goes wrong.
             self.rows.append(Row("Learn LED shape", act=self.learn_toggle,
                                  hint=self.learn_hint))
+            self.rows.append(Row("Log blobs to the stick", act=self.log_toggle,
+                                 hint=self.log_hint))
             self.rows.append(Row("Write shape CSV to the stick",
                                  act=self.shape_save, hint=self.shape_hint))
         else:
@@ -686,7 +799,142 @@ class Camera(RowScreen):
             hint=("keeps these across power cycles, except the full-mode "
                   "register and the two sensor thresholds") if self.wiicam()
             else "keeps these settings across power cycles"))
+        if self.wiicam():
+            self.rows.append(Row(
+                "Advanced", act=self.enter_advanced,
+                hint="the older gates, the sensor's own registers and the "
+                     "connection test -- none of them needed for a test"))
         self.rows.append(Row("Back", act=self.app.to_menu))
+
+    def build_advanced(self):
+        """Page two: set once, then left alone.
+
+        Everything here either has a working replacement on page one, gates
+        INSIDE the sensor where a wrong value leaves the gun dark, or is a
+        one-off check. None of it belongs in front of somebody trying to find
+        the sensitivity row while an LED bar is dropping corners.
+        """
+        link = self.app.link
+        self.title = "CAMERA TUNING -- ADVANCED"
+        self.subtitle = ("set once and left alone -- the height gate on the "
+                         "first page replaces most of this")
+        self.rows.append(Row(
+            "Smallest blob kept", "spin",
+            get=lambda: link.last.get("bmin"),
+            set=lambda v: link.send("~cam=bmin:%d" % v),
+            lo=0, hi=15, step=1,
+            hint="drops specks below this size; 0 keeps everything"))
+        self.rows.append(Row(
+            "Largest blob kept", "spin",
+            get=lambda: link.last.get("bmax"),
+            set=lambda v: link.send("~cam=bmax:%d" % v),
+            lo=0, hi=15, step=1,
+            hint="drops blobs bigger than this -- a window is usually "
+                 "much larger than an LED; 15 keeps everything"))
+        self.rows.append(Row(
+            "Odd-one-out (size steps)", "spin",
+            get=lambda: link.last.get("rtol"),
+            set=lambda v: link.send("~cam=rtol:%d" % v),
+            lo=0, hi=15, step=1,
+            hint="drops a blob more than this many size steps from the "
+                 "other three. Needs no distance tuning; 0 is off, 3 is "
+                 "a fair start"))
+        # The two older shape gates. The 4-bit size the three rows above judge
+        # barely moves on this rig -- 52,624 confirmed LED blobs came in at
+        # size 1 or 2 and did not respond to a 1.8x change of distance -- so
+        # these were the first real measurement, and the height gate on page
+        # one is the second. They are kept because guns in the field are set
+        # up with them, not because they are what to reach for now.
+        #
+        # Both ladders are the MEASURED LED envelope with a step of margin,
+        # and both start at the firmware's own floor. That matters here more
+        # than anywhere: the gun REFUSES a pxmax of 1..11 and an armax of
+        # 1..15 rather than clamping them, so a plain lo/hi step of 1 would
+        # spend its first eleven presses sending values the gun throws away --
+        # on a screen with no console, that is a row whose arrows visibly do
+        # nothing and no way at all to find out why.
+        #
+        # Labelled and shown in what they physically reject, not in the wire's
+        # units: 'armax 20' is unreadable, '2.5:1' is a shape.
+        self.rows.append(Row(
+            "Biggest blob (pixels)", "spin",
+            get=lambda: link.last.get("pxmax"),
+            set=lambda v: link.send("~cam=pxmax:%d" % v),
+            vals=(0, 12, 13, 14, 16, 20, 24),
+            fmt=lambda v: "off" if not v else "%d px" % v,
+            hint="drops a blob of more pixels than this; the height gate is "
+                 "the better one now. Needs Blob detail 2"))
+        # "Not recommended" in the hint rather than only in a release note.
+        # A ratio needs the width, and at sensitivity 2 the sensor smears a
+        # blob sideways -- 2x2 became 12x3 on the same LEDs -- so this gate
+        # measures the gain and throws away real LEDs, which reaches the user
+        # as a cursor that sticks and never as a row they set weeks ago.
+        self.rows.append(Row(
+            "Roundness limit", "spin",
+            get=lambda: link.last.get("armax"),
+            set=lambda v: link.send("~cam=armax:%d" % v),
+            vals=(0, 16, 20, 24, 32),
+            fmt=lambda v: "off" if not v else "%g:1" % (v / 8.0),
+            hint="drops a blob longer than this beside its width; NOT "
+                 "recommended, wrong at sensitivity 2. Needs Blob detail 2"))
+        # The sensor's own thresholds. These gate INSIDE the camera, before
+        # it hands out its four slots, so they are the only ones that stop
+        # a stray source from costing a corner rather than being noticed
+        # after it already has.
+        self.rows.append(Row(
+            "Sensor max size (0x06)", "spin",
+            get=lambda: link.last.get("hwmax"),
+            set=lambda v: link.send("~cam=hwmax:%d" % v),
+            vals=(-1, 60, 80, 100, 120, 140, 160, 180, 200, 224, 255),
+            hint="the camera's OWN ceiling; -1 leaves it alone. Nintendo "
+                 "used 100-200. Safe knob: our LEDs can never be large"))
+        self.rows.append(Row(
+            "Sensor min size (0x1B)", "spin",
+            get=lambda: link.last.get("hwmin"),
+            set=lambda v: link.send("~cam=hwmin:%d" % v),
+            vals=(-1, 0, 1, 2, 3, 4, 5, 6, 8, 10),
+            hint="never written by the stock driver, so it sits at an "
+                 "unknown default. Risky knob: our LEDs are already small"))
+        # Beside the sensor thresholds rather than beside Blob detail, because
+        # it is the same kind of thing: a raw register nobody can look up.
+        # It is the only move left when full detail comes back as nonsense.
+        self.rows.append(Row(
+            "Full-mode register (0x33)", "spin",
+            get=lambda: link.last.get("fullreg"),
+            set=lambda v: link.send("~cam=fullreg:%d" % v),
+            vals=(85, 5), fmt="0x%02x",
+            # "NOT saved" belongs in the hint, not only in the firmware's
+            # camsave reply that nobody on the TV can read: ~camsave writes
+            # fmt, the size window, rtol and the shape gates and stops there,
+            # so a user who found the byte that works, pressed Save and
+            # power-cycled would come back to nonsense and no idea why.
+            hint="the byte that asks for full mode -- nobody is sure "
+                 "which. Try the other if 2 shows nonsense; NOT saved"))
+        self.rows.append(Row(
+            "Sensor connection test", act=self.diag,
+            hint="checks power, wiring, swapped lines and the sensor "
+                 "itself; the log shows the verdict"))
+        # Says where it goes AND where Save is. Nothing on this page saves,
+        # and a user who has just spent a minute on the size window needs to
+        # be told that once rather than find out on the next power cycle.
+        self.rows.append(Row(
+            "Back", act=self.leave_advanced,
+            hint="back to the camera page -- Save to gun is there, and "
+                 "nothing on this page is kept until it is pressed"))
+
+    def enter_advanced(self):
+        self.advanced = True
+        self.build()
+        self.sel = 0
+
+    def leave_advanced(self):
+        self.advanced = False
+        self.build()
+        # Back onto the row that opened it rather than at the top of the
+        # list: this is a page people step in and out of while a capture is
+        # running, and landing on Sensitivity every time invites nudging it.
+        self.sel = next((i for i, r in enumerate(self.rows)
+                         if r.label == "Advanced"), 0)
 
     def log_toggle(self):
         """Start or stop a CSV of every new camera frame, on the stick.
@@ -699,25 +947,29 @@ class Camera(RowScreen):
             n, path = self._log.rows, self._log.path
             self._log.close()
             self._log = None
-            self.app.toast_now("stopped -- %d frames written to %s"
-                               % (n, os.path.basename(path)))
+            self.app.toast_now("stopped -- %d frames written to %s (recording "
+                               "%d)" % (n, os.path.basename(path),
+                                        self._log_seq))
             return
         try:
-            if not os.path.isdir(OUT_DIR):
-                os.makedirs(OUT_DIR)
-            path = os.path.join(OUT_DIR, "blobs-%s.csv"
-                                % time.strftime("%Y%m%d-%H%M%S"))
+            path, seq = recording_path("blobs")
             self._log = BlobLog(path)
+            self._log_seq = seq
         except Exception as e:
             self.app.toast_now("could not open the log: %s" % e)
             return
-        self.app.toast_now("logging to %s -- aim at the screen, then swing "
-                           "past the window" % os.path.basename(self._log.path))
+        # The number, out loud, at the start and again at the end. It is what
+        # the user has to say to ask for the file afterwards, and the clock in
+        # the rest of the name means nothing on a Pi that has no clock.
+        self.app.toast_now("recording %d -- logging to %s, aim at the screen "
+                           "then swing past the window"
+                           % (self._log_seq,
+                              os.path.basename(self._log.path)))
 
     def log_hint(self):
         if self._log is not None:
-            return ("recording, %d frames so far -- select again to stop and "
-                    "close the file" % self._log.rows)
+            return ("recording %d, %d frames so far -- select again to stop "
+                    "and close the file" % (self._log_seq, self._log.rows))
         return "writes one row per camera frame to the stick, for reading on a PC"
 
     def close_log(self):
@@ -815,10 +1067,7 @@ class Camera(RowScreen):
                                "2 s -- nothing written")
             return
         try:
-            if not os.path.isdir(OUT_DIR):
-                os.makedirs(OUT_DIR)
-            path = os.path.join(OUT_DIR, "shape-%s.csv"
-                                % time.strftime("%Y%m%d-%H%M%S"))
+            path, seq = recording_path("shape")
             n = write_shape_csv(path, link.hists)
         except Exception as e:
             self.app.toast_now("could not write the shape CSV: %s" % e)
@@ -832,8 +1081,9 @@ class Camera(RowScreen):
             self.app.toast_now("wrote %s -- SIZE only, %d blobs: the shape "
                                "features need Blob detail 2" % (name, led))
         else:
-            self.app.toast_now("wrote %d rows to %s -- %d frames, %d LED, %d "
-                               "rejected" % (n, name, frames, led, rej))
+            self.app.toast_now("wrote %d rows to %s (recording %d) -- %d "
+                               "frames, %d LED, %d rejected"
+                               % (n, name, seq, frames, led, rej))
 
     def shape_hint(self):
         frames, led, rej = self.app.link.hists.counts()
@@ -841,11 +1091,11 @@ class Camera(RowScreen):
         # rejected blobs measured over 0 frames" reads like a broken counter
         # rather than like a capture nobody has started yet.
         if led or rej:
-            return ("writes the %d LED and %d rejected blobs measured over %d "
-                    "frames to the stick, as shape-DATE.csv"
+            return ("writes the %d LED and %d rejected blobs over %d frames "
+                    "to the stick, as the next shape-NNN.csv"
                     % (led, rej, frames))
-        return ("writes the histograms to the stick as shape-DATE.csv, one row "
-                "per class and feature")
+        return ("writes the histograms to the stick as the next numbered "
+                "shape-NNN.csv, one row per class and feature")
 
     def diag(self):
         self.app.link.send("~camdiag")
@@ -886,6 +1136,13 @@ class Camera(RowScreen):
             self.build()
             self._built_wii = self.wiicam()
             self.sel = min(self.sel, max(0, len(self.rows) - 1))
+        # Esc on the second page comes back to the first one. Left to
+        # RowScreen it would go all the way out to the menu, and the menu
+        # closes a blob log that is still recording -- so a glance at the size
+        # window would end a capture the user was in the middle of taking.
+        if self.advanced and "back" in acts:
+            self.leave_advanced()
+            acts = [a for a in acts if a != "back"]
         # The blob readout is a live measurement, so it is re-read while this
         # screen is up rather than sampled once on the way in. Faster while
         # logging, because then the samples are the deliverable.
@@ -969,18 +1226,37 @@ class Camera(RowScreen):
                 out.append("blob sizes: set Blob detail to 1 to read them")
                 parts = parts.replace("(sizes need fmt:1)", "").strip()
             shown = []
-            for b in parse_blobs(parts):
+            parsed = parse_blobs(parts)
+            for b in parsed:
                 txt = "%d,%d size %d" % (b[0], b[1], b[2])
                 # The box and the brightness only exist in full mode. Printed
                 # as a fixed part of the line they would read as a measured
                 # 0x0 box on every gun that is not in it.
-                if len(b) == 7:
+                if len(b) >= 7:
                     txt += " box %dx%d %dpx" % (b[4], b[5], b[6])
                 if b[3] != 1:
                     txt += " DROPPED"
                 shown.append(txt)
             if shown:
                 out.append("blobs now: " + "    ".join(shown))
+            # Does the box mean what the panel draws it as? The position and
+            # the box come out of different halves of the same report, and the
+            # box is only believed to be in the sensor's 128x96 array. If it
+            # is, the two land on each other; if they pull apart, every shape
+            # gate on this screen is judging a number in unknown units and the
+            # measurement behind them has to be redone. That is worth saying
+            # in words as well as drawing, because it is a conclusion, not a
+            # reading -- and it is the answer to the question the panel was
+            # added to settle.
+            gap = box_position_gap(parsed)
+            if gap is not None and gap > BOX_MATCH_PX:
+                out.append("BOX AND POSITION DISAGREE by %.1f of 128 px -- "
+                           "box units wrong, or a lens correction is moving "
+                           "the position" % gap)
+            elif gap is not None:
+                out.append("box centres land on the reported positions, worst "
+                           "%.1f of 128 px -- the box really is in the "
+                           "sensor's own array" % gap)
         # First, always: this one means the window is set so tight it would
         # blind the gun, and it was previously last and cut off by the slice.
         # The DELTA, like the drop counts below: bvalve counts since boot, so
@@ -1065,6 +1341,126 @@ class Camera(RowScreen):
             out.append("   ".join(rec))
         return out
 
+    def draw_shape(self, sc, x, y, w, h, blobs=None):
+        """What the sensor sees, drawn in ITS OWN 128x96 pixels.
+
+        The readout above says where the gun thinks each blob is. It cannot
+        say what SHAPE the thing was -- and shape is the only thing the gates
+        on this screen judge, so tuning them from a coordinate is tuning
+        blind. Each blob is drawn as the box it actually filled, at the size
+        the sensor reports, inside the whole frame: one LED said to span
+        twelve of 128 columns is either the truth about this lens or a unit
+        error, and nobody can tell those apart from a number on its own.
+
+        The crosshair is a MEASUREMENT, not decoration. The position and the
+        box arrive in different halves of the same report and only the
+        position's units are certain, so if the box fields really are in the
+        sensor's array the box centre sits under the crosshair. When they pull
+        apart the panel draws the gap as a line rather than tidying it away --
+        a wrong unit here invalidates every shape gate and the whole LED
+        envelope behind them.
+
+        Returns the rectangle it covered, label and numbers included, so
+        hostcheck can measure it against the rows and the readout.
+        """
+        link = self.app.link
+        if blobs is None:
+            blobs = parse_blobs(getattr(link, "blobs", ""))
+        xi, yi, wi, hi = int(x), int(y), int(w), int(h)
+        panel = pygame.Rect(xi, yi, wi, hi)
+        pygame.draw.rect(sc.s, (16, 20, 26), panel)
+        # The frame's own edge and a grid every 32 sensor pixels. Half the
+        # question this panel answers is how much of the frame one LED takes
+        # up, and "a quarter of the way across" is something the eye can judge
+        # against a line where it cannot judge it against nothing.
+        kx, ky = w / SENSOR_W, h / SENSOR_H
+        for gx in range(32, int(SENSOR_W), 32):
+            pygame.draw.line(sc.s, (30, 36, 44), (xi + gx * kx, yi),
+                             (xi + gx * kx, yi + hi))
+        for gy in range(32, int(SENSOR_H), 32):
+            pygame.draw.line(sc.s, (30, 36, 44), (xi, yi + gy * ky),
+                             (xi + wi, yi + gy * ky))
+        pygame.draw.rect(sc.s, (48, 54, 61), panel, 1)
+        # The two legends split between the label and the line under the
+        # numbers, because either of them alone runs wider than the 307 px
+        # this column has at 1024x768 and a caption that overhangs its own
+        # panel is worse than no caption.
+        sc.text(x + w / 2, y - sc.h * 0.026,
+                "SENSOR %dx%d -- fill = how full" % (SENSOR_W, SENSOR_H),
+                sc.f_xs, C_DIM)
+
+        told = []                     # the numbers, one line per blob
+        boxed = False
+        for i, b in enumerate(blobs[:4]):
+            tag = "ABCD"[i]
+            bx, by, box, npx, dens, placed = blob_shape(b)
+            # Kept or gate-dropped, on the outline, because that is the
+            # question the gates are being tuned to answer. Never on the fill:
+            # the fill is already carrying the density.
+            col = C_OK if b[3] == 1 else C_BAD
+            cx, cy = x + bx * kx, y + by * ky
+            if box is not None:
+                boxed = True
+                r = pygame.Rect(int(x + box[0] * kx), int(y + box[1] * ky),
+                                max(2, int(box[2] * kx)),
+                                max(2, int(box[3] * ky))).clip(panel)
+                pygame.draw.rect(sc.s, heat(dens), r)
+                # Dashed would be better for a box whose origin was never
+                # sent, but at 30 px across a dash is noise; one pixel of
+                # outline instead of two, and the number says so in words.
+                pygame.draw.rect(sc.s, col, r, 2 if placed else 1)
+                sc.text(min(max(r.left + 5, xi + 6), xi + wi - 6),
+                        max(yi + 7, r.top - 7), tag, sc.f_xs, col)
+            if panel.collidepoint(int(cx), int(cy)):
+                sc.crosshair(cx, cy, 3, C_FG, dot=True)
+            gap = None
+            if box is not None and placed:
+                mx = x + (box[0] + box[2] / 2.0) * kx
+                my = y + (box[1] + box[3] / 2.0) * ky
+                gap = math.hypot(box[0] + box[2] / 2.0 - bx,
+                                 box[1] + box[3] / 2.0 - by)
+                if gap > BOX_MATCH_PX:
+                    # Loud on purpose. This is the panel failing its own
+                    # check, and a faint hairline would be read as decoration
+                    # by the one person who needs to see it.
+                    pygame.draw.line(sc.s, C_BAD, (mx, my), (cx, cy), 2)
+                    pygame.draw.circle(sc.s, C_BAD, (int(mx), int(my)), 4, 1)
+            if box is None:
+                told.append(("%s no box" % tag, col))
+                continue
+            # w and h as the gun REPORTED them, not the w+1 the box is drawn
+            # at: these are the numbers the gates compare against and the
+            # numbers under suspicion, so printing anything else here would
+            # hide exactly what is being checked.
+            txt = "%s %dx%d  %dpx  %d%%" % (tag, b[4], b[5], npx,
+                                            round(100 * dens))
+            if not placed:
+                txt += "  no origin"
+            elif gap is not None and gap > BOX_MATCH_PX:
+                txt += "  off %.1f" % gap
+            told.append((txt, col))
+        if not blobs:
+            sc.text(x + w / 2, y + h / 2, "no blobs reported", sc.f_s, C_WARN)
+        elif not boxed:
+            # One line, not four. Outside full mode NO blob has a box, and
+            # "A no box / B no box / C no box / D no box" is four lines of
+            # column saying the one thing the reader has to do about it.
+            told = [("boxes need Blob detail 2", C_WARN)]
+
+        ty = y + h + sc.h * 0.012 + sc.f_xs.get_height() / 2.0
+        dy = int(sc.f_xs.get_height() * 1.15)
+        bottom = y + h
+        for txt, col in told:
+            sc.text(x + w / 2, ty, txt, sc.f_xs, col)
+            bottom = ty + sc.f_xs.get_height() / 2.0
+            ty += dy
+        if blobs:
+            sc.text(x + w / 2, ty, "+ = position; green kept, red dropped",
+                    sc.f_xs, C_DIM)
+            bottom = ty + sc.f_xs.get_height() / 2.0
+        top = y - sc.h * 0.026 - sc.f_xs.get_height() / 2.0
+        return pygame.Rect(xi, int(top), wi, int(bottom - top))
+
     def draw(self, sc):
         if self.tuning:
             sc.text(sc.w / 2, sc.h * 0.12, "AUTO TUNE", sc.f_l, C_WARN)
@@ -1079,29 +1475,47 @@ class Camera(RowScreen):
         # landed on top of the last three of them. It is placed from where the
         # rows actually end instead, and the rows are given a shorter run.
         #
-        # It is now SIXTEEN rows, and the band was re-measured for them. At
-        # 1024x768 -- the mode the Pi actually runs in -- f_m draws a 24 px
-        # line box, and the old band (0.24 h to 0.66 h) left fourteen rows a
-        # pitch of 24.8: 0.8 px of daylight between one label and the next,
-        # with nothing spare for two more. Three unused gaps were measured and
-        # spent on them:
-        #   the subtitle ended 45 px above the first row with nothing in
-        #     between, so the band now starts at 0.185 h;
-        #   draw_rows returns a whole pitch PAST the last row, so the readout
-        #     is placed from that row's own rectangle instead and stops
-        #     wasting 27 px of the gap;
-        #   the readout wrapped at a flat 96 columns and left a third of the
-        #     screen width empty, which cost it a whole wrapped row.
-        # After: 27 px of pitch, 3 px of daylight, two MORE rows than before,
-        # and the readout still gets its six. 0.715 h is where the band stops
-        # -- one step further and the readout is down to five rows, which is
-        # the trade the measurement says not to make.
+        # It reached SIXTEEN, at which point 1024x768 -- the mode the Pi
+        # actually runs in -- left a 27 px pitch for a 24 px line box and the
+        # readout was down to its last six rows. The list is now split in two,
+        # nine rows and ten, which frees that up again; but draw_rows SPREADS
+        # whatever it has over the band it is given, so nine rows in the old
+        # sixteen-row band would put 51 px between 24 px labels, push the last
+        # row's rectangle 8 px lower and cost the readout a row for nothing.
+        # The pitch is capped at 0.050 h instead -- one and a half times the
+        # glyph box -- and everything the rows do not need goes to the readout
+        # and to the sensor panel beside them. Measured at 1024x768: 38 px of
+        # pitch, 14 px of daylight, and eleven readout rows on the first page
+        # and nine on the longer second one, where sixteen rows left six.
         sc.text(sc.w / 2, sc.h * 0.09, self.title, sc.f_l, C_FG)
         sc.text(sc.w / 2, sc.h * 0.145, self.subtitle, sc.f_s, C_DIM)
-        y = self.draw_rows(sc, sc.h * 0.185, sc.h * 0.715)
-        w = sc.w * 0.30
-        self.app.draw_preview(sc, sc.w * 0.66, sc.h * 0.28,
-                              w, w * FRAME_H / FRAME_W)
+        y1 = min(sc.h * 0.715,
+                 sc.h * 0.185 + max(0, len(self.rows) - 1) * sc.h * 0.050)
+        y = self.draw_rows(sc, sc.h * 0.185, y1)
+        # The sensor's own view, in place of the CAMERA VIEW every other
+        # screen shows. That one draws the resolved quad, which only exists
+        # once four LEDs are already being found -- the state camera tuning
+        # ENDS in. What tuning needs is the blobs as the sensor handed them
+        # over, the gate-dropped ones included, and that is this panel.
+        #
+        # Sized from the room it HAS, not from the screen width alone. The
+        # readout below is centred and runs nearly the full width, so it has
+        # to start under the panel: at 1024x768 the 0.30 w this column has
+        # always used is the binding limit and nothing moves, but on a 16:9
+        # mode the same fraction is 384 px across and 288 tall, and that
+        # pushed the readout down far enough to cut two rows off the bottom of
+        # it. 0.654 h is where the panel and its numbers must stop for the
+        # readout to keep nine rows; the floor stops a short screen from
+        # shrinking the panel into something nobody can read.
+        py = sc.h * 0.22
+        below = 5 * int(sc.f_xs.get_height() * 1.15) + sc.h * 0.012
+        room = sc.h * 0.654 - py - below
+        w = min(sc.w * 0.30, max(sc.w * 0.16, room * SENSOR_W / SENSOR_H))
+        # Centred in what is left beside the rows, which draw_rows ends at
+        # 0.62 w whenever a preview is up. At the width cap that is 0.66 w --
+        # exactly where the camera view it replaces has always been drawn.
+        self.shape_rect = self.draw_shape(sc, (sc.w * 0.62 + sc.w) / 2 - w / 2,
+                                          py, w, w * SENSOR_H / SENSOR_W)
         # Wrapped to the width the screen ACTUALLY has. A fixed 96 columns
         # filled 686 px of a 1024 px screen and left 338 px of it empty, which
         # cost the full-mode blob line a third wrapped row it did not need --
@@ -1116,7 +1530,15 @@ class Camera(RowScreen):
         # own hint, which is the collision this arithmetic exists to make
         # impossible. Both ends come from the same numbers the rows and the
         # hint are drawn at, so the three cannot drift apart.
+        #
+        # The readout is CENTRED and runs nearly the full width, so it has to
+        # clear the sensor panel as well as the rows -- the panel column is
+        # taller than the shorter of the two row lists, and taking the rows
+        # alone drew the first line of the readout straight through the
+        # panel's own numbers.
         bot = max((r.rect.bottom for r in self.rows if r.rect), default=y)
+        if self.shape_rect is not None:
+            bot = max(bot, self.shape_rect.bottom)
         top = bot + sc.h * 0.016
         gh = sc.f_xs.get_height()
         step = max(1, int(gh * READOUT_STEP))

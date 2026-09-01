@@ -712,18 +712,89 @@ def main():
     app._link_bad = False
     ser = app.link.src.ser          # attach() built a NEW fake serial
 
-    # ---- the ambient-light readout ---------------------------------------
+    # ---- the two pages ----------------------------------------------------
+    # Sixteen rows on one page was more than anyone could find anything in
+    # while a test was running. What has to hold is not a row COUNT but which
+    # page each control is on: the first page is what a test needs, the second
+    # is what is set once and left alone, and a control drifting back onto the
+    # first page puts the list straight back where it started.
     app.link.last["board"] = "rp2040-wiicam"
     cam3 = pical.Camera(app)
-    labels = [r.label for r in cam3.rows]
-    ck("Blob detail (sizes)" in labels and "Largest blob kept" in labels,
-       "the wiicam camera screen offers the blob size window")
     app.open(cam3)
+
+    def page(cam, advanced):
+        """Build the page named and hand back its labels, in order."""
+        if bool(cam.advanced) != advanced:
+            cam.enter_advanced() if advanced else cam.leave_advanced()
+        return [r.label for r in cam.rows]
+
+    FRONT = ["Sensitivity", "Blob detail (sizes)", "Biggest blob (height)",
+             "Learn LED shape", "Log blobs to the stick",
+             "Write shape CSV to the stick", "Save to gun", "Advanced", "Back"]
+    ADV = ["Smallest blob kept", "Largest blob kept",
+           "Odd-one-out (size steps)", "Biggest blob (pixels)",
+           "Roundness limit", "Sensor max size (0x06)",
+           "Sensor min size (0x1B)", "Full-mode register (0x33)",
+           "Sensor connection test", "Back"]
+    labels = page(cam3, False)
+    ck(labels == FRONT,
+       "the camera page carries the testing controls, in order (%s)" % labels)
+    adv_labels = page(cam3, True)
+    ck(adv_labels == ADV,
+       "and the second page carries the gates and the registers (%s)"
+       % adv_labels)
+    ck(not [l for l in adv_labels if l in FRONT and l != "Back"],
+       "with nothing on both pages at once (%s)"
+       % [l for l in adv_labels if l in FRONT and l != "Back"])
+    # Every control the one long list used to carry is still reachable. A
+    # split that quietly loses a row is worse than a list that is too long:
+    # the setting is simply gone, with nothing on screen to say where.
+    WAS = ["Sensitivity", "Sensor connection test", "Blob detail (sizes)",
+           "Full-mode register (0x33)", "Smallest blob kept",
+           "Largest blob kept", "Odd-one-out (size steps)",
+           "Biggest blob (pixels)", "Roundness limit",
+           "Sensor max size (0x06)", "Sensor min size (0x1B)",
+           "Log blobs to the stick", "Learn LED shape",
+           "Write shape CSV to the stick", "Save to gun"]
+    lost = [l for l in WAS if l not in FRONT + ADV]
+    ck(not lost,
+       "and nothing that used to be on the screen was lost (%s)" % lost)
+
+    # Getting there and back. Esc has to come back to the camera page rather
+    # than out to the menu: the menu closes a blob log that is still
+    # recording, so a glance at the size window would end a capture.
+    labels = page(cam3, False)
+    cam3.sel = labels.index("Advanced")
+    app.step([key(pygame.K_RETURN)], t + 9.15)
+    ck(cam3.advanced and isinstance(app.view, pical.Camera),
+       "selecting Advanced opens the second page on the same screen")
+    ck("ADVANCED" in cam3.title and cam3.title != pical.Camera.title,
+       "which says so in its own title: %r" % cam3.title)
+    app.step([key(pygame.K_ESCAPE)], t + 9.16)
+    ck(not cam3.advanced and isinstance(app.view, pical.Camera),
+       "and Esc comes back to the camera page, not out to the menu")
+    ck(cam3.rows[cam3.sel].label == "Advanced",
+       "landing back on the row that opened it (%s)"
+       % cam3.rows[cam3.sel].label)
+    # One screen throughout, so a running log survives the trip. Two Camera
+    # objects would each have their own, and the one started on page one
+    # would go on writing with nothing able to reach it to close it.
+    cam3.log_toggle()
+    trip = cam3._log
+    page(cam3, True)
+    page(cam3, False)
+    ck(cam3._log is trip and trip is not None,
+       "a blob log started on the camera page is still recording after a "
+       "visit to the second one")
+    cam3.log_toggle()
+
+    labels = page(cam3, True)
     cam3.sel = labels.index("Largest blob kept")
     n0 = len(ser.written)
     app.step([key(pygame.K_LEFT)], t + 9.2)
     ck(any(b"cam=bmax:" in w for w in ser.written[n0:]),
-       "and nudging it sends the gate to the gun")
+       "and nudging a row on the second page sends the gate to the gun")
+    labels = page(cam3, False)
     app.link.blobs = "CAM: blobs 30,40,3,1 200,41,4,1 31,140,3,1 210,150,14,0"
     app.link.last.update({"br4": 800, "br3": 150, "br2": 40, "br1": 10,
                           "br0": 0, "brej": 7})
@@ -872,23 +943,33 @@ def main():
     # 0.8 px of daylight, and two more rows in the same band would have had
     # the labels overlapping with nothing to say so. Measured off the rects
     # draw_rows itself sets, at the resolution the Pi runs at.
-    cam3.draw(pi_sc)
-    ys = sorted(r.rect.centery for r in cam3.rows if r.rect)
-    pitch = min(b - a for a, b in zip(ys, ys[1:]))
-    ck(len(cam3.rows) >= 16,
-       "the camera screen really is carrying sixteen rows now (%d)"
-       % len(cam3.rows))
-    ck(pitch - pi_sc.f_m.get_height() >= 3.0,
-       "and the rows still clear each other by a real margin at 1024x768: "
-       "%d px of pitch for a %d px line box (%.1f px of daylight)"
-       % (pitch, pi_sc.f_m.get_height(),
-          pitch - pi_sc.f_m.get_height()))
-    # ...and clear the subtitle above them, which is the space the band was
-    # grown into.
-    sub_bottom = pi_sc.h * 0.145 + pi_sc.f_s.get_height() / 2.0
-    ck(ys[0] - pi_sc.f_m.get_height() / 2.0 >= sub_bottom,
-       "the first row starts below the subtitle (row top %d, subtitle ends "
-       "%d)" % (ys[0] - pi_sc.f_m.get_height() / 2.0, sub_bottom))
+    #
+    # The band no longer stretches to fill itself either: nine rows spread
+    # over the sixteen-row band would put 51 px between 24 px labels and push
+    # the readout down for nothing. Both pages are measured, because the
+    # longer of the two is the one that decides how much is left below.
+    for advanced in (False, True):
+        page(cam3, advanced)
+        cam3.draw(pi_sc)
+        ys = sorted(r.rect.centery for r in cam3.rows if r.rect)
+        pitch = min(b - a for a, b in zip(ys, ys[1:]))
+        what = "second page" if advanced else "camera page"
+        ck(8 <= len(cam3.rows) <= 11,
+           "the %s is a list somebody can read from a sofa, not sixteen "
+           "rows (%d)" % (what, len(cam3.rows)))
+        ck(pitch - pi_sc.f_m.get_height() >= 3.0,
+           "and the rows on the %s clear each other by a real margin at "
+           "1024x768: %d px of pitch for a %d px line box (%.1f px of "
+           "daylight)" % (what, pitch, pi_sc.f_m.get_height(),
+                          pitch - pi_sc.f_m.get_height()))
+        # ...and clear the subtitle above them, which is the space the band
+        # was grown into.
+        sub_bottom = pi_sc.h * 0.145 + pi_sc.f_s.get_height() / 2.0
+        ck(ys[0] - pi_sc.f_m.get_height() / 2.0 >= sub_bottom,
+           "the first row on the %s starts below the subtitle (row top %d, "
+           "subtitle ends %d)"
+           % (what, ys[0] - pi_sc.f_m.get_height() / 2.0, sub_bottom))
+    labels = page(cam3, False)
 
     def readout_rows():
         """Draw one camera frame and hand back the rect of EVERY readout row.
@@ -988,33 +1069,258 @@ def main():
        "and it is still drawing a useful number of rows (%d)" % len(rows_b))
     cam3.log_toggle()
 
-    # The sensor's own thresholds, the odd-one-out gate, the shape gate, the
-    # report format and the full-mode register all reach the gun. fmt: is sent
-    # ONLY for full mode: the previous firmware has no such key and drops it
-    # in silence, so a gun on it could never be moved off detail 0 at all.
-    for label, wire in (("Odd-one-out (size steps)", b"cam=rtol:"),
-                        ("Biggest blob (pixels)", b"cam=pxmax:"),
-                        ("Roundness limit", b"cam=armax:"),
-                        ("Sensor max size (0x06)", b"cam=hwmax:"),
-                        ("Sensor min size (0x1B)", b"cam=hwmin:"),
-                        ("Full-mode register (0x33)", b"cam=fullreg:")):
-        ck(label in labels, "the camera screen offers '%s'" % label)
-        cam3.sel = labels.index(label)
+    # ---- the sensor shape panel --------------------------------------------
+    # A coordinate cannot say what SHAPE a blob was, and shape is the only
+    # thing the gates on this screen judge. The panel draws each blob as the
+    # box it actually filled, in the sensor's own 128x96 pixels, with the
+    # position the gun reported crossed on top of it.
+    #
+    # That crosshair is a MEASUREMENT, not decoration. The box fields are only
+    # BELIEVED to be in the 128x96 array; the position certainly is not (the
+    # gun scales it into the pipeline's 240x176 first). If the two land on
+    # each other the belief holds; if they pull apart, every shape gate is
+    # judging a number in unknown units and the LED envelope behind them has
+    # to be measured again. So the panel is tested on both outcomes.
+    def texts_of(cam, sc=pi_sc):
+        """Every string the screen draws, with its rect and whether it came
+        through lines() -- so the panel's own numbers can be told apart from
+        the readout underneath it."""
+        real_text, real_lines = pical.Screen.text, pical.Screen.lines
+        got = {"inside": False, "all": []}
+
+        def spy_text(self, x, y, msg, font=None, colour=pical.C_FG,
+                     centre=True):
+            r = real_text(self, x, y, msg, font, colour, centre)
+            got["all"].append((r, str(msg), got["inside"]))
+            return r
+
+        def spy_lines(self, x, y, msgs, font=None, colour=pical.C_DIM,
+                      step=1.5):
+            got["inside"] = True
+            try:
+                return real_lines(self, x, y, msgs, font, colour, step)
+            finally:
+                got["inside"] = False
+
+        pical.Screen.text, pical.Screen.lines = spy_text, spy_lines
+        try:
+            sc.s.fill(pical.C_BG)
+            cam.draw(sc)
+        finally:
+            pical.Screen.text, pical.Screen.lines = real_text, real_lines
+        return got["all"]
+
+    def paint(rect, sc=pi_sc):
+        a = pygame.surfarray.array3d(sc.s)
+        sub = a[rect.left:rect.right, rect.top:rect.bottom]
+        return int((sub.sum(axis=2) > 60).sum())
+
+    def reds(rect, sc=pi_sc):
+        a = pygame.surfarray.array3d(sc.s).astype(int)
+        sub = a[rect.left:rect.right, rect.top:rect.bottom]
+        return int((abs(sub - np.asarray(pical.C_BAD)).sum(axis=2) <= 10).sum())
+
+    def blob9(xp, yp, size, keep, w, h, px, dx=0, dy=0):
+        """A nine-field blob whose box sits, by construction, exactly where
+        the reported position says it should -- offset by dx,dy when the test
+        wants the two to disagree."""
+        xn = xp * pical.SENSOR_W / pical.FRAME_W
+        yn = yp * pical.SENSOR_H / pical.FRAME_H
+        return "%d,%d,%d,%d,%d,%d,%d,%d,%d" % (
+            xp, yp, size, keep, w, h, px,
+            int(round(xn - (w + 1) / 2.0)) + dx,
+            int(round(yn - (h + 1) / 2.0)) + dy)
+
+    # The conversion first, on its own, because everything drawn rests on it.
+    x9, y9, box9, px9, dens9, placed9 = pical.blob_shape(
+        (120, 88, 3, 1, 11, 9, 84, 58, 43))
+    ck(abs(x9 - 64.0) < 0.01 and abs(y9 - 48.0) < 0.01,
+       "the reported position converts out of the pipeline's 240x176 into "
+       "the sensor's own 128x96 (%.2f, %.2f, want 64, 48)" % (x9, y9))
+    ck(box9 == (58.0, 43.0, 12, 10) and placed9,
+       "the box is placed by its own origin and sized w+1 by h+1 -- the gun "
+       "sends xmx-xmn, so a one-pixel blob reports 0 and a box drawn 0 wide "
+       "is an LED that vanishes: %s" % (box9,))
+    ck(px9 == 84 and abs(dens9 - 84 / 120.0) < 1e-9,
+       "and density is the pixel count over the box it fills (%.3f)" % dens9)
+    x7, y7, box7, _p7, _d7, placed7 = pical.blob_shape((120, 88, 3, 1, 11, 9, 84))
+    ck(not placed7 and box7 is not None
+       and abs(box7[0] + box7[2] / 2.0 - x7) < 1e-9,
+       "a seven-field blob has no origin, so its box is hung on the position "
+       "and says so rather than being dropped: %s" % (box7,))
+    ck(pical.blob_shape((120, 88, 3, 1))[2] is None,
+       "and a four-field blob has no box at all, rather than a measured 0x0")
+    ck(pical.box_position_gap([(120, 88, 3, 1, 11, 9, 84)]) is None,
+       "with nothing to compare, the box/position check answers None rather "
+       "than a made-up zero -- 'they agree' is a claim, not a default")
+
+    # Nine fields, boxes where the positions say they should be. Measured
+    # against the EMPTY panel rather than against zero: the panel's own
+    # background and its 32-pixel grid are lit too, so a bare threshold would
+    # pass on a panel that drew no blobs at all.
+    app.link.last["fmt"] = 2
+    app.link.blobs = "CAM: blobs"
+    texts_of(cam3)
+    bare = paint(cam3.shape_rect)
+    good = " ".join(blob9(*b) for b in
+                    ((50, 45, 3, 1, 11, 9, 84), (190, 48, 4, 1, 12, 10, 79),
+                     (52, 150, 3, 1, 10, 9, 80), (195, 152, 14, 0, 41, 38, 255)))
+    app.link.blobs = "CAM: blobs " + good
+    drew = texts_of(cam3)
+    pr = cam3.shape_rect
+    ck(pr is not None and pr.width > 0 and pr.height > 0,
+       "the shape panel is drawn and says what it covered: %s" % (pr,))
+    ck(paint(pr) > bare + 1500,
+       "and four blobs really put ink on it -- boxes, fills and crosshairs "
+       "(%d lit pixels against %d for an empty frame)" % (paint(pr), bare))
+    nums = [m for r, m, inside in drew if not inside and pr.colliderect(r)]
+    ck(any("11x9" in m and "84px" in m and "%" in m for m in nums),
+       "the numbers under it give each blob its w x h, its pixel count and "
+       "how full the box is: %s" % nums)
+    ck(any("41x38" in m for m in nums),
+       "including the one that got dropped, which is the blob a gate is "
+       "being tuned to reject: %s" % nums)
+    ck("box centres land on the reported positions" in
+       "\n".join(cam3.blob_lines()),
+       "and the readout says the box really is in the sensor's own array: %s"
+       % [l for l in cam3.blob_lines() if "box centres" in l])
+    quiet_red = reds(pr)
+
+    # Now break it: the same blobs with their boxes shifted a long way off.
+    app.link.blobs = "CAM: blobs " + " ".join(
+        blob9(*b, dx=dx, dy=dy) for b, dx, dy in
+        (((50, 45, 3, 1, 11, 9, 84), 14, 7),
+         ((190, 48, 4, 1, 12, 10, 79), -12, 6),
+         ((52, 150, 3, 1, 10, 9, 80), 13, -9),
+         ((195, 152, 14, 0, 41, 38, 255), -15, 8)))
+    drew = texts_of(cam3)
+    said = "\n".join(cam3.blob_lines())
+    ck("BOX AND POSITION DISAGREE" in said,
+       "a box that does not sit on its own position is called out in words, "
+       "because it means the units are wrong: %s"
+       % [l for l in cam3.blob_lines() if "DISAGREE" in l])
+    ck("128" in said,
+       "against the frame it is measured in, so 16 px means something: %r"
+       % [l for l in cam3.blob_lines() if "DISAGREE" in l])
+    nums = [m for r, m, inside in drew if not inside and pr.colliderect(r)]
+    ck(sum(1 for m in nums if "off " in m) >= 3,
+       "and every disagreeing blob carries its own gap: %s" % nums)
+    ck(reds(cam3.shape_rect) > quiet_red + 60,
+       "the gap is DRAWN as well -- a line from the box centre to the "
+       "crosshair, so it cannot be missed from a sofa (%d red pixels against "
+       "%d when they agree)" % (reds(cam3.shape_rect), quiet_red))
+
+    # Kept and dropped have to be told apart, or a gate cannot be judged.
+    app.link.blobs = "CAM: blobs " + " ".join(
+        blob9(*b) for b in ((50, 45, 3, 1, 11, 9, 84),
+                            (190, 48, 4, 1, 12, 10, 79)))
+    texts_of(cam3)
+    all_kept = reds(cam3.shape_rect)
+    app.link.blobs = "CAM: blobs " + " ".join(
+        blob9(*b) for b in ((50, 45, 3, 0, 11, 9, 84),
+                            (190, 48, 4, 0, 12, 10, 79)))
+    texts_of(cam3)
+    ck(reds(cam3.shape_rect) > all_kept + 40,
+       "a gate-dropped blob is drawn in a different colour from a kept one "
+       "(%d red pixels against %d)" % (reds(cam3.shape_rect), all_kept))
+
+    # The other three report formats, and a frame with nothing in it. None of
+    # them may throw: pical is fullscreen on a Pi with no console, so one
+    # exception inside draw is a black TV and no way to find out why.
+    for what, line, want in (
+            ("seven fields, the previous firmware",
+             "CAM: blobs 50,45,3,1,11,9,84 190,48,4,1,12,10,79", "no origin"),
+            ("four fields, no sizes at all",
+             "CAM: blobs 50,45,3,1 190,48,4,1 52,150,3,1 195,152,14,0 "
+             "(sizes need fmt:1)", "boxes need Blob detail 2"),
+            ("a frame with no blobs in it", "CAM: blobs", "no blobs reported"),
+            ("no answer from the gun yet", "", "no blobs reported"),
+            ("a line the send buffer cut in half",
+             "CAM: blobs 50,45,3,1,11,9,84,58,4 190,48,4,1,12", "11x9"),
+            ("numbers the sensor cannot produce",
+             "CAM: blobs 999,999,3,1,127,127,9999,127,127 "
+             "-5,-9,3,0,-2,-3,-4,-6,-7", None)):
+        app.link.blobs = line
+        try:
+            drew = texts_of(cam3)
+            threw = None
+        except Exception as e:                 # noqa: BLE001 - that IS the test
+            drew, threw = [], e
+        ck(threw is None, "the panel survives %s (%r)" % (what, threw))
+        if threw is None and want:
+            shown = [m for r, m, inside in drew
+                     if not inside and cam3.shape_rect.colliderect(r)]
+            ck(any(want in m for m in shown),
+               "...and says '%s' rather than drawing a measured box it never "
+               "got: %s" % (want, shown))
+        if threw is None:
+            ck(cam3.shape_rect.right <= pi_sc.w
+               and cam3.shape_rect.bottom <= pi_sc.h
+               and cam3.shape_rect.left >= 0 and cam3.shape_rect.top >= 0,
+               "and stays on the screen with %s (%s)"
+               % (what, cam3.shape_rect))
+
+    # ---- and it must not be drawn over anything else ----------------------
+    # The panel is a whole column tall and the readout under it is CENTRED and
+    # runs nearly the full width, so the readout has to clear the panel as
+    # well as the rows. Taking the rows alone drew the first line of the
+    # readout straight through the panel's own numbers.
+    app.link.blobs = "CAM: blobs " + good
+    for advanced in (False, True):
+        page(cam3, advanced)
+        drew = texts_of(cam3)
+        pr = cam3.shape_rect
+        what = "second page" if advanced else "camera page"
+        hit = [r for r in (row.rect for row in cam3.rows if row.rect)
+               if pr.colliderect(r)]
+        ck(not hit, "the panel clears every row on the %s (%s)" % (what, hit))
+        under = [(r, m) for r, m, inside in drew if inside and pr.colliderect(r)]
+        ck(not under,
+           "and the readout starts below it rather than through it, %s (%s)"
+           % (what, [m[:24] for _, m in under]))
+        tip_top = pi_sc.h * pical.TIP_Y - pi_sc.f_s.get_height() / 2.0
+        ck(pr.bottom <= tip_top - 6,
+           "and the panel's own numbers clear the row hint, %s (panel ends "
+           "%d, hint starts %d)" % (what, pr.bottom, tip_top))
+        wide = [m for r, m, _i in drew if r.left < 0 or r.right > pi_sc.w]
+        ck(not wide,
+           "with nothing on the %s drawn off the side of a 1024 px screen "
+           "(%s)" % (what, [m[:40] for m in wide]))
+    labels = page(cam3, False)
+
+    # The sensor's own thresholds, the odd-one-out gate, the shape gates, the
+    # report format and the full-mode register all reach the gun -- from
+    # whichever page they now live on. fmt: is sent ONLY for full mode: the
+    # previous firmware has no such key and drops it in silence, so a gun on
+    # it could never be moved off detail 0 at all.
+    for label, wire, adv in (("Biggest blob (height)", b"cam=bhmax:", False),
+                             ("Odd-one-out (size steps)", b"cam=rtol:", True),
+                             ("Biggest blob (pixels)", b"cam=pxmax:", True),
+                             ("Roundness limit", b"cam=armax:", True),
+                             ("Sensor max size (0x06)", b"cam=hwmax:", True),
+                             ("Sensor min size (0x1B)", b"cam=hwmin:", True),
+                             ("Full-mode register (0x33)", b"cam=fullreg:",
+                              True)):
+        here = page(cam3, adv)
+        ck(label in here, "the camera screen offers '%s'" % label)
+        cam3.sel = here.index(label)
         n0 = len(ser.written)
         app.step([key(pygame.K_RIGHT)], t + 9.5)
         ck(any(wire in w for w in ser.written[n0:]),
            "and nudging it sends %s to the gun" % wire.decode())
 
-    # ---- the shape gate, in the reader's units and inside the firmware's
+    # ---- the shape gates, in the reader's units and inside the firmware's
     # ---- refusal ranges ----------------------------------------------------
-    # The gun REFUSES a pxmax of 1..11 and an armax of 1..15 outright -- it
-    # answers by name and leaves the old value alone. On a screen with no
-    # console that is an arrow that visibly does nothing, so the ladders are
-    # built so it cannot be reached: every rung, stepped from every other
-    # rung, in both directions, has to be a value the firmware takes.
-    for label, floor in (("Biggest blob (pixels)", 12),
-                         ("Roundness limit", 16)):
-        row = cam3.rows[labels.index(label)]
+    # The gun REFUSES a bhmax of 1..7, a pxmax of 1..11 and an armax of 1..15
+    # outright -- it answers by name and leaves the old value alone. On a
+    # screen with no console that is an arrow that visibly does nothing, so
+    # the ladders are built so it cannot be reached: every rung, stepped from
+    # every other rung, in both directions, has to be a value the gun takes.
+    for label, floor, adv in (("Biggest blob (height)", 8, False),
+                              ("Biggest blob (pixels)", 12, True),
+                              ("Roundness limit", 16, True)):
+        here = page(cam3, adv)
+        row = cam3.rows[here.index(label)]
         sent = []
         real_send, app.link.send = app.link.send, sent.append
         try:
@@ -1042,32 +1348,73 @@ def main():
     # And the value on screen is the one a person thinks in. armax travels as
     # EIGHTHS of a ratio: a row showing "20" beside a label saying roundness
     # is a setting nobody at a TV can check, whichever way they set it.
-    ar = cam3.rows[labels.index("Roundness limit")]
+    adv_labels = page(cam3, True)
+    ar = cam3.rows[adv_labels.index("Roundness limit")]
     ck(ar.show(20) == "2.5:1" and ar.show(16) == "2:1"
        and ar.show(24) == "3:1" and ar.show(0) == "off",
        "the roundness row shows a RATIO, not the wire's eighths (%s)"
        % [ar.show(v) for v in (0, 16, 20, 24, 32)])
-    px = cam3.rows[labels.index("Biggest blob (pixels)")]
+    px = cam3.rows[adv_labels.index("Biggest blob (pixels)")]
     ck(px.show(14) == "14 px" and px.show(0) == "off" and px.show(None) == "--",
        "and the pixel row names its unit, with 'off' for the value that "
        "means off (%s)" % [px.show(v) for v in (None, 0, 14)])
+    # armax is kept for guns already set up with it, and it is WRONG here: the
+    # ratio needs a width, and at sensitivity 2 the sensor smears a blob
+    # sideways, so the gate drops real LEDs. That reaches the user as a cursor
+    # that sticks and never as the row they set weeks ago, so the row itself
+    # has to say so -- a release note nobody at a TV can read is not a warning.
+    ck("NOT recommended" in ar.tip(),
+       "and the roundness row says outright that it is not recommended: %r"
+       % ar.tip())
+    ck("NOT recommended" not in px.tip()
+       and "NOT recommended" not in cam3.rows[
+           adv_labels.index("Smallest blob kept")].tip(),
+       "while the rows that ARE still fit for use do not, so the warning "
+       "keeps its meaning")
     # Whatever the gun says, including what it cannot mean. A firmware that
     # means something else by the key, or a value typed at a serial terminal,
     # must not take the screen down: pical is fullscreen with no console, so
     # an exception inside draw is a black TV.
+    labels = page(cam3, False)
+    bh = cam3.rows[labels.index("Biggest blob (height)")]
+    ck(bh.show(10) == "10 rows" and bh.show(0) == "off"
+       and bh.show(None) == "--",
+       "the height row is in sensor ROWS, which is what keeps it apart from "
+       "the pixel count -- both would otherwise read '12 px' (%s)"
+       % [bh.show(v) for v in (None, 0, 10)])
     for v in (-1, 7, 255, 10 ** 9):
-        for r_ in (ar, px):
+        for r_ in (ar, px, bh):
             ck(isinstance(r_.show(v), str),
                "'%s' survives a value the gun should never send (%r -> %r)"
                % (r_.label, v, r_.show(v)))
-    for label in ("Biggest blob (pixels)", "Roundness limit"):
-        tip = cam3.rows[labels.index(label)].tip()
+    for label, adv in (("Biggest blob (height)", False),
+                       ("Biggest blob (pixels)", True),
+                       ("Roundness limit", True)):
+        here = page(cam3, adv)
+        tip = cam3.rows[here.index(label)].tip()
         ck("Blob detail 2" in tip,
            "'%s' says it needs full detail -- in any other format the gate "
            "stands down and the row does nothing: %r" % (label, tip))
         ck("drops" in tip,
            "and says what it physically throws away, not what it sets: %r"
            % tip)
+    labels = page(cam3, False)
+
+    # No hint may be wider than the screen. They are drawn CENTRED and on one
+    # line, with no wrapping anywhere -- a hint 1141 px long on the Pi's 1024
+    # simply loses a word off each end, and the word this one lost was the
+    # "NOT recommended" it was rewritten to carry.
+    for advanced in (False, True):
+        page(cam3, advanced)
+        for r_ in cam3.rows:
+            tip = r_.tip()
+            if not tip:
+                continue
+            wide = pi_sc.f_s.size(tip)[0]
+            ck(wide <= pi_sc.w - 20,
+               "the '%s' hint fits the Pi's screen (%d px of %d): %r"
+               % (r_.label, wide, pi_sc.w, tip))
+    labels = page(cam3, False)
 
     # A REFUSAL has to reach the user. The gun answers by name and leaves the
     # old value in place, so the row goes on showing the truth -- which from
@@ -1106,8 +1453,16 @@ def main():
     save_hint = cam3.rows[labels.index("Save to gun")].tip()
     ck("full-mode register" in save_hint and "sensor thresholds" in save_hint,
        "the Save hint names what does NOT persist: %r" % save_hint)
-    ck("NOT saved" in cam3.rows[labels.index("Full-mode register (0x33)")].tip(),
+    adv_labels = page(cam3, True)
+    ck("NOT saved" in cam3.rows[
+           adv_labels.index("Full-mode register (0x33)")].tip(),
        "and the register's own row says it too")
+    # Nothing on the second page saves, and the row that leaves it is the last
+    # thing a user touches after a minute spent on the size window.
+    ck("Save" in cam3.rows[adv_labels.index("Back")].tip(),
+       "the second page's Back row says where Save is: %r"
+       % cam3.rows[adv_labels.index("Back")].tip())
+    labels = page(cam3, False)
 
     # The camera's true frame rate, from the gun's own clock. Nobody has ever
     # measured it on this sensor, and it decides whether full mode is
@@ -1178,7 +1533,7 @@ def main():
     ck("Learn LED shape" in labels and "Write shape CSV to the stick" in labels,
        "the wiicam camera screen offers the shape capture and its CSV")
     csv_row = cam4.rows[labels.index("Write shape CSV to the stick")]
-    ck("shape-DATE.csv" in csv_row.tip() and "0 LED" not in csv_row.tip(),
+    ck("shape-NNN.csv" in csv_row.tip() and "0 LED" not in csv_row.tip(),
        "and before anything is captured its hint says what the file is, not "
        "that it holds nothing: %r" % csv_row.tip())
 
@@ -1273,12 +1628,15 @@ def main():
     for ln in learn_lines(0, 3400, 13120, 268, full):
         app.link.src.q.put(ln)
     app.toast = ""
-    time.sleep(1.1)                            # a new second, so a new name
+    # No sleep. The name used to be built from the clock alone, so two
+    # captures in the same second landed on the same file and this test had to
+    # wait out a second to see two of them -- which is precisely the collision
+    # a Pi with no RTC hits on every boot, at every second of the day.
     cam4.shape_save()
     shapes = sorted(f for f in os.listdir(pical.OUT_DIR)
                     if f.startswith("shape-"))
-    ck(len(shapes) == 2, "a second capture writes a second file rather than "
-                         "overwriting the first (%s)" % shapes)
+    ck(len(shapes) == 2, "a second capture written in the SAME second is a "
+                         "second file, not an overwrite (%s)" % shapes)
     hdr, rows = csv_rows(os.path.join(pical.OUT_DIR, shapes[-1]))
     got = {(r[0], r[1]): r for r in rows}
     ck(len(rows) == 12 and got[("rej", "irel")][5] == "12",
@@ -1288,6 +1646,86 @@ def main():
        "with the LED and rejected counts on every row")
     ck("13120 LED" in app.toast,
        "and the toast reports what was captured: %r" % app.toast)
+
+    # ---- never overwrite a recording ---------------------------------------
+    # The Pi has NO real-time clock: every boot starts it at the same value,
+    # so a capture taken today and one taken next week are stamped with the
+    # same second. Under the old clock-only names the second one silently
+    # replaced the first, and a capture taken at the TV is the only copy there
+    # is. The number is scanned from the directory and only ever counts up.
+    ck(all(f.split("-")[1].isdigit() and len(f.split("-")[1]) == 3
+           for f in shapes),
+       "every recording carries a zero-padded number (%s)" % shapes)
+    nn = [int(f.split("-")[1]) for f in shapes]
+    ck(nn == sorted(nn) and nn[1] > nn[0],
+       "counting up, so a plain sort puts them in the order they were taken "
+       "-- which is what the clock could not do (%s)" % shapes)
+    ck(("recording %d" % nn[-1]) in app.toast,
+       "and the toast says the number, which is what a user has to say to "
+       "ask for the file: %r" % app.toast)
+
+    seq_dir = tempfile.mkdtemp(prefix="pical-seq-")
+    ck(pical.next_recording(seq_dir) == 1, "an empty stick starts at 1")
+    for name in ("blobs-001-010101.csv", "shape-002-010101.csv",
+                 "blobs-007-235959.csv"):
+        open(os.path.join(seq_dir, name), "w").close()
+    ck(pical.next_recording(seq_dir) == 8,
+       "the next number is the highest ALREADY THERE plus one, whatever wrote "
+       "it -- blobs and shape share one count so 'number 4' means one file "
+       "(got %d)" % pical.next_recording(seq_dir))
+    # A lens sweep is 'lenssweep-20260901-013038.log'. Read as a sequence
+    # number that date would make the next recording number 20,260,902, and
+    # every name after it unreadable.
+    open(os.path.join(seq_dir, "lenssweep-20260901-013038.log"), "w").close()
+    ck(pical.next_recording(seq_dir) == 8,
+       "a datestamped name is not mistaken for a sequence number (got %d)"
+       % pical.next_recording(seq_dir))
+    ck(pical.next_recording(os.path.join(seq_dir, "nope")) == 1,
+       "and a directory that cannot be listed still records, rather than "
+       "refusing")
+
+    # The real thing, hammered: a hundred names in the same second, none of
+    # them a name that already exists.
+    real_out, pical.OUT_DIR = pical.OUT_DIR, seq_dir
+    try:
+        seen = set(os.listdir(seq_dir))
+        clashed, nums = [], []
+        for _ in range(100):
+            p, n = pical.recording_path("blobs")
+            name = os.path.basename(p)
+            if name in seen:
+                clashed.append(name)
+            seen.add(name)
+            nums.append(n)
+            open(p, "w").close()
+        ck(not clashed,
+           "a hundred recordings taken inside one second never reuse a name "
+           "(%s)" % clashed[:3])
+        ck(nums == sorted(nums) and len(set(nums)) == len(nums),
+           "and their numbers go up one at a time, never repeating (%s..%s)"
+           % (nums[:3], nums[-3:]))
+        ck(nums[0] == 8, "carrying on from what was already there (%d)"
+           % nums[0])
+        # Belt and braces: a file already sitting on the name the count picks
+        # is stepped over rather than written through. With no clock and a
+        # directory that may have failed to list, "highest + 1" is a good
+        # guess, not a proof -- and this is the one thing that must not be
+        # guessed at, because the file it would destroy is the only copy.
+        taken = os.path.join(seq_dir, "shape-%03d-%s.csv"
+                             % (pical.next_recording(seq_dir),
+                                time.strftime("%H%M%S")))
+        with open(taken, "w") as fh:
+            fh.write("the capture nobody wants to lose\n")
+        got, _n = pical.recording_path("shape")
+        ck(os.path.abspath(got) != os.path.abspath(taken)
+           and not os.path.exists(got),
+           "the name the count lands on is checked against the stick as "
+           "well, so nothing is ever written through (%s, not %s)"
+           % (os.path.basename(got), os.path.basename(taken)))
+        ck(open(taken).read().startswith("the capture"),
+           "and the file that was already there is still what it was")
+    finally:
+        pical.OUT_DIR = real_out
 
     # ---- the twelve lines, out of order and cut short ----------------------
     # They arrive interleaved with the frame stream and any of them can be

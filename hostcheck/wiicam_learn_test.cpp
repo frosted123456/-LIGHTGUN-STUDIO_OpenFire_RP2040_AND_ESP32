@@ -771,10 +771,24 @@ int main()
         { 256, 528, 4,  10, 20, 13, 23, 140 },
         { 512, 384, 7,  10, 20, 15, 22, 150 },   // 5 wide, 2 tall, at the centre
     };
+    // The same three corners and the same stray SIZE and INTENSITY, with a box
+    // the height cut is the only gate that objects to: 3 wide and 9 tall is
+    // 3:1, so a 2:1 armax would catch it too and there would be no telling
+    // which knob did the rejecting -- bsrej counts them all in one place.
+    // Kept at 9 rather than higher so none of its four box features clamps:
+    // width 3, height 9, aspect 24 eighths and area 27 all land in bins of
+    // their own, and none of them is a bin the 5x2 stray above used.
+    static const FullObj SHAPE_STRAY_TALL[4] = {
+    //    x    y  sz  xmn ymn xmx ymx  px
+        { 256, 240, 2,  10, 20, 14, 24,  60 },
+        { 768, 240, 3,  10, 20, 15, 25, 100 },
+        { 256, 528, 4,  10, 20, 13, 23, 140 },
+        { 512, 384, 7,  10, 20, 13, 29, 150 },   // 3 wide, 9 tall, at the centre
+    };
     {
         // Lock on four real corners first, with every gate open and the
         // capture off, so nothing here is learned from the lock-in.
-        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,pxmax:0,armax:0");
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0");
         wiicam_cam_command("camlearn=on:0");
         for (int i = 0; i < 8; ++i) frame(SHAPE_RIG);
 
@@ -841,7 +855,49 @@ int main()
            "sink is told what the blob looked like, never which gate objected "
            "to it");
 
-        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,pxmax:0,armax:0");
+        // And a THIRD way in: the height cut. It is a different knob inside
+        // the same shape gate, and it is the one with a real capture behind
+        // it, so it had better be able to contribute to the distribution it
+        // will be re-chosen from. A height rejection that fed nothing would
+        // leave the negative class describing only the strays the OTHER knobs
+        // happen to catch -- which is a distribution shaped by the gate that
+        // was switched on while it was captured, and that is precisely what
+        // labelling by geometry exists to avoid.
+        wiicam_cam_command("cam=bmin:0,bmax:15,bhmax:8,pxmax:0,armax:0");
+        const unsigned long srej_c = blobstat("bsrej=");
+        const unsigned long rej_c  = blobstat("brej=");
+        const unsigned long r3c    = blobstat("br3=");
+        const unsigned long far_c  = blobstat("bfar=");
+        frame(SHAPE_STRAY_TALL);
+        ck(blobstat("bsrej=") == srej_c + 1 && blobstat("brej=") == rej_c,
+           "the HEIGHT cut is what rejected this one -- its 9-row box, with "
+           "the size window wide open and the other two shape knobs off");
+        ck(blobstat("br3=") == r3c + 1 && blobstat("bfar=") == far_c + 1,
+           "...three corners resolved with the fourth reconstructed, and the "
+           "stray nowhere near it: the positional label the negative class "
+           "needs, arrived at without the height cut having any vote in it");
+        ck(wl_blobs(1) == 3u && wl_blobs(0) == 0u,
+           "a bhmax rejection reaches the negative class too -- the third of "
+           "the three ways in, and the sink cannot tell them apart");
+        ck(hat(1, WL_BH, 9) == 1u && hat(1, WL_BW, 3) == 1u,
+           "carrying the tall stray's OWN 3x9 box: 9 rows in the height "
+           "histogram is the sample a reader needs to see where a height cut "
+           "could go, and it is the feature that got the blob rejected");
+        ck(hat(1, WL_ASPECT, 16) == 1u && hat(1, WL_AREA, 27) == 1u,
+           "...with its own 3:1 aspect and its 27 pixels of area, none of them "
+           "in a bin the 5x2 stray used, so a sample filed under the wrong "
+           "blob's box would be visible rather than absorbed into a count "
+           "that was already there");
+        ck(hat(1, WL_SZ, 7) == 3u && hat(1, WL_IREL, 24) == 3u,
+           "...and its size and relative intensity land in the same two bins "
+           "all three rejections did: the two features that did not change are "
+           "the two that say the sink was told what the blob looked like and "
+           "never which gate objected to it");
+        ck(hat(1, WL_BH, 2) == 2u,
+           "and the earlier pair are still where they were -- the third sample "
+           "is added to the negative class, not written over it");
+
+        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0");
     }
 
     // ======================================================================
