@@ -29,7 +29,12 @@ from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
 #      intensity a full report adds to every blob
 #   6  the shape-learning capture: the multi-line 'CAM: hist' reply, held
 #      until it is whole, and the CSV both front ends write out of it
-LINK_API = 6
+#   7  the shape gate (pxmax/armax) and the counters that judge every gate's
+#      rejections (bsrej, bfar, bnear). All five are parsed HERE, so a pical
+#      copied onto a stick beside an older tools/ would show the two new rows
+#      as "--" for ever and never raise the false-negative warning -- with
+#      nothing anywhere to say why.
+LINK_API = 7
 
 SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
 # Board-scaled noise gates: the wiicam's 33-deg lens has ~2.2x less screen
@@ -142,7 +147,11 @@ def parse_blobs(line):
 
     Four fields per blob -- (x, y, size, kept) -- in basic and extended mode,
     and seven in full mode, where the sensor also reports the blob's bounding
-    box and its brightness: (x, y, size, kept, boxw, boxh, intensity). The box
+    box and its pixel count: (x, y, size, kept, boxw, boxh, px). Wiibrew calls
+    that last field an intensity; measured against the box it is plainly a
+    count of lit pixels -- it never once exceeded the bounding box across 340
+    blobs, and a 2x2 box reads exactly 4 every single time, which a brightness
+    would not. The wire name is kept because the CSVs already carry it. The box
     is in the sensor's own 128x96 pixel array; x and y are NOT. The gun
     normalises those out of the sensor's 1024x768 report into the pipeline's
     240x176 space before it records them (wiicam_aim.cpp, x = nx * SX), so a
@@ -196,7 +205,20 @@ class BlobLog:
             "x2", "y2", "s2", "k2", "x3", "y3", "s3", "k3",
             "fmt", "fullreg",
             "w0", "h0", "i0", "w1", "h1", "i1",
-            "w2", "h2", "i2", "w3", "h3", "i3")
+            "w2", "h2", "i2", "w3", "h3", "i3",
+            # The two halves of "was that rejection right?", and the shape
+            # gate's own count. bfar and bnear reached the firmware after this
+            # file was last touched and were never written down, so every
+            # capture taken since answers the one question the log exists to
+            # answer -- is the gate throwing away real LEDs? -- with silence.
+            # bnear is the false-negative meter: it counts blobs a gate
+            # dropped that sat exactly where the missing corner should have
+            # been, and it moves long before the cursor starts sticking.
+            "bfar", "bnear", "bsrej",
+            # ...and the settings those counts were taken under. A pixel-count
+            # and roundness limit read months later mean nothing unless the
+            # row says which limits were in force when it was written.
+            "pxmax", "armax")
 
     def __init__(self, path):
         self.path = path
@@ -241,6 +263,12 @@ class BlobLog:
         for i in range(4):
             b = blobs[i] if i < len(blobs) else ()
             vals.extend(b[4:7] if len(b) == 7 else ("", "", ""))
+        # Blank, not zero, on a gun too old to send them: a counter that reads
+        # 0 for a whole capture is indistinguishable from a gate that never
+        # fired, and "bnear stayed at zero" is exactly the conclusion this
+        # column is used to draw.
+        for k in ("bfar", "bnear", "bsrej", "pxmax", "armax"):
+            vals.append(last.get(k, ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
         # an empty file, because the writes are still in the page cache.
@@ -654,7 +682,18 @@ class Link:
                                                  "brej", "bframes", "bdrop",
                                                  "br4", "br3", "br2", "br1",
                                                  "br0", "brrej", "bvalve", "bms",
-                                                 "rtol", "hwmax", "hwmin"):
+                                                 "rtol", "hwmax", "hwmin",
+                                                 # The shape gate and the two
+                                                 # counters that judge every
+                                                 # gate's rejections. Left out
+                                                 # of this tuple they never
+                                                 # reach last[] at all, so the
+                                                 # CSV column and the readout
+                                                 # would both be permanently
+                                                 # blank with nothing on the
+                                                 # wire to blame for it.
+                                                 "pxmax", "armax",
+                                                 "bsrej", "bfar", "bnear"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -1114,6 +1153,18 @@ def main():
                 "units to the box pixel -- so the box is a shape, not a "
                 "distance. If those numbers do not move with the LEDs, the "
                 "mode register below is the thing to try.")
+            # Said HERE, because this is the only moment the two shape
+            # controls stop being inert -- and there is no room beside them
+            # for the numbers behind the recommendation. Over 52,624
+            # confirmed LED blobs the pixel count ran 4-12 and 99.9% of the
+            # boxes were 2:1 or rounder, so both defaults are the measured
+            # envelope with a step of margin on it.
+            log("full detail is also what the 'biggest blob' and 'roundness' "
+                "limits need: in any other format the gun is sent no box and "
+                "the gate stands down. Measured over 52,624 confirmed LED "
+                "blobs, an LED is 4-12 pixels and 99.9% of them are 2:1 or "
+                "rounder -- so 14 px and 2.5:1 refuse only shapes no LED here "
+                "has ever made.")
     lab(rowb, "blob detail", (F[0], 9), C_DIM).pack(side="left")
     for fv, nm in ((0, "off"), (1, "sizes"), (2, "full detail")):
         tk.Radiobutton(rowb, text=nm, value=fv, variable=cam_fmt,
@@ -1153,7 +1204,7 @@ def main():
     #
     # On a row of its own, and it has to be: the detail radios above already
     # need 500 px of the 585 this panel gets at the fixed 1020 px window
-    # width, and the label and two radios below need 228 more. The line this
+    # width, and this label and its two radios need 228 more. The line this
     # would have saved was taken off the headings instead.
     rowfr = tk.Frame(frame_wii, bg=C_BG); rowfr.pack(fill="x", pady=1)
     cam_fullreg = tk.IntVar(value=85)
@@ -1174,29 +1225,114 @@ def main():
                        selectcolor="#161b22", activebackground=C_BG,
                        activeforeground=C_FG, highlightthickness=0, bd=0
                        ).pack(side="left")
-    lab(rowfr, "'full detail' only -- flip if it reads as nonsense",
-        (F[0], 8), C_DIM).pack(side="left", padx=(6, 0))
-    # wraplength, not hope: these two lines carry live numbers whose length is
-    # not known in advance, and a label that overflows this tab is CLIPPED with
-    # no sign that anything is missing.
-    rowb2 = tk.Frame(frame_wii, bg=C_BG); rowb2.pack(fill="x", pady=1)
-    # Odd-one-out: four identical emitters should look alike in one frame, so a
-    # blob that does not match the others is the suspect. Needs no distance
-    # tuning, which is what defeats the absolute window above.
-    lab(rowb2, "odd-one-out steps", (F[0], 9), C_DIM).pack(side="left")
-    for key, lo, hi, step in (("rtol", 0, 15, 1),
-                              ("hwmax", -1, 255, 5), ("hwmin", -1, 255, 1)):
-        if key != "rtol":
-            lab(rowb2, "sensor %s" % ("max" if key == "hwmax" else "min"),
-                (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
+    # The two SENSOR thresholds ride on this row now, not on the gate row
+    # below. Not for tidiness: the shape gate needs two more controls, and
+    # measured at 768p this panel has 21 px of vertical slack in a tab area
+    # that stops growing at 313 -- while a new row of spinboxes costs 25. The
+    # space had to come out of rows that already existed, and it is the WIDTH
+    # that was free. Measured: the register label and its radios take 234 px
+    # of 585, this pair takes 288, and the hint that used to follow the radios
+    # took 256. Two of those three fit here; three never did.
+    #
+    # The hint is the one that goes, because it is the one with a second copy:
+    # send_fullreg() logs the same advice, at greater length, the moment the
+    # register is touched. It also reads better this way -- everything on this
+    # row is a byte written straight into a camera register, and everything on
+    # the row below is judged on this side of the wire.
+    for key, lo, hi, step in (("hwmax", -1, 255, 5), ("hwmin", -1, 255, 1)):
+        lab(rowfr, "sensor %s" % ("max" if key == "hwmax" else "min"),
+            (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
         gv = tk.IntVar(value=lo)
         bgate[key] = gv
-        sp = tk.Spinbox(rowb2, from_=lo, to=hi, increment=step, width=4,
+        sp = tk.Spinbox(rowfr, from_=lo, to=hi, increment=step, width=4,
                         textvariable=gv, font=F, bg="#161b22", fg=C_FG,
                         relief="flat",
                         command=lambda k=key, v=gv: gate_send(k, v))
         sp.pack(side="left", padx=(2, 0))
         sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
+        bspin[key] = sp
+    # wraplength, not hope: these two lines carry live numbers whose length is
+    # not known in advance, and a label that overflows this tab is CLIPPED with
+    # no sign that anything is missing.
+    rowb2 = tk.Frame(frame_wii, bg=C_BG); rowb2.pack(fill="x", pady=1)
+    # The three gates the GUN's own code applies, in one place -- 492 px of
+    # the 585 this panel has, measured with all three on it.
+    #
+    # Odd-one-out: four identical emitters should look alike in one frame, so a
+    # blob that does not match the others is the suspect. Needs no distance
+    # tuning, which is what defeats the absolute window above.
+    lab(rowb2, "odd-one-out steps", (F[0], 9), C_DIM).pack(side="left")
+    gv = tk.IntVar(value=0)
+    bgate["rtol"] = gv
+    sp = tk.Spinbox(rowb2, from_=0, to=15, increment=1, width=4,
+                    textvariable=gv, font=F, bg="#161b22", fg=C_FG,
+                    relief="flat",
+                    command=lambda k="rtol", v=gv: gate_send(k, v))
+    sp.pack(side="left", padx=(2, 0))
+    sp.bind("<Return>", lambda _e, k="rtol", v=gv: gate_send(k, v))
+    bspin["rtol"] = sp
+
+    # ---- the shape gate ----------------------------------------------------
+    # The 4-bit size the gates above judge is nearly useless on this rig:
+    # 52,624 confirmed LED blobs came in at size 1 or 2 and did not move for a
+    # 1.8x change of distance. Full mode reports a bounding box and a pixel
+    # count, which are a real measurement, and these two gate on that. They
+    # need 'full detail' to do anything at all -- in any other format the gun
+    # has no box to judge and the gate stands down.
+    #
+    # Both are a ONE-CLASS envelope: the bounds come from what an LED has
+    # actually looked like, with a step of margin, so the gate can only refuse
+    # something outside everything we have ever measured. The firmware REFUSES
+    # a pxmax of 1..11 and an armax of 1..15 outright rather than clamping, so
+    # the spinboxes step through a fixed list of legal values instead of a
+    # range -- an increment of 1 from 0 would send pxmax:1 and get a refusal
+    # the user has to read the log to find out about.
+    #
+    # Shown in the units the user thinks in, not the wire's: armax is eighths
+    # of a ratio, and "20" on a panel means nothing at all next to "2.5:1".
+    PXMAX_STEPS = (("off", 0), ("12 px", 12), ("13 px", 13), ("14 px", 14),
+                   ("16 px", 16), ("20 px", 20), ("24 px", 24))
+    ARMAX_STEPS = (("off", 0), ("2:1", 16), ("2.5:1", 20), ("3:1", 24),
+                   ("4:1", 32))
+    shape_var = {}          # key -> (StringVar, {shown: wire}, {wire: shown})
+
+    def shape_send(k):
+        """Send the value the spinbox is showing, translated back to the wire.
+
+        Nothing here may raise: this runs from a Tk callback, and an exception
+        in one leaves the control dead with only a traceback on a stderr the
+        user does not have."""
+        var, to_wire, _ = shape_var[k]
+        try:
+            n = to_wire[var.get()]
+        except Exception:
+            return                      # not one of the rungs; ignore it
+        link.send("~cam=%s:%d" % (k, n))
+        link.send("~camblob?")
+        # There is no room beside these two for a hint saying so, and without
+        # one a gate set outside full mode does nothing at all with nothing to
+        # say why -- the same trap the shape capture has, answered the same
+        # way. Only when the gate is being turned ON: saying it while somebody
+        # switches one off is noise.
+        if n and cam_fmt.get() != 2:
+            log("the shape gate only acts in 'full detail'. In the other "
+                "formats the gun is sent no bounding box and no pixel count, "
+                "so there is nothing to judge and the gate stands down -- set "
+                "blob detail to 'full detail' above, or this setting does "
+                "nothing.")
+
+    for key, name, steps in (("pxmax", "biggest blob", PXMAX_STEPS),
+                             ("armax", "roundness", ARMAX_STEPS)):
+        lab(rowb2, name, (F[0], 9), C_DIM).pack(side="left", padx=(12, 2))
+        sv = tk.StringVar(value=steps[0][0])
+        shape_var[key] = (sv, {s: w for s, w in steps},
+                          {w: s for s, w in steps})
+        sp = tk.Spinbox(rowb2, values=tuple(s for s, _ in steps), width=5,
+                        textvariable=sv, font=F, bg="#161b22", fg=C_FG,
+                        relief="flat", state="readonly",
+                        readonlybackground="#161b22",
+                        command=lambda k=key: shape_send(k))
+        sp.pack(side="left", padx=(2, 0))
         bspin[key] = sp
 
     blob_lbl = lab(frame_wii, "blob readout: set blob detail to 'sizes' to "
@@ -1840,7 +1976,11 @@ def main():
     # The blob readout, polled only while the Camera tab is on a wiicam: it is
     # a live measurement of what the sensor is handing us, and the whole point
     # is to see it CHANGE as the gun swings past the window.
-    blob_state = {"ref": {}, "line": "", "good": True}
+    # near_said: the long explanation of the false-negative meter goes to the
+    # log the FIRST time it moves and not on every poll -- the log box is six
+    # lines tall, and a warning that repeats twice a second is a warning that
+    # pushes the diag verdict and the save result off the end of it.
+    blob_state = {"ref": {}, "line": "", "good": True, "near_said": False}
     blob_rate = FrameRate()
 
     def blob_tick():
@@ -1883,6 +2023,20 @@ def main():
                     continue            # mid-edit, not a number yet
                 if cur != v:
                     gv.set(v)
+            # The shape gate follows the gun too, through its own translation:
+            # the wire carries 20, the box shows "2.5:1". A value that is not
+            # one of the rungs -- a gun set from a serial terminal, or a
+            # firmware that means something else by the key -- is left alone
+            # rather than snapped to the nearest rung, because snapping would
+            # claim a setting nobody chose and the box would then send it.
+            for key, (sv, _to_wire, to_shown) in shape_var.items():
+                v = link.last.get(key)
+                if v is None or v not in to_shown:
+                    continue
+                if focused is not None and focused is bspin.get(key):
+                    continue
+                if sv.get() != to_shown[v]:
+                    sv.set(to_shown[v])
             # fmt is what the gun holds; ext is the same answer from a gun on
             # older firmware, which knows only "sizes on" and never sends fmt
             # at all. Falling back keeps the control showing the truth on such
@@ -1920,7 +2074,7 @@ def main():
                     # printed in extended mode reads as a measured shape.
                     txt = "%d,%d size %d" % (b[0], b[1], b[2])
                     if len(b) == 7:
-                        txt += " box %dx%d bright %d" % (b[4], b[5], b[6])
+                        txt += " box %dx%d %dpx" % (b[4], b[5], b[6])
                     if b[3] != 1:
                         txt += " DROPPED"
                     shown.append(txt)
@@ -1954,27 +2108,62 @@ def main():
                     # give-back at any point in the power cycle left "SIZE
                     # WINDOW TOO TIGHT" on the panel for good, long after the
                     # user had widened the window it was complaining about.
-                    d_rej = []
-                    for k in ("brej", "brrej", "bvalve"):
+                    d_rej = {}
+                    for k in ("brej", "brrej", "bvalve", "bsrej", "bnear"):
                         cur = link.last.get(k, 0)
                         prev = blob_state["ref"].get(k, cur)
-                        d_rej.append(max(0, cur - prev))
+                        d_rej[k] = max(0, cur - prev)
                         now.append(cur)
                         keys = keys + (k,)
                     blob_state["ref"] = dict(zip(keys, now))
                     blob_state["good"] = d[0] * 10 >= tot * 8
                     hz = blob_rate.hz
+                    # Every word here is rationed. This label wraps at the
+                    # panel's own width, a third wrapped line costs 14 px, and
+                    # the panel has 21 px of slack in the 313 px tab area a
+                    # 768p screen allows. Two counters had to go on, so two
+                    # things came off to pay for them: the sentence that
+                    # spelled out the give-back warning, and the "(we poll at
+                    # 420)" aside -- which was only ever a note about a number
+                    # this front end does not even poll at. pical's readout is
+                    # not wrapped this tight and still carries it.
+                    # Measured at the panel's 573 px: this line with one
+                    # warning up is 983 px of a 1100 px two-line budget, and
+                    # with both up it takes the third line and still leaves
+                    # 17 px under the cap.
                     blob_state["line"] = (
-                        "last %d frames: %d%% saw all four LEDs, %d%% only "
-                        "three, %d%% two or fewer   --   %s   dropped: %d by "
-                        "size, %d as odd-one-out"
+                        "last %d frames: %d%% saw all four LEDs, %d%% three, "
+                        "%d%% two or fewer   %s   dropped %d size, %d odd, "
+                        "%d shape"
                         % (tot, 100 * d[0] // tot, 100 * d[1] // tot,
                            100 * (d[2] + d[3] + d[4]) // tot,
-                           ("camera %.0f new frames/s (we poll at 420)" % hz)
+                           ("camera %.0f new frames/s" % hz)
                            if hz else "measuring camera rate...",
-                           d_rej[0], d_rej[1])
-                        + ("   SIZE WINDOW TOO TIGHT: it would drop nearly "
-                           "every blob" if d_rej[2] else ""))
+                           d_rej["brej"], d_rej["brrej"], d_rej["bsrej"])
+                        + ("   SIZE WINDOW TOO TIGHT" if d_rej["bvalve"]
+                           else "")
+                        # Not a drop count, and it must not read as one: bnear
+                        # counts blobs a gate threw away that sat exactly
+                        # where the missing corner should have been. Every
+                        # other number on this line is the gate working; this
+                        # one is the gate being WRONG, and it moves long
+                        # before the cursor starts sticking. Six words on the
+                        # panel, because forty more would cost the third
+                        # wrapped line; the sentence that explains it goes to
+                        # the log once, which is where this panel already puts
+                        # the reasoning that will not fit beside a control.
+                        + ("   GATE MAY BE TAKING REAL LEDs (%d)"
+                           % d_rej["bnear"] if d_rej["bnear"] else ""))
+                    if d_rej["bnear"] and not blob_state["near_said"]:
+                        blob_state["near_said"] = True
+                        log("GATE MAY BE TAKING REAL LEDs: %d blob(s) a gate "
+                            "dropped sat exactly where the missing corner had "
+                            "to be, so they were almost certainly LEDs. This "
+                            "is the false-negative meter -- it moves long "
+                            "before the cursor starts sticking. Widen "
+                            "whichever gate you tightened last: the size "
+                            "window, the odd-one-out steps, or the two shape "
+                            "limits beside them." % d_rej["bnear"])
                 if blob_state["line"]:
                     blob_lbl2.config(
                         text=blob_state["line"],

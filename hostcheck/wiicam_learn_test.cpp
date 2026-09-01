@@ -45,8 +45,12 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
     if (*l < g_bl) return -1;
     memcpy(o, g_blob, g_bl); *l = g_bl; return ESP_OK; }
 static uint32_t g_u32 = 0; static bool g_uhave = false;
+// Both gate keys by NAME. camreset erases the size gate's "gate0" AND the
+// shape gate's "gate1", and a stub that only knows the first lets the second
+// erase fall through to the calibration blob -- wiping a setting the command
+// never mentions while leaving the one it did.
 esp_err_t nvs_erase_key(nvs_handle_t, const char* k){
-    if (k && !strcmp(k, "gate0")) g_uhave = false;
+    if (k && (!strcmp(k, "gate0") || !strcmp(k, "gate1"))) g_uhave = false;
     else if (is_lens(k)) g_lhave = false; else g_bhave = false;
     return ESP_OK; }
 esp_err_t nvs_set_i16(nvs_handle_t, const char*, int16_t){ return ESP_OK; }
@@ -567,42 +571,54 @@ int main()
            "...and no histogram moved either");
     }
 
-    // ---- a frame the resolver could NOT confirm teaches nothing -------------
-    // This is the whole safety property. A blob the gate rejected in a frame
-    // that still resolved four real corners would be strong evidence; a
-    // rejection in a frame that did NOT is exactly the case where the gate may
-    // have been wrong, so it is evidence of nothing. Learning from it is the
-    // feedback loop the header refuses: the gate teaching itself, drifting
-    // once and never coming back, with a working-looking gun the whole time.
+    // ---- a rejection where the missing LED should be teaches nothing --------
+    // This is the whole safety property. A negative label is a positional
+    // verdict: the reconstructed fourth corner says where the missing LED must
+    // be, and a rejected blob nowhere near it was not an LED. A rejected blob
+    // sitting ON it is the opposite reading -- the gate almost certainly took
+    // a real corner -- and learning from that is the feedback loop the header
+    // refuses: the gate teaching itself that LEDs are strays, drifting once
+    // and never coming back, with a working-looking gun the whole time.
+    //
+    // Here the rejected blob IS a rig corner, so every one of these frames
+    // reaches the negative branch and every one of them has to come out of it
+    // with nothing recorded. ("The NEGATIVE class, and the second way into it"
+    // further down is the same branch with the blob moved off the corner,
+    // which is the case that does produce a sample.)
     //
     // Worth recording what this arrangement demonstrates about the sensor: the
     // wiicam has four object slots, so a rejected blob costs the resolver its
-    // fourth corner and the frame stops being confirmed. On this hardware
-    // r.n_real == 4 therefore implies every blob was kept -- see the notes at
-    // the end of this file.
+    // fourth REAL corner. On this hardware r.n_real == 4 therefore implies
+    // every blob was kept -- see the notes at the end of this file.
     {
         arm_clean();
         wiicam_cam_command("cam=bmin:0,bmax:5");
         FullObj junk[4];
         memcpy(junk, RIG, sizeof(junk));
         junk[3].sz = 12;                     // a big diffuse patch, out of window
-        const unsigned long rej_a = blobstat("brej=");
-        const unsigned long r3a   = blobstat("br3=");
+        const unsigned long rej_a  = blobstat("brej=");
+        const unsigned long r3a    = blobstat("br3=");
+        const unsigned long near_a = blobstat("bnear=");
         for (int i = 0; i < 6; ++i) frame(junk);
-        const unsigned long rej_b = blobstat("brej=");
-        const unsigned long r3b   = blobstat("br3=");
+        const unsigned long rej_b  = blobstat("brej=");
+        const unsigned long r3b    = blobstat("br3=");
         ck(rej_b >= rej_a + 6,
            "the size window really did reject a blob in every one of these "
            "frames -- without that this block proves nothing");
         ck(r3b >= r3a + 6,
            "...and every one of them left the resolver with three real "
            "corners, not four");
+        ck(blobstat("bnear=") >= near_a + 6,
+           "...and every rejected blob was sitting where the reconstruction "
+           "says the missing LED is, which is the false-negative meter and the "
+           "one reading that must never become a negative SAMPLE");
         ck(wl_frames() == 0u,
            "a frame the resolver could not confirm at four corners contributes "
            "NO frame, however many blobs it had");
         ck(wl_blobs(0) == 0u && wl_blobs(1) == 0u,
-           "and no blobs from it, in either class: an unconfirmed rejection is "
-           "not evidence, and the gate must never end up teaching itself");
+           "and no blobs from it, in either class: a blob rejected on top of "
+           "the missing corner is evidence about the GATE, not about strays, "
+           "and the gate must never end up teaching itself");
         ck(hsum(0, WL_SZ) == 0 && hsum(1, WL_SZ) == 0,
            "...so not one bin moved");
         wiicam_cam_command("cam=bmin:0,bmax:15");
@@ -715,6 +731,117 @@ int main()
            "must not leave twelve phantom round, area-zero blobs behind for a "
            "reader to draw a shape gate around");
         wiicam_cam_command("cam=fmt:2");
+    }
+
+    // ---- the NEGATIVE class, and the second way into it ---------------------
+    // A rejected blob is only evidence when the frame around it was labelled
+    // by GEOMETRY. The resolver supplies that label from three real corners
+    // and a reconstructed fourth: the reconstruction says where the missing
+    // LED must be, so a rejected blob sitting nowhere near ANY corner was not
+    // an LED whatever it looked like. That is the one path into class 1, and
+    // the SHAPE gate is now a second way to walk it -- the gate that rejected
+    // the blob is not part of the label, so a shape rejection has to feed the
+    // negative class exactly as a size-window rejection does. If it did not,
+    // the one gate with a real measurement behind it would be the one gate
+    // that never contributed a sample to the distribution it exists to be
+    // chosen from.
+    //
+    // Two frames on the same rig. SHAPE_RIG is four square corners, which is
+    // what the resolver locks on; SHAPE_STRAY keeps its first three and puts a
+    // stray in the fourth slot, at the middle of the rig -- 68 px from every
+    // corner in 240-space, comfortably past the DOUBLED association radius the
+    // negative label demands, so it cannot be the LED that went missing.
+    //
+    //   kept    4x4, 5x5 and 3x3, all square, sizes 2/3/4, px 60/100/140
+    //   stray   5x2, which is 2.5:1 and past a 2:1 armax, size 7, px 150
+    //
+    // The stray's six features land in six distinct bins and not one of them
+    // clamps, so a feature recorded in the wrong place says which one it was.
+    static const FullObj SHAPE_RIG[4] = {
+    //    x    y  sz  xmn ymn xmx ymx  px
+        { 256, 240, 2,  10, 20, 14, 24,  60 },
+        { 768, 240, 3,  10, 20, 15, 25, 100 },
+        { 256, 528, 4,  10, 20, 13, 23, 140 },
+        { 768, 528, 5,  10, 20, 14, 24, 190 },
+    };
+    static const FullObj SHAPE_STRAY[4] = {
+    //    x    y  sz  xmn ymn xmx ymx  px
+        { 256, 240, 2,  10, 20, 14, 24,  60 },
+        { 768, 240, 3,  10, 20, 15, 25, 100 },
+        { 256, 528, 4,  10, 20, 13, 23, 140 },
+        { 512, 384, 7,  10, 20, 15, 22, 150 },   // 5 wide, 2 tall, at the centre
+    };
+    {
+        // Lock on four real corners first, with every gate open and the
+        // capture off, so nothing here is learned from the lock-in.
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,pxmax:0,armax:0");
+        wiicam_cam_command("camlearn=on:0");
+        for (int i = 0; i < 8; ++i) frame(SHAPE_RIG);
+
+        wiicam_cam_command("cam=armax:16");
+        arm_clean();
+        const unsigned long srej_a = blobstat("bsrej=");
+        const unsigned long rej_a  = blobstat("brej=");
+        const unsigned long r3a    = blobstat("br3=");
+        const unsigned long far_a  = blobstat("bfar=");
+        frame(SHAPE_STRAY);
+        ck(blobstat("bsrej=") == srej_a + 1 && blobstat("brej=") == rej_a,
+           "the SHAPE gate is what rejected the stray -- its 2.5:1 box, not "
+           "its size, which the window was wide open for");
+        ck(blobstat("br3=") == r3a + 1,
+           "...and the three corners left behind still resolved, with the "
+           "fourth reconstructed: without that there is no positional label "
+           "and nothing may be learned at all");
+        ck(blobstat("bfar=") == far_a + 1,
+           "...and the stray sat nowhere near the reconstructed corner, which "
+           "is what makes it a stray rather than a corner the gate stole");
+
+        ck(wl_blobs(1) == 1u,
+           "a SHAPE-gate rejection reaches the negative class: the label came "
+           "from the resolver, so which gate did the rejecting cannot matter");
+        ck(wl_blobs(0) == 0u && wl_frames() == 0u,
+           "and nothing reaches the positive class from that frame -- three "
+           "real corners is not four, and only a four-corner frame says every "
+           "blob in it was an LED");
+
+        ck(hbin(1, WL_SZ) == 7 && hbin(1, WL_BW) == 5 && hbin(1, WL_BH) == 2,
+           "the negative sample carries the STRAY's own size and box, not the "
+           "first slot's or the last kept blob's");
+        ck(hbin(1, WL_ASPECT) == 12 && hbin(1, WL_AREA) == 10,
+           "...and its own aspect and area, 2.5:1 over 10 native pixels -- the "
+           "shape that got it rejected is the shape that gets recorded");
+        // Three kept blobs, so the median is the ODD branch: the middle value
+        // itself, 100, not the mean of the middle two. Take the even branch
+        // here and 150 is filed against (100+140)/2 = 120, which is bin 20.
+        ck(hbin(1, WL_IREL) == 24,
+           "and its intensity is filed against the median of the three blobs "
+           "that were KEPT -- 150 against 100 is bin 24, where averaging the "
+           "middle pair of an odd count would put it at 20");
+        ck(hsum(0, WL_SZ) == 0 && hsum(0, WL_IREL) == 0,
+           "...with the positive histograms still completely empty, so the "
+           "sample cannot have been filed under both labels");
+
+        // The same frame, the same stray, rejected by the SIZE WINDOW instead.
+        // Two gates, one negative class: the sample they produce has to be the
+        // same sample, or the distribution a gate is chosen from depends on
+        // which gate was switched on while it was captured.
+        wiicam_cam_command("cam=armax:0,bmin:0,bmax:5");
+        const unsigned long srej_b = blobstat("bsrej=");
+        const unsigned long rej_b  = blobstat("brej=");
+        frame(SHAPE_STRAY);
+        ck(blobstat("brej=") == rej_b + 1 && blobstat("bsrej=") == srej_b,
+           "this time the size WINDOW rejected it -- size 7 outside 0..5, with "
+           "the shape gate off");
+        ck(wl_blobs(1) == 2u && wl_blobs(0) == 0u,
+           "...and it is the second sample in the negative class");
+        ck(hat(1, WL_SZ, 7) == 2u && hat(1, WL_BW, 5) == 2u
+           && hat(1, WL_BH, 2) == 2u && hat(1, WL_ASPECT, 12) == 2u
+           && hat(1, WL_AREA, 10) == 2u && hat(1, WL_IREL, 24) == 2u,
+           "landing in the same six bins as the shape-gate rejection did: the "
+           "sink is told what the blob looked like, never which gate objected "
+           "to it");
+
+        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,pxmax:0,armax:0");
     }
 
     // ======================================================================
@@ -907,27 +1034,30 @@ int main()
     return fails ? 1 : 0;
 }
 
-// ---- what this test could NOT reach, and why -------------------------------
-// Two branches of the integration have no test above because nothing driving
-// wiicam_aim_process_sz can reach them on this sensor. Recorded here rather
-// than left as a silent gap in the coverage.
+// ---- two branches this test used to be unable to reach ---------------------
+// Kept because the reasoning is still worth having, and because the reason it
+// no longer applies is the whole shape of the negative class.
 //
-// 1. CLASS 1 IS UNREACHABLE THROUGH THE INTEGRATION. The negative class is fed
-//    from blobs a gate rejected in a frame the resolver confirmed at four real
-//    corners. But the wiicam has exactly four object slots, and only KEPT
-//    blobs are handed to quad_update -- so a rejected blob leaves three points
-//    and r.n_real can be at most three. r.n_real == 4 therefore implies every
-//    blob was kept, and `wl_note(keep[i] ? 0 : 1, ...)` can only ever pass 0.
-//    The block above proves the half that is a safety property (an unconfirmed
-//    frame teaches nothing), and the sink's own class routing is covered
-//    directly in "the class label"; what cannot be shown is the two-class
-//    comparison the module exists for. Reaching it needs the label taken
-//    before the gate runs -- e.g. noting the rejected blobs of a frame whose
-//    remaining three points still resolved, which is a firmware change, not a
-//    test change.
+// 1. CLASS 1 WAS UNREACHABLE while the only label was "four real corners". The
+//    wiicam has exactly four object slots and only KEPT blobs are handed to
+//    quad_update, so a rejected blob leaves three points and r.n_real can be
+//    at most three. r.n_real == 4 therefore implies every blob was kept, and
+//    `wl_note(keep[i] ? 0 : 1, ...)` under that label could only ever pass 0:
+//    the positive class filled while the negative one stayed structurally
+//    empty, and the module would have looked like it was working.
 //
-// 2. THE ODD-COUNT MEDIAN IS UNREACHABLE for the same reason. `m` in the
-//    intensity median is the number of kept blobs in a confirmed frame, which
-//    by the above is always 4, so `(m & 1) ? v[m/2] : ...` always takes the
-//    even branch. The even branch is pinned above, on a frame chosen so the
-//    two middle values differ from the mean of all four.
+//    The firmware took the second label the note asked for. A frame with three
+//    real corners and a RECONSTRUCTED fourth, with exactly one blob rejected,
+//    says where the missing LED must be -- so the rejected blob can be judged
+//    on position alone, and one sitting further than twice the resolver's own
+//    association radius from every corner was not an LED whatever it looked
+//    like. That is still a verdict no gate voted in. "The NEGATIVE class, and
+//    the second way into it" above drives it both ways round, through the size
+//    window and through the shape gate, and the two produce the same sample.
+//
+// 2. THE ODD-COUNT MEDIAN came with it. `m` in the intensity median is the
+//    number of KEPT blobs, which under a four-corner label was always 4 -- so
+//    `(m & 1) ? v[m/2] : ...` could only take the even branch. A three-corner
+//    frame with one blob rejected leaves three, and the odd branch is pinned
+//    in that same block on intensities chosen so the middle value and the mean
+//    of the middle pair land in different bins.

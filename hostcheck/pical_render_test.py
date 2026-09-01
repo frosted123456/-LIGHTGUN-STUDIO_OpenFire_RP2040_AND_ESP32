@@ -746,7 +746,7 @@ def main():
 
     # ---- full detail: seven fields per blob, and the worst-case readout ----
     # This is the state the readout is TALLEST in, and the one the slice at
-    # the bottom of Camera.draw has to survive: box and brightness on every
+    # the bottom of Camera.draw has to survive: box and pixel count on every
     # blob, three of them dropped, so the sentence wraps onto three rows and
     # not two.
     app.link.last.update({"fmt": 2, "fullreg": 85})
@@ -756,28 +756,49 @@ def main():
     # Two replies, because every counter on this screen is a DELTA: the first
     # takes the baseline, the second is the window the user actually reads.
     app.link.last.update({"bframes": 1900, "bms": 19000, "brej": 40,
-                          "brrej": 18, "bvalve": 4, "br4": 1000, "br3": 60,
+                          "brrej": 18, "bvalve": 4, "bsrej": 6, "bnear": 0,
+                          "br4": 1000, "br3": 60,
                           "br2": 20, "br1": 5, "br0": 0})
     cam3._rate.feed(1900, 19000)
     cam3.blob_lines()
     app.link.last.update({"bframes": 2000, "bms": 20000, "brej": 90,
-                          "brrej": 39, "br4": 1200, "br3": 90, "br2": 30,
-                          "br1": 8, "br0": 1})
+                          "brrej": 39, "bsrej": 20, "br4": 1200, "br3": 90,
+                          "br2": 30, "br1": 8, "br0": 1})
     cam3._rate.feed(2000, 20000)
     full = cam3.blob_lines()
     joined = "\n".join(full)
-    ck("box 41x38 bright 255" in joined,
-       "full detail shows each blob's box and brightness")
-    ck(len(pical.wrap(full[0], 96)) == 3,
-       "the full-mode blob line wraps onto three rows, not two (%d)"
-       % len(pical.wrap(full[0], 96)))
+    ck("box 41x38 255px" in joined,
+       "full detail shows each blob's box and pixel count")
+    # The readout wraps to the width the SCREEN has, not to a flat 96 columns.
+    # 96 filled 686 px of the Pi's 1024 and left 338 px of it empty, which
+    # spent a whole wrapped row of a readout that has six -- and the row it
+    # spent was the one at the bottom saying a capture was recording.
+    pi_cols = pical.readout_cols(pical.Screen(pygame.Surface((1024, 768))))
+    ck(pi_cols > 96,
+       "1024x768 wraps the readout wider than the old flat 96 columns (%d)"
+       % pi_cols)
+    # Asserted as "never worse", not as a fixed row count. It used to demand
+    # three rows at 96 and two at the measured width, which was true only for
+    # the exact length of the label at the time -- relabelling one field from
+    # "bright 255" to "255px" shortened every blob by five characters, both
+    # widths landed on two rows, and a test that was really about the WIDTH
+    # failed over wording. What has to hold is that measuring the screen can
+    # never cost a row versus the flat 96, whatever the line happens to say.
+    ck(len(pical.wrap(full[0], pi_cols)) <= len(pical.wrap(full[0], 96)),
+       "wrapping to the measured width never costs a row versus a flat 96 "
+       "(%d -> %d rows)"
+       % (len(pical.wrap(full[0], 96)), len(pical.wrap(full[0], pi_cols))))
     wrapped = []
     for ln in full:
-        wrapped.extend(pical.wrap(ln, 96))
-    ck(len(wrapped) >= 6,
-       "the worst-case readout is at least six rows deep, so the slice is "
-       "actually being tested (%d rows: %s)"
+        wrapped.extend(pical.wrap(ln, pi_cols))
+    ck(len(wrapped) >= 5,
+       "the worst-case readout still fills the rows drawn for it, so the fit "
+       "arithmetic is actually being tested (%d rows: %s)"
        % (len(wrapped), [r[:18] for r in wrapped]))
+    ck("14 dropped by shape" in joined,
+       "the shape gate's own drops are a DELTA beside the other two, so the "
+       "user can see which gate is doing the work: %s"
+       % [l for l in full if "dropped" in l])
 
     # The drop counts have to STAY on screen between gun replies. blob_lines()
     # runs from draw() at ~60 fps while link.last changes about once a second:
@@ -808,12 +829,66 @@ def main():
        "and it clears once the give-backs stop, instead of latching for the "
        "rest of the power cycle")
 
+    # ---- the false-negative meter -----------------------------------------
+    # bnear counts blobs a gate threw away that sat exactly where the missing
+    # corner had to be. It is the only number on this screen that says a gate
+    # is WRONG, and worded as one more drop count it would read as the gate
+    # earning its keep -- the exact opposite. It has to be a warning, and it
+    # has to be a delta like everything else here.
+    ck("GATE MAY BE TAKING REAL LEDs" not in "\n".join(cam3.blob_lines()),
+       "a bnear that has not moved raises nothing")
+    app.link.last.update({"bframes": 2300, "bms": 23000, "bnear": 3,
+                          "br4": 1500, "br3": 190, "br2": 60, "br1": 15,
+                          "br0": 4})
+    near = "\n".join(cam3.blob_lines())
+    ck("GATE MAY BE TAKING REAL LEDs" in near,
+       "bnear moving says the gate may be taking real LEDs: %s"
+       % [l for l in cam3.blob_lines() if "GATE" in l])
+    ck("3 dropped by" not in near and "3 dropped as" not in near,
+       "and it is NOT phrased as another drop count -- read as one it looks "
+       "like the gate working, which is the opposite of what it means: %s"
+       % [l for l in cam3.blob_lines() if "GATE" in l])
+    ck("corner" in near,
+       "it says WHY the blob was probably an LED -- it sat where a corner "
+       "should have been")
+    app.link.last.update({"bframes": 2400, "bms": 24000,
+                          "br4": 1600, "br3": 220, "br2": 70, "br1": 18,
+                          "br0": 5})
+    ck("GATE MAY BE TAKING REAL LEDs" not in "\n".join(cam3.blob_lines()),
+       "and it clears once the gate stops doing it, rather than latching on "
+       "a since-boot total for the rest of the power cycle")
+
     # The readout must not be drawn ON TOP of the rows, nor over the selected
     # row's own hint below them. Measured at 1024x768, which is the mode the
     # Pi actually runs in: at the 1280x720 the rest of this test renders at, a
     # seventh row still clears the hint by 2 px and the collision the slice
     # exists to avoid would go unnoticed.
     pi_sc = pical.Screen(pygame.Surface((1024, 768)))
+
+    # ---- the rows themselves have to clear EACH OTHER ---------------------
+    # draw_rows shrinks the pitch to fit the band it is given, and it will go
+    # on shrinking it past the height of the face it draws in: at fourteen
+    # rows the band left 24.8 px of pitch for a 24 px line box, which is
+    # 0.8 px of daylight, and two more rows in the same band would have had
+    # the labels overlapping with nothing to say so. Measured off the rects
+    # draw_rows itself sets, at the resolution the Pi runs at.
+    cam3.draw(pi_sc)
+    ys = sorted(r.rect.centery for r in cam3.rows if r.rect)
+    pitch = min(b - a for a, b in zip(ys, ys[1:]))
+    ck(len(cam3.rows) >= 16,
+       "the camera screen really is carrying sixteen rows now (%d)"
+       % len(cam3.rows))
+    ck(pitch - pi_sc.f_m.get_height() >= 3.0,
+       "and the rows still clear each other by a real margin at 1024x768: "
+       "%d px of pitch for a %d px line box (%.1f px of daylight)"
+       % (pitch, pi_sc.f_m.get_height(),
+          pitch - pi_sc.f_m.get_height()))
+    # ...and clear the subtitle above them, which is the space the band was
+    # grown into.
+    sub_bottom = pi_sc.h * 0.145 + pi_sc.f_s.get_height() / 2.0
+    ck(ys[0] - pi_sc.f_m.get_height() / 2.0 >= sub_bottom,
+       "the first row starts below the subtitle (row top %d, subtitle ends "
+       "%d)" % (ys[0] - pi_sc.f_m.get_height() / 2.0, sub_bottom))
 
     def readout_rows():
         """Draw one camera frame and hand back the rect of EVERY readout row.
@@ -858,15 +933,27 @@ def main():
         top = min(r[0] for r in rows)
         bottom = max(r[1] for r in rows)
         # Where the selected row's own hint starts: draw_rows puts it at
-        # 0.90 h, centred, in f_s. Running the readout into it is what a
+        # TIP_Y, centred, in f_s. Running the readout into it is what a
         # wider slice buys.
-        tip_top = pi_sc.h * 0.90 - pi_sc.f_s.get_height() / 2.0
+        tip_top = pi_sc.h * pical.TIP_Y - pi_sc.f_s.get_height() / 2.0
+        # The LAST ROW'S GLYPH, not its highlight rectangle. The rectangle is
+        # 0.72 of the pitch and stops well short of the descender, so a
+        # readout tucked just under it can still be drawn through the label's
+        # bottom -- which is a collision the rect-only check cannot see.
+        glyph_bottom = max((r.rect.centery + pi_sc.f_m.get_height() / 2.0
+                            for r in cam3.rows if r.rect), default=0)
         ck(top >= row_bottom,
            "the blob readout sits below the last row, not over it, %s (rows "
            "end %d, readout starts %d)" % (what, row_bottom, top))
-        ck(bottom <= tip_top,
-           "and its last wrapped row clears the row hint at 0.90 h, %s "
-           "(readout ends %d, hint starts %d)" % (what, bottom, tip_top))
+        # Real margin at both ends, not a pixel of clearance: this list grows,
+        # and every previous time it grew the thing under it was found by
+        # somebody at a TV rather than here.
+        ck(top - glyph_bottom >= 6,
+           "and clears the last LABEL by a real margin, %s (label ends %d, "
+           "readout starts %d)" % (what, glyph_bottom, top))
+        ck(bottom <= tip_top - 6,
+           "and its last wrapped row clears the row hint by a real margin, "
+           "%s (readout ends %d, hint starts %d)" % (what, bottom, tip_top))
 
     rows_a = readout_rows()
     ck(any("blobs now" in m for _, _, m in rows_a),
@@ -879,27 +966,35 @@ def main():
        and any("new frames/s" in m for _, _, m in rows_a),
        "the rows pical draws still reach the frame rate and the LOGGING "
        "indicator (drew %s)" % [m[:18] for _, _, m in rows_a])
-    check_clear(rows_a, "with six rows of readout")
+    check_clear(rows_a, "with a full readout")
 
-    # And the deepest the readout ever gets: the give-back warning takes a row
-    # of its own on top of the three the blob line already wraps onto, so
-    # there are SEVEN rows of content and the slice is the only thing keeping
-    # the last of them out of the hint below.
+    # And the deepest the readout ever gets: both warnings take a row each on
+    # top of the rows the blob line already wraps onto, and the fit
+    # arithmetic is the only thing keeping the last of them out of the hint.
     app.link.last.update({"bframes": 2300, "bms": 23000, "bvalve": 90,
+                          "bnear": 9,
                           "br4": 1500, "br3": 190, "br2": 60, "br1": 15,
                           "br0": 4})
     rows_b = readout_rows()
-    ck(any("SIZE WINDOW TOO TIGHT" in m for _, _, m in rows_b),
-       "the worst case really is the worst case (drew %s)"
-       % [m[:20] for _, _, m in rows_b])
-    check_clear(rows_b, "with the give-back warning taking a seventh")
+    ck(any("SIZE WINDOW TOO TIGHT" in m for _, _, m in rows_b)
+       and any("GATE MAY BE TAKING REAL LEDs" in m for _, _, m in rows_b),
+       "the worst case really is the worst case -- both warnings up at once "
+       "(drew %s)" % [m[:20] for _, _, m in rows_b])
+    check_clear(rows_b, "with both warnings taking a row each")
+    # More content than there are rows for is the NORMAL state of this
+    # readout, and what it must never do is silently draw the overflow on top
+    # of the hint. The count comes from the space that is actually there.
+    ck(len(rows_b) >= 5,
+       "and it is still drawing a useful number of rows (%d)" % len(rows_b))
     cam3.log_toggle()
 
-    # The sensor's own thresholds, the odd-one-out gate, the report format and
-    # the full-mode register all reach the gun. fmt: is sent ONLY for full
-    # mode: the previous firmware has no such key and drops it in silence, so
-    # a gun on it could never be moved off detail 0 at all.
+    # The sensor's own thresholds, the odd-one-out gate, the shape gate, the
+    # report format and the full-mode register all reach the gun. fmt: is sent
+    # ONLY for full mode: the previous firmware has no such key and drops it
+    # in silence, so a gun on it could never be moved off detail 0 at all.
     for label, wire in (("Odd-one-out (size steps)", b"cam=rtol:"),
+                        ("Biggest blob (pixels)", b"cam=pxmax:"),
+                        ("Roundness limit", b"cam=armax:"),
                         ("Sensor max size (0x06)", b"cam=hwmax:"),
                         ("Sensor min size (0x1B)", b"cam=hwmin:"),
                         ("Full-mode register (0x33)", b"cam=fullreg:")):
@@ -909,6 +1004,89 @@ def main():
         app.step([key(pygame.K_RIGHT)], t + 9.5)
         ck(any(wire in w for w in ser.written[n0:]),
            "and nudging it sends %s to the gun" % wire.decode())
+
+    # ---- the shape gate, in the reader's units and inside the firmware's
+    # ---- refusal ranges ----------------------------------------------------
+    # The gun REFUSES a pxmax of 1..11 and an armax of 1..15 outright -- it
+    # answers by name and leaves the old value alone. On a screen with no
+    # console that is an arrow that visibly does nothing, so the ladders are
+    # built so it cannot be reached: every rung, stepped from every other
+    # rung, in both directions, has to be a value the firmware takes.
+    for label, floor in (("Biggest blob (pixels)", 12),
+                         ("Roundness limit", 16)):
+        row = cam3.rows[labels.index(label)]
+        sent = []
+        real_send, app.link.send = app.link.send, sent.append
+        try:
+            for start in (None, 0) + tuple(row.vals) + (1, 5, 7, 63):
+                held = {"v": start}
+                real_get, row.get = row.get, (lambda h=held: h["v"])
+                try:
+                    for d in (-1, +1):
+                        for _ in range(len(row.vals) + 3):
+                            row.nudge(d)
+                            if sent:
+                                held["v"] = int(sent[-1].split(":")[1])
+                finally:
+                    row.get = real_get
+        finally:
+            app.link.send = real_send
+        got = sorted(set(int(s.split(":")[1]) for s in sent))
+        illegal = [v for v in got if v and v < floor]
+        ck(got and not illegal,
+           "'%s' can only ever emit a value the gun accepts -- 0 or >= %d "
+           "(emitted %s, illegal %s)" % (label, floor, got, illegal))
+        ck(0 in got, "...including 0, which is how the gate is turned off "
+                     "again (%s emitted %s)" % (label, got))
+
+    # And the value on screen is the one a person thinks in. armax travels as
+    # EIGHTHS of a ratio: a row showing "20" beside a label saying roundness
+    # is a setting nobody at a TV can check, whichever way they set it.
+    ar = cam3.rows[labels.index("Roundness limit")]
+    ck(ar.show(20) == "2.5:1" and ar.show(16) == "2:1"
+       and ar.show(24) == "3:1" and ar.show(0) == "off",
+       "the roundness row shows a RATIO, not the wire's eighths (%s)"
+       % [ar.show(v) for v in (0, 16, 20, 24, 32)])
+    px = cam3.rows[labels.index("Biggest blob (pixels)")]
+    ck(px.show(14) == "14 px" and px.show(0) == "off" and px.show(None) == "--",
+       "and the pixel row names its unit, with 'off' for the value that "
+       "means off (%s)" % [px.show(v) for v in (None, 0, 14)])
+    # Whatever the gun says, including what it cannot mean. A firmware that
+    # means something else by the key, or a value typed at a serial terminal,
+    # must not take the screen down: pical is fullscreen with no console, so
+    # an exception inside draw is a black TV.
+    for v in (-1, 7, 255, 10 ** 9):
+        for r_ in (ar, px):
+            ck(isinstance(r_.show(v), str),
+               "'%s' survives a value the gun should never send (%r -> %r)"
+               % (r_.label, v, r_.show(v)))
+    for label in ("Biggest blob (pixels)", "Roundness limit"):
+        tip = cam3.rows[labels.index(label)].tip()
+        ck("Blob detail 2" in tip,
+           "'%s' says it needs full detail -- in any other format the gate "
+           "stands down and the row does nothing: %r" % (label, tip))
+        ck("drops" in tip,
+           "and says what it physically throws away, not what it sets: %r"
+           % tip)
+
+    # A REFUSAL has to reach the user. The gun answers by name and leaves the
+    # old value in place, so the row goes on showing the truth -- which from
+    # the sofa is indistinguishable from an arrow that does nothing. pical has
+    # no visible log outside the auto-tune overlay, so a refusal that only
+    # goes to the log is a refusal nobody will ever see.
+    for reply, why in (
+            ("CAM: pxmax below 12 would reject measured LEDs -- not set\n",
+             "a pxmax under the measured LED envelope"),
+            ("CAM: armax below 16 (2:1) would reject measured LEDs -- not "
+             "set\n", "an armax under 2:1"),
+            ("CAM: hwmax:0 refused -- it blinds the sensor\n",
+             "the sensor ceiling that would blind the camera")):
+        app.toast = ""
+        app.link.src.q.put(reply)
+        app.step([], t + 9.55)
+        ck(reply.split("\n")[0][:40] in app.toast,
+           "the gun refusing %s is said out loud, not left in a log nobody "
+           "can see: %r" % (why, app.toast))
 
     cam3.sel = labels.index("Blob detail (sizes)")
     for k, want, gone in ((pygame.K_LEFT, b"cam=ext:1", b"cam=fmt:1"),

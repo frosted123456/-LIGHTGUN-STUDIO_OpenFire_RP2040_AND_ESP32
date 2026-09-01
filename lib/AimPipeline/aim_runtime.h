@@ -101,6 +101,17 @@ bool aim_gate_load(int* out_fmt, int* out_bmin, int* out_bmax, int* out_rtol);
 bool aim_gate_store(int fmt, int bmin, int bmax, int rtol);
 bool aim_gate_clear(void);
 
+// The SHAPE knobs, in a second key rather than packed into the first. The
+// first is full at 14 bits of payload under its tag, and re-packing it would
+// make every gate already in a gun's flash unreadable -- a silent downgrade to
+// "no gate stored" on the one setting that survives a reboot. Absent key means
+// the shape gate is off, which is also its default.
+//   pxmax  largest blob PIXEL COUNT kept, 0 = off
+//   armax  longest/shortest side, in EIGHTHS (8 = 1:1, 16 = 2:1), 0 = off
+bool aim_gate2_load(int* out_pxmax, int* out_armax);
+bool aim_gate2_store(int pxmax, int armax);
+bool aim_gate2_clear(void);
+
 // The capture layer owns the lead value and how much of the quad was really
 // seen; mode 1 needs both, so it reports them here. conf is the fraction of
 // corners MEASURED this frame (n_real/4), not the resolver's miss-damped

@@ -204,7 +204,8 @@ fi
 
 # The RP2040/wiicam front end: the stale-slot mask, 240x176 normalisation,
 # lock + solve, lead, and the ~cam subset -- all on the host.
-if g++ -std=c++17 -O2 -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+       -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
        -Ilib/QuadResolver -Ilib/AimPipeline -Ilib/RecoilFx \
        hostcheck/wiicam_adapter_test.cpp \
        lib/WiicamAim/wiicam_aim.cpp lib/WiicamAim/wiicam_learn.cpp \

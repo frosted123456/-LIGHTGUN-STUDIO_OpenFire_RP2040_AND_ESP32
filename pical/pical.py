@@ -46,7 +46,7 @@ from gun_studio import (BlobLog, CAM_KEYS, CAM_RANGE, FrameRate, LENS_KEYS,
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
 # every feature whose parsing lives in tools/ stops working -- silently, in a
 # way that looks exactly like a broken screen. So it is checked, out loud.
-LINK_API_NEEDED = 6
+LINK_API_NEEDED = 7
 LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
@@ -74,6 +74,37 @@ C_SEL = (31, 111, 235)
 def wrap(text, width=72):
     """A refusal reason is a sentence, not a caption: show all of it."""
     return textwrap.wrap(str(text), width) or [""]
+
+
+# Where a settings screen draws the selected row's hint, as a fraction of the
+# screen height, and how far apart the readout above it stacks its lines. Both
+# are named rather than typed twice: the camera screen has to work out how
+# many readout rows fit BEFORE the hint, and a screen that computes the fit
+# from one number while the hint is drawn at another is a screen that overlaps
+# them -- which is what a hard-coded slice of six did the day a row was added
+# to the list above it.
+TIP_Y = 0.90
+READOUT_STEP = 1.25
+
+
+def readout_cols(sc):
+    """How many characters of the small readout face fit across the screen.
+
+    Measured off the font rather than assumed. The camera readout used to wrap
+    at a flat 96 columns whatever the screen was, which on the Pi's 1024x768
+    filled 686 px and left 338 px unused -- and every column it did not use
+    cost a wrapped row of a readout that is already fighting for room. 0.90 of
+    the width, because the lines are CENTRED and the widest of them is not
+    known until it is built.
+    """
+    sample = "abcdefghijklmnopqrstuvwxyz 0123456789 ,.:-"
+    try:
+        avg = sc.f_xs.size(sample)[0] / float(len(sample))
+        if avg > 0:
+            return max(60, int(sc.w * 0.90 / avg))
+    except Exception:
+        pass
+    return 96                 # the width this wrapped at before it measured
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +306,12 @@ class Row:
     kind 'button' fires act(); kind 'spin' adjusts a value with left/right and
     reads it back live from the gun, so the screen never shows a value the
     gun does not actually hold.
+
+    `fmt` may be a callable as well as a %-format, for a setting whose wire
+    value is not the number a person thinks in. The shape gate's aspect limit
+    is one: it travels as EIGHTHS, so the gun answers 20 and the reader on the
+    sofa needs '2.5:1'. A %-format cannot divide, and a screen with no console
+    beside it gives nobody any way to work out what 20 meant.
     """
 
     def __init__(self, label, kind="button", act=None, get=None, set=None,
@@ -308,10 +345,32 @@ class Row:
         except Exception:
             return ""
 
+    def show(self, v):
+        """The value as the reader sees it.
+
+        Everything is caught: a fmt callable runs on whatever the gun last
+        said, including a number from a firmware that means something else by
+        the key, and pical is fullscreen on a Pi with no console -- a
+        ZeroDivisionError inside a draw is a black screen, not a bad label."""
+        if v is None:
+            return "--"
+        try:
+            return self.fmt(v) if callable(self.fmt) else (self.fmt % v)
+        except Exception:
+            return str(v)
+
     def nudge(self, d):
         if self.kind != "spin" or self.set is None:
             return
         v = self.value()
+        # Anything that will not do arithmetic is treated as no reading at
+        # all. Every value on the wire arrives through an int(), so this
+        # should be impossible -- but this runs off a key press on a screen
+        # with no console, and an arrow that raises takes the whole front end
+        # down with it. "Start from the end you are stepping away from" is
+        # already the answer for a gun that has not replied yet.
+        if v is not None and not isinstance(v, (int, float)):
+            v = None
         if self.vals:
             # Move along the ladder from wherever the gun actually is. With no
             # reading yet, start from the end the user is stepping away from
@@ -400,8 +459,7 @@ class RowScreen:
             r.rect = pygame.Rect(int(sc.w * bx), int(y - dy * 0.36),
                                  int(sc.w * bw), int(dy * 0.72))
             if r.kind == "spin":
-                v = r.value()
-                txt = "--" if v is None else (r.fmt % v)
+                txt = r.show(r.value())
                 sc.text(sc.w * vx, y, ("< %s >" % txt) if on else txt,
                         sc.f_m, C_OK if on else C_DIM)
             elif r.get is not None:
@@ -413,7 +471,7 @@ class RowScreen:
         if self.rows:
             tip = self.rows[self.sel].tip()
             if tip:
-                sc.text(sc.w / 2, sc.h * 0.90, tip, sc.f_s, C_DIM)
+                sc.text(sc.w / 2, sc.h * TIP_Y, tip, sc.f_s, C_DIM)
         return y
 
     def draw(self, sc):
@@ -499,7 +557,7 @@ class Camera(RowScreen):
                                         % ("fmt" if v == 2 else "ext", v)),
                 lo=0, hi=2, step=1,
                 hint="0 position only, 1 adds each blob's size for the gates "
-                     "below, 2 adds its box and brightness. Save to keep it"))
+                     "below, 2 adds its box and pixel count. Save to keep it"))
             # Directly under the row that turns full detail on, because this
             # is the only thing to try when full detail comes back as
             # nonsense: which byte the sensor wants for that mode is the one
@@ -512,9 +570,10 @@ class Camera(RowScreen):
                 vals=(85, 5), fmt="0x%02x",
                 # "NOT saved" belongs in the hint, not only in the firmware's
                 # camsave reply that nobody on the TV can read: ~camsave
-                # writes fmt, bmin, bmax and rtol and nothing else, so a user
-                # who found the byte that works, pressed Save and power-cycled
-                # would come back to nonsense and no idea why.
+                # writes fmt, the size window, rtol and the shape gate and
+                # stops there, so a user who found the byte that works,
+                # pressed Save and power-cycled would come back to nonsense
+                # and no idea why.
                 hint="the byte that asks for full mode -- nobody is sure "
                      "which. Try the other if 2 shows nonsense; NOT saved"))
             self.rows.append(Row(
@@ -538,6 +597,38 @@ class Camera(RowScreen):
                 hint="drops a blob more than this many size steps from the "
                      "other three. Needs no distance tuning; 0 is off, 3 is "
                      "a fair start"))
+            # The shape gate. The 4-bit size the three rows above judge barely
+            # moves on this rig -- 52,624 confirmed LED blobs came in at size 1
+            # or 2 and did not respond to a 1.8x change of distance -- while
+            # full mode's bounding box and pixel count are a real measurement.
+            #
+            # Both ladders are the MEASURED LED envelope with a step of margin,
+            # and both start at the firmware's own floor. That matters here
+            # more than anywhere: the gun REFUSES a pxmax of 1..11 and an armax
+            # of 1..15 rather than clamping them, so a plain lo/hi step of 1
+            # would spend its first eleven presses sending values the gun
+            # throws away -- on a screen with no console, that is a row whose
+            # arrows visibly do nothing and no way at all to find out why.
+            #
+            # Labelled and shown in what they physically reject, not in the
+            # wire's units: 'armax 20' is unreadable, '2.5:1' is a shape.
+            self.rows.append(Row(
+                "Biggest blob (pixels)", "spin",
+                get=lambda: link.last.get("pxmax"),
+                set=lambda v: link.send("~cam=pxmax:%d" % v),
+                vals=(0, 12, 13, 14, 16, 20, 24),
+                fmt=lambda v: "off" if not v else "%d px" % v,
+                hint="drops a blob of more pixels than this; measured LEDs "
+                     "are 4-12, so 14 px leaves a step. Needs Blob detail 2"))
+            self.rows.append(Row(
+                "Roundness limit", "spin",
+                get=lambda: link.last.get("armax"),
+                set=lambda v: link.send("~cam=armax:%d" % v),
+                vals=(0, 16, 20, 24, 32),
+                fmt=lambda v: "off" if not v else "%g:1" % (v / 8.0),
+                hint="drops a blob longer than this beside its width; 99.9% "
+                     "of measured LEDs are 2:1 or rounder. Needs Blob "
+                     "detail 2"))
             # The sensor's own thresholds. These gate INSIDE the camera, before
             # it hands out its four slots, so they are the only ones that stop
             # a stray source from costing a corner rather than being noticed
@@ -583,10 +674,11 @@ class Camera(RowScreen):
                 "Auto tune", act=self.run_auto,
                 hint="sweeps exposure and threshold, then keeps a safety margin"))
         # What ~camsave actually writes, on the board it is written from. The
-        # gun stores the blob format, the size window and the odd-one-out
-        # tolerance and stops there: the full-mode register and the two SENSOR
-        # thresholds are left out on purpose, because they are the settings
-        # that can leave a gun dark and a power cycle has to stay a way back.
+        # gun stores the blob format, the size window, the odd-one-out
+        # tolerance and the shape gate and stops there: the full-mode register
+        # and the two SENSOR thresholds are left out on purpose, because they
+        # are the settings that can leave a gun dark and a power cycle has to
+        # stay a way back.
         # A flat "keeps these settings" sent people away believing an hwmax
         # they had spent an evening on would still be there in the morning.
         self.rows.append(Row(
@@ -843,7 +935,11 @@ class Camera(RowScreen):
         """
         last = self.app.link.last
         v = last.get(key)
-        if v is None:
+        # Absent, or anything that will not subtract. Every counter on the
+        # wire arrives through an int(), so the second case should be
+        # impossible -- but this is called from draw() sixty times a second on
+        # a screen with no console, where one TypeError is a black TV.
+        if not isinstance(v, (int, float)):
             return 0
         frames = last.get("bframes")
         prev, at, shown = self._drop_ref.get(key, (None, None, 0))
@@ -879,7 +975,7 @@ class Camera(RowScreen):
                 # as a fixed part of the line they would read as a measured
                 # 0x0 box on every gun that is not in it.
                 if len(b) == 7:
-                    txt += " box %dx%d bright %d" % (b[4], b[5], b[6])
+                    txt += " box %dx%d %dpx" % (b[4], b[5], b[6])
                 if b[3] != 1:
                     txt += " DROPPED"
                 shown.append(txt)
@@ -889,10 +985,22 @@ class Camera(RowScreen):
         # blind the gun, and it was previously last and cut off by the slice.
         # The DELTA, like the drop counts below: bvalve counts since boot, so
         # the raw value pinned this warning on screen for the rest of the
-        # power cycle after a single give-back -- burning one of the six
-        # readout rows on a window the user had already widened.
+        # power cycle after a single give-back -- spending one of the few rows
+        # this readout gets on a window the user had already widened.
         if self._delta("bvalve"):
             out.append("SIZE WINDOW TOO TIGHT -- widen it or set it to 0..15")
+        # Second, and for the same reason: this is the only number on the
+        # screen that says a gate is WRONG rather than that it is working.
+        # bnear counts blobs a gate threw away that sat exactly where the
+        # missing corner had to be, so they were almost certainly LEDs -- it
+        # is the false-negative meter, and it moves long before the symptom
+        # does. Worded as a doubt about the gate, never as another drop count:
+        # read as "N dropped" it would look like the gate earning its keep,
+        # which is the exact opposite of what it means.
+        dnear = self._delta("bnear")
+        if dnear:
+            out.append("GATE MAY BE TAKING REAL LEDs: %d dropped where a "
+                       "corner should be -- widen it" % dnear)
         keys = ("br4", "br3", "br2", "br1", "br0")
         now = [link.last.get(k) for k in keys]
         tot = None
@@ -926,17 +1034,26 @@ class Camera(RowScreen):
         # been fixed still read as dropping thousands of blobs, forever.
         drej = self._delta("brej")
         drrej = self._delta("brrej")
+        dsrej = self._delta("bsrej")
         if drej:
             bits.append("%d dropped by size" % drej)
         if drrej:
             bits.append("%d dropped as odd-one-out" % drrej)
+        # The shape gate's own count, beside the other two so the three can be
+        # compared at a glance: which gate is doing the work is the first
+        # question after tightening one, and it cannot be answered from a
+        # total that lumps them together.
+        if dsrej:
+            bits.append("%d dropped by shape" % dsrej)
         if bits:
             out.append("   ".join(bits))
-        # The two "something is being recorded" indicators, on ONE row. A row
-        # each would have made seven of content where six are drawn, and the
-        # one pushed off the bottom would be whichever came last -- which is
-        # exactly the failure that widened the slice to six: a capture running
-        # at the TV with nothing on screen to say so.
+        # The two "something is being recorded" indicators, on ONE row, and
+        # last. A row each would put one more line of content than there is
+        # room for, and the one pushed off the bottom would be whichever came
+        # second -- which is exactly the failure that widened the readout in
+        # the first place: a capture running at the TV with nothing on screen
+        # to say so. Last because everything above it is either a measurement
+        # or a warning, and those are what a reader short of rows should get.
         rec = []
         if self.learn_on():
             frames, led, _rej = self.app.link.hists.counts()
@@ -961,24 +1078,54 @@ class Camera(RowScreen):
         # The wiicam list grew to twelve rows, so a readout at a FIXED height
         # landed on top of the last three of them. It is placed from where the
         # rows actually end instead, and the rows are given a shorter run.
+        #
+        # It is now SIXTEEN rows, and the band was re-measured for them. At
+        # 1024x768 -- the mode the Pi actually runs in -- f_m draws a 24 px
+        # line box, and the old band (0.24 h to 0.66 h) left fourteen rows a
+        # pitch of 24.8: 0.8 px of daylight between one label and the next,
+        # with nothing spare for two more. Three unused gaps were measured and
+        # spent on them:
+        #   the subtitle ended 45 px above the first row with nothing in
+        #     between, so the band now starts at 0.185 h;
+        #   draw_rows returns a whole pitch PAST the last row, so the readout
+        #     is placed from that row's own rectangle instead and stops
+        #     wasting 27 px of the gap;
+        #   the readout wrapped at a flat 96 columns and left a third of the
+        #     screen width empty, which cost it a whole wrapped row.
+        # After: 27 px of pitch, 3 px of daylight, two MORE rows than before,
+        # and the readout still gets its six. 0.715 h is where the band stops
+        # -- one step further and the readout is down to five rows, which is
+        # the trade the measurement says not to make.
         sc.text(sc.w / 2, sc.h * 0.09, self.title, sc.f_l, C_FG)
-        sc.text(sc.w / 2, sc.h * 0.155, self.subtitle, sc.f_s, C_DIM)
-        y = self.draw_rows(sc, sc.h * 0.24, sc.h * 0.66)
+        sc.text(sc.w / 2, sc.h * 0.145, self.subtitle, sc.f_s, C_DIM)
+        y = self.draw_rows(sc, sc.h * 0.185, sc.h * 0.715)
         w = sc.w * 0.30
         self.app.draw_preview(sc, sc.w * 0.66, sc.h * 0.28,
                               w, w * FRAME_H / FRAME_W)
+        # Wrapped to the width the screen ACTUALLY has. A fixed 96 columns
+        # filled 686 px of a 1024 px screen and left 338 px of it empty, which
+        # cost the full-mode blob line a third wrapped row it did not need --
+        # and that row came straight out of the readout's own budget below.
+        cols = readout_cols(sc)
         lines = []
         for ln in self.blob_lines():
-            lines.extend(wrap(ln, 96))
-        # Six, not five: in full mode the per-blob line carries a box and a
-        # brightness as well, and with the gate dropping blobs it wraps onto
-        # THREE rows, not two -- 194 characters of it. At five that pushed the
-        # camera's frame rate and the "LOGGING: N frames" indicator off the
-        # bottom, so a capture at the TV gave no sign it was recording.
-        # Six is the most that fits: measured at 1024x768, the sixth row ends
-        # 13 px above the selected row's own hint at 0.90 h and a seventh
-        # would land 8 px INSIDE it.
-        sc.lines(sc.w / 2, y + sc.h * 0.02, lines[:6], sc.f_xs, C_DIM)
+            lines.extend(wrap(ln, cols))
+        # How many rows FIT, counted, rather than a hard-coded six. Six was
+        # what fitted the day it was measured; the next row added to the list
+        # above it silently pushed the last of them into the selected row's
+        # own hint, which is the collision this arithmetic exists to make
+        # impossible. Both ends come from the same numbers the rows and the
+        # hint are drawn at, so the three cannot drift apart.
+        bot = max((r.rect.bottom for r in self.rows if r.rect), default=y)
+        top = bot + sc.h * 0.016
+        gh = sc.f_xs.get_height()
+        step = max(1, int(gh * READOUT_STEP))
+        # The hint's top edge, less a margin: running the readout to within a
+        # pixel of it reads as one paragraph rather than two.
+        floor = sc.h * TIP_Y - sc.f_s.get_height() / 2.0 - sc.h * 0.008
+        room = int((floor - top - gh) // step) + 1
+        sc.lines(sc.w / 2, top + gh / 2.0, lines[:max(1, room)], sc.f_xs,
+                 C_DIM, READOUT_STEP)
         sc.text(sc.w / 2, sc.h * 0.96, "Esc goes back", sc.f_xs, C_DIM)
 
 
@@ -2627,7 +2774,17 @@ class App:
                     # A refusal must be as visible as a success: both of these
                     # otherwise read as a solenoid that has stopped working.
                     or r.startswith("FX: quiet mode is ON")
-                    or r.startswith("FX: busy")):
+                    or r.startswith("FX: busy")
+                    # A setting the gun REFUSED. It answers by name and leaves
+                    # the old value in place, so the row goes on showing what
+                    # is really there -- which looks exactly like an arrow
+                    # that does nothing. The ladders above are built so this
+                    # cannot happen from pical, but a gun holding a setting
+                    # from a serial terminal, or a firmware whose floor has
+                    # moved, both land here, and a refusal nobody sees is a
+                    # control the user gives up on.
+                    or "-- not set" in r
+                    or "refused" in r):
                 self.toast_now(r.strip()[:110])
         # After the replies are drained, so the restore check reads the gun's
         # freshest answer rather than the one from the previous frame.

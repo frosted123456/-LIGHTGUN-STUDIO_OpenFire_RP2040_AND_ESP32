@@ -80,6 +80,25 @@ def by_text(w, want, cls="Radiobutton", out=None):
     return out
 
 
+def spinboxes(w, out=None):
+    """Every Spinbox on the tree.
+
+    The shape-gate pair is built in a loop with no handle kept, and they are
+    the only two controls here whose steps are a fixed LIST rather than a
+    range -- which is their whole point, because the gun refuses the values a
+    range would walk through. That has to be driven, not read.
+    """
+    out = [] if out is None else out
+    try:
+        if w.winfo_class() == "Spinbox":
+            out.append(w)
+    except Exception:
+        pass
+    for c in w.winfo_children():
+        spinboxes(c, out)
+    return out
+
+
 def texts(w, out):
     try:
         t = w.cget("text")
@@ -166,10 +185,13 @@ def driver():
         for ln in (
             "AIM: pong board=rp2040-wiicam\n",
             "CAM: board=rp2040-wiicam sens=1 lens=0 res=2 dash=0 ext=1 fmt=1 "
-            "fullreg=5 bmin=2 bmax=9 rtol=3 hwmax=-1 hwmin=-1\n",
-            "CAM: blob fmt=1 ext=1 fullreg=5 bmin=2 bmax=9 rtol=3 hwmax=-1 "
+            "fullreg=5 bmin=2 bmax=9 rtol=3 pxmax=0 armax=0 hwmax=-1 "
+            "hwmin=-1\n",
+            "CAM: blob fmt=1 ext=1 fullreg=5 bmin=2 bmax=9 rtol=3 pxmax=0 "
+            "armax=0 hwmax=-1 "
             "hwmin=-1 bn=4 brej=7 brrej=2 bvalve=4 bframes=900 bms=9000 "
-            "bdrop=3 br4=800 br3=150 br2=40 br1=10 br0=0\n",
+            "bdrop=3 bsrej=0 bfar=0 bnear=0 br4=800 br3=150 br2=40 br1=10 "
+            "br0=0\n",
             "CAM: blobs 30,40,3,1 200,41,4,1 31,140,3,1 210,150,14,0\n",
         ):
             link.src.q.put(ln)
@@ -225,6 +247,100 @@ def driver():
             if "~cam=fullreg:5" not in WIRE:
                 errs.append("the full-mode register radio sent %s" % WIRE)
 
+        # ---- the shape gate ------------------------------------------------
+        # The gun REFUSES a pxmax of 1..11 and an armax of 1..15 outright: it
+        # answers by name and leaves the old value alone, so a spinbox
+        # stepping by 1 from 0 would spend its first eleven clicks doing
+        # nothing visible. These two step through a fixed LIST for that
+        # reason, and the list is what is being tested -- every rung, walked
+        # in both directions, has to be a value the gun accepts.
+        gate_box = {}
+        for sp in spinboxes(root):
+            vals = str(sp.cget("values"))
+            if "2.5:1" in vals:
+                gate_box["armax"] = sp
+            elif "12 px" in vals:
+                gate_box["pxmax"] = sp
+        if len(gate_box) != 2:
+            errs.append("the camera tab has no shape-gate controls (found "
+                        "%s of %d spinboxes)"
+                        % (sorted(gate_box), len(spinboxes(root))))
+        else:
+            # The 700 ms sync pulls these boxes back to whatever the gun last
+            # said. Forgetting the gun's value first leaves the walk below
+            # measuring the ladder and nothing else.
+            for k in ("pxmax", "armax"):
+                link.last.pop(k, None)
+            # And put the detail radio back to 'sizes', which the click test
+            # above left on 'full detail'. Two things ride on it: the shape
+            # gate does nothing outside full mode, which the panel has to say
+            # out loud, and a test that only ever steps these in full mode
+            # would never find out whether it does.
+            if "sizes" in radios:
+                radios["sizes"].invoke()
+                root.update()
+            for key, floor in (("pxmax", 12), ("armax", 16)):
+                sp = gate_box[key]
+                sent = []
+                for direction in ("buttonup", "buttondown"):
+                    for _ in range(12):
+                        WIRE.clear()
+                        sp.invoke(direction)
+                        root.update()
+                        sent += [w for w in WIRE
+                                 if w.startswith("~cam=%s:" % key)]
+                vals = sorted(set(int(w.split(":")[1]) for w in sent))
+                illegal = [v for v in vals if v and v < floor]
+                if not vals:
+                    errs.append("stepping the %s box put nothing on the wire"
+                                % key)
+                elif illegal:
+                    errs.append("the %s ladder can emit %s, which the gun "
+                                "refuses -- the arrows would do nothing and "
+                                "say nothing (emitted %s)"
+                                % (key, illegal, vals))
+                elif 0 not in vals:
+                    errs.append("the %s ladder cannot reach 0, so the gate "
+                                "can be turned on but never off: %s"
+                                % (key, vals))
+            # There is no room beside these two for a hint, and a gate set
+            # outside full mode does nothing at all -- so the panel has to say
+            # so somewhere. The log is where this panel already puts what will
+            # not fit beside a control.
+            gate_log = logbox_text(root)
+            if "full detail" not in gate_log or "stands down" not in gate_log:
+                errs.append("stepping the shape gate outside full mode never "
+                            "said the gate would do nothing: %r"
+                            % gate_log[-300:])
+            # And the box follows the GUN, in the gun's own units translated
+            # into the reader's. 20 eighths is 2.5:1, and a panel showing 20
+            # beside a label saying roundness is a setting nobody can check.
+            # Every counter left exactly where the first reply put it: the
+            # readout below this is built from DELTAS, and a reply that moves
+            # one to prove a translation would spend the give-back the
+            # give-back test is waiting for.
+            link.src.q.put(
+                "CAM: blob fmt=1 ext=1 fullreg=5 bmin=2 bmax=9 rtol=3 "
+                "pxmax=14 armax=20 hwmax=-1 hwmin=-1 bn=4 brej=7 brrej=2 "
+                "bvalve=4 bframes=900 bms=9000 bdrop=3 bsrej=0 bfar=0 "
+                "bnear=0 br4=800 br3=150 br2=40 br1=10 br0=0\n")
+            settle_t = time.time() + 1.6
+            while time.time() < settle_t:
+                root.update()
+                time.sleep(0.05)
+            shown = {k: str(gate_box[k].get()) for k in gate_box}
+            if shown.get("armax") != "2.5:1" or shown.get("pxmax") != "14 px":
+                errs.append("the shape boxes did not follow the gun into the "
+                            "reader's units: %s" % shown)
+            if link.last.get("pxmax") != 14 or link.last.get("armax") != 20:
+                errs.append("pxmax / armax never reached link.last: %r"
+                            % {k: link.last.get(k)
+                               for k in ("pxmax", "armax")})
+            for k in ("bsrej", "bfar", "bnear"):
+                if k not in link.last:
+                    errs.append("'%s' never reached link.last, so the CSV "
+                                "column for it can only ever be blank" % k)
+
         # ---- basic mode: the gun says why every size is -1 -----------------
         # The trailer is the only thing on the line that explains the -1s.
         # Dropped, the readout looked like four blobs measured at size -1 and
@@ -246,12 +362,14 @@ def driver():
                         % [t for t in texts(root, []) if "blobs now" in t])
 
         # ---- full detail: seven fields per blob ----------------------------
-        # Box and brightness only exist here, and the readout line is at its
+        # Box and pixel count only exist here, and the readout line is at its
         # longest -- which is the state the panel has to still fit in.
         for ln in (
-            "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 hwmax=-1 "
+            "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 pxmax=14 "
+            "armax=20 hwmax=-1 "
             "hwmin=-1 bn=4 brej=90 brrej=39 bvalve=61 bframes=1900 bms=19000 "
-            "bdrop=3 br4=1700 br3=250 br2=90 br1=40 br0=20\n",
+            "bdrop=3 bsrej=31 bfar=9 bnear=0 br4=1700 br3=250 br2=90 br1=40 "
+            "br0=20\n",
             "CAM: blobs 130,140,3,1,11,9,214 200,141,14,0,12,10,203 "
             "131,140,13,0,10,9,198 210,150,14,0,41,38,255\n",
         ):
@@ -261,8 +379,8 @@ def driver():
         root.update()
         all_text = texts(root, [])
         joined = "\n".join(all_text)
-        if "box 41x38 bright 255" not in joined:
-            errs.append("full mode never showed the box and brightness: %s"
+        if "box 41x38 255px" not in joined:
+            errs.append("full mode never showed the box and pixel count: %s"
                         % [t for t in all_text if "blobs now" in t])
         if "set blob detail" in joined:
             errs.append("the basic-mode 'sizes need fmt:1' hint outlived "
@@ -272,6 +390,13 @@ def driver():
             errs.append("a give-back happening now raised no size-window "
                         "warning: %s"
                         % [t for t in all_text if "saw all four LEDs" in t])
+        # ...and the shape gate's own drops sit beside the other two, so the
+        # reader can see WHICH gate is doing the work. A total that lumps
+        # them together cannot answer that, and it is the first question
+        # after tightening one of them.
+        if "31 shape" not in joined:
+            errs.append("the shape gate's drops are not in the readout: %s"
+                        % [t for t in all_text if "dropped" in t])
         if link.last.get("fullreg") != 85:
             errs.append("the register radio did not follow the gun back to "
                         "0x55: %r" % link.last.get("fullreg"))
@@ -355,14 +480,68 @@ def driver():
         else:
             errs.append("could not find the wiicam camera panel to measure")
 
+        # ---- the false-negative meter --------------------------------------
+        # bnear counts blobs a gate threw away that sat exactly where the
+        # missing corner had to be, so they were almost certainly LEDs. It is
+        # the only number on this panel that says a gate is WRONG, and read as
+        # one more drop count it would look like the gate earning its keep --
+        # the exact opposite of what it means.
+        for ln in (
+            "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 pxmax=14 "
+            "armax=20 hwmax=-1 "
+            "hwmin=-1 bn=4 brej=120 brrej=50 bvalve=90 bframes=2400 "
+            "bms=24000 bdrop=3 bsrej=44 bfar=12 bnear=6 br4=2100 br3=280 "
+            "br2=95 br1=44 br0=22\n",
+            "CAM: blobs 130,140,3,1,11,9,214 200,141,14,0,12,10,203 "
+            "131,140,13,0,10,9,198 210,150,14,0,41,38,255\n",
+        ):
+            link.src.q.put(ln)
+        root.update()
+        time.sleep(1.6)
+        root.update()
+        near_text = texts(root, [])
+        near = "\n".join(near_text)
+        if "GATE MAY BE TAKING REAL LEDs" not in near:
+            errs.append("bnear moving raised no warning at all: %s"
+                        % [t for t in near_text if "dropped" in t])
+        if "6 shape" in near or "6 size" in near or "6 odd" in near:
+            errs.append("bnear was folded in with the drop counts, where it "
+                        "reads as the gate working rather than as the gate "
+                        "being wrong: %s"
+                        % [t for t in near_text if "dropped" in t])
+        # The sentence that will not fit beside the numbers goes to the log,
+        # once, which is where this panel already puts its reasoning.
+        near_log = logbox_text(root)
+        if "corner" not in near_log or "false-negative" not in near_log:
+            errs.append("the log never explained what the warning means: %r"
+                        % near_log[-300:])
+        if near_log.count("GATE MAY BE TAKING REAL LEDs") > 1:
+            errs.append("the explanation repeats on every poll, which pushes "
+                        "the diag verdict and the save result out of a "
+                        "six-line log box")
+        # Both warnings up at once is the deepest this readout ever gets: one
+        # more wrapped line than the state measured above, and the panel has
+        # to survive it without a single row being cut off the bottom. It is a
+        # weaker bar than the 20 px margin on purpose -- the margin is for the
+        # state the panel sits in, this is for the state it can reach.
+        if wii is not None and nb is not None:
+            page = nb.nametowidget(nb.tabs()[0])
+            if wii.winfo_reqheight() > page.winfo_height():
+                errs.append("with both warnings up the wiicam panel needs "
+                            "%dpx of a %dpx tab area -- its last rows are cut "
+                            "off, which is where 'Save to gun' lives"
+                            % (wii.winfo_reqheight(), page.winfo_height()))
+
         # ...and the give-back warning has to come OFF again once the gun
         # stops giving blobs back. bvalve counts since boot: read raw it
         # latched for the rest of the power cycle, on a panel whose whole job
         # is to say whether the window the user just typed is a good one.
         for ln in (
-            "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 hwmax=-1 "
-            "hwmin=-1 bn=4 brej=90 brrej=39 bvalve=61 bframes=2900 bms=29000 "
-            "bdrop=3 br4=2600 br3=300 br2=100 br1=45 br0=25\n",
+            "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 pxmax=14 "
+            "armax=20 hwmax=-1 "
+            "hwmin=-1 bn=4 brej=120 brrej=50 bvalve=90 bframes=2900 "
+            "bms=29000 bdrop=3 bsrej=44 bfar=12 bnear=6 br4=2600 br3=300 "
+            "br2=100 br1=45 br0=25\n",
             "CAM: blobs 130,140,3,1,11,9,214 200,141,4,1,12,10,203 "
             "131,140,3,1,10,9,198 210,150,3,1,41,38,255\n",
         ):
@@ -370,9 +549,31 @@ def driver():
         root.update()
         time.sleep(1.6)
         root.update()
-        if "SIZE WINDOW TOO TIGHT" in "\n".join(texts(root, [])):
+        cleared = "\n".join(texts(root, []))
+        if "SIZE WINDOW TOO TIGHT" in cleared:
             errs.append("the size-window warning never cleared after the "
                         "give-backs stopped")
+        if "GATE MAY BE TAKING REAL LEDs" in cleared:
+            errs.append("the false-negative warning latched on a since-boot "
+                        "total instead of clearing when the gate stopped")
+
+        # A REFUSAL has to be visible. The gun answers by name and leaves the
+        # old value alone, so the control goes on showing the truth -- which
+        # from the user's side is a spinbox that does nothing.
+        for refusal in (
+            "CAM: pxmax below 12 would reject measured LEDs -- not set\n",
+            "CAM: armax below 16 (2:1) would reject measured LEDs -- not "
+            "set\n",
+        ):
+            link.src.q.put(refusal)
+        root.update()
+        time.sleep(1.0)
+        root.update()
+        refused_log = logbox_text(root)
+        for want in ("pxmax below 12", "armax below 16"):
+            if want not in refused_log:
+                errs.append("the gun refusing a setting ('%s') was swallowed "
+                            "instead of shown: %r" % (want, refused_log[-300:]))
 
         # ---- shape learning ------------------------------------------------
         # The capture that measures what a confirmed LED looks like on this

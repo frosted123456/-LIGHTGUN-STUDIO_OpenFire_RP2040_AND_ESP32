@@ -113,6 +113,33 @@ static uint8_t  s_bmin = 0, s_bmax = 15;    // accepted blob size window
 // lowest non-zero value. See size_consensus_drop().
 static uint8_t  s_rtol = 0;
 
+// ---- the SHAPE gate -------------------------------------------------------
+// The 4-bit size is nearly useless on this rig -- 52,624 confirmed LED blobs
+// came in at size 1 (95.6%) or 2 (4.4%), with no response to a 1.8x distance
+// change. Full mode's bounding box and pixel count are a real measurement, and
+// these two knobs gate on them.
+//
+// A ONE-CLASS envelope, not a discriminator. Both bounds come from what an LED
+// has actually looked like, with a step of margin, so the gate can only ever
+// refuse something OUTSIDE everything we have ever measured. That is the shape
+// of gate that cannot invent a false negative out of a guess: to lose a real
+// LED it would have to be unlike all 52,624 of them.
+//
+//   pxmax  the blob's pixel count. Measured 4..12; 4 is a hard floor nothing
+//          ever goes below. 0 = off.
+//   armax  longest side / shortest side, in EIGHTHS (8 = 1:1, 16 = 2:1).
+//          Measured 63% exactly square and 99.9% at 2:1 or rounder, right
+//          across the distance range -- an LED is a point source, so its blob
+//          is round whatever the bar's geometry and whatever angle it is held
+//          at. This is the one feature that should survive changing the bar.
+//          0 = off.
+//
+// Both need full mode; without a box there is nothing to judge and the gate
+// stands down rather than guessing.
+static uint8_t  s_pxmax = 0;
+static uint8_t  s_armax = 0;
+static uint32_t s_bsrej = 0;   // blobs the shape gate wanted to reject
+
 // ---- the sensor's OWN size thresholds -------------------------------------
 // Registers 0x06 (MAXSIZE) and 0x1B (MINSIZE) gate blobs inside the sensor,
 // BEFORE it allocates its four slots. That makes them the only settings that
@@ -467,6 +494,10 @@ void wiicam_aim_begin(void)
             s_rtol = (uint8_t)grtol;
             ext_set(gfmt);
         }
+        int gpx = 0, gar = 0;
+        if (aim_gate2_load(&gpx, &gar)) {
+            s_pxmax = (uint8_t)gpx; s_armax = (uint8_t)gar;
+        }
     }
     // Recoil engine: defaults (dormant), then whatever was saved. The reply
     // sink is shared so FX: lines reach the tools the same way CAM: does.
@@ -610,6 +641,30 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // every blob -- the readout said the gate was idle in exactly the case it
     // was misconfigured, which is the one case the number exists to reveal.
     for (int i = 0; i < an; ++i) if (!keep[i]) ++s_brej;
+
+    // The shape gate, on the same keep[] and before the same floor. Full mode
+    // only: s_fw/s_fh/s_fi are meaningless in any other format, and judging a
+    // blob by a box the sensor never sent is how a gate rejects everything.
+    if ((s_pxmax || s_armax) && (s_ext_state & 3) == WIICAM_FMT_FULL) {
+        for (int i = 0; i < an; ++i) {
+            if (!keep[i]) continue;               // already gone, do not double-count
+            const int w = (int)s_fw[aslot[i]];
+            const int h = (int)s_fh[aslot[i]];
+            const int px = (int)s_fi[aslot[i]];
+            int drop = 0;
+            if (s_pxmax && px > (int)s_pxmax) drop = 1;
+            // A zero side has no ratio -- it is a blob one pixel across in
+            // that axis, which is the SMALLEST thing the sensor reports, not
+            // an infinitely elongated one. Judging it would reject every
+            // faint LED at the far end of the play range.
+            if (!drop && s_armax && w > 0 && h > 0) {
+                const int lo = (w < h) ? w : h;
+                const int hi = (w < h) ? h : w;
+                if ((8 * hi) / lo > (int)s_armax) drop = 1;
+            }
+            if (drop) { keep[i] = 0; --nk; ++s_bsrej; }
+        }
+    }
 
     // The floor. Below TWO points the resolver cannot fit anything at all and
     // GetPosition falls through to the stock, uncalibrated path -- the cursor
@@ -853,6 +908,7 @@ bool wiicam_cam_command(const char* line)
         const int save_fmt = (int)(s_ext_state & 3);
         ok = aim_gate_store(save_fmt > WIICAM_FMT_EXT ? WIICAM_FMT_EXT : save_fmt,
                             (int)s_bmin, (int)s_bmax, (int)s_rtol) && ok;
+        ok = aim_gate2_store((int)s_pxmax, (int)s_armax) && ok;
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
                           s_lcx, s_lcy };
@@ -862,12 +918,13 @@ bool wiicam_cam_command(const char* line)
         // beta rides in the reply so a tool can VERIFY what was written rather
         // than assume it; cam? reports the live value, this reports the stored one.
         reply(ok && lens_ok
-              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d fmt=%d bmin=%d bmax=%d rtol=%d (sens lives in the OpenFIRE profile; full mode and the two SENSOR thresholds hwmax/hwmin are NOT saved, so a power cycle always clears them)\n"
+              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d fmt=%d bmin=%d bmax=%d rtol=%d pxmax=%d armax=%d (sens lives in the OpenFIRE profile; full mode and the two SENSOR thresholds hwmax/hwmin are NOT saved, so a power cycle always clears them)\n"
               : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), aim_beta_get(),
               (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
               save_fmt > WIICAM_FMT_EXT ? WIICAM_FMT_EXT : save_fmt,
-              (int)s_bmin, (int)s_bmax, (int)s_rtol);
+              (int)s_bmin, (int)s_bmax, (int)s_rtol,
+              (int)s_pxmax, (int)s_armax);
         return true;
     }
     if (!strncmp(line, "camdiag", 7)) {
@@ -914,18 +971,19 @@ bool wiicam_cam_command(const char* line)
             bw[i] = s_bw[i]; bh[i] = s_bh[i]; bi[i] = s_bi[i];
         }
         reply("CAM: blob fmt=%u ext=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
-              "hwmax=%d hwmin=%d "
+              "pxmax=%u armax=%u hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
-              "bdrop=%lu bfar=%lu bnear=%lu "
+              "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu "
               "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu\n",
               (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
               (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
-              (unsigned)s_rtol, (int)(s_hwmax < 0 ? -1 : s_hwmax),
+              (unsigned)s_rtol, (unsigned)s_pxmax, (unsigned)s_armax,
+              (int)(s_hwmax < 0 ? -1 : s_hwmax),
               (int)(s_hwmin < 0 ? -1 : s_hwmin), bn,
               (unsigned long)s_brej, (unsigned long)s_brrej,
               (unsigned long)s_bvalve, (unsigned long)s_bframes,
               (unsigned long)(fx_now() / 1000ull),
-              (unsigned long)s_bdrop,
+              (unsigned long)s_bdrop, (unsigned long)s_bsrej,
               (unsigned long)s_bfar, (unsigned long)s_bnear,
               (unsigned long)s_breal[4],
               (unsigned long)s_breal[3], (unsigned long)s_breal[2],
@@ -995,6 +1053,7 @@ bool wiicam_cam_command(const char* line)
         if (s_ext_state & 3) ext_set(0);
         s_bmin = 0; s_bmax = 15;
         s_rtol = 0;
+        s_pxmax = 0; s_armax = 0;
         // RESTORE, not "leave alone". Marking them untouched left whatever we
         // had written in the sensor -- so the one command a user reaches for
         // when the gun has gone dark could not undo the one setting able to
@@ -1009,7 +1068,7 @@ bool wiicam_cam_command(const char* line)
         // gate that stops the gun aiming would come back on the next boot and
         // the one command a user reaches for when nothing works would fix the
         // session and lose the argument.
-        const bool gone = aim_gate_clear();
+        const bool gone = aim_gate_clear() && aim_gate2_clear();
         reply(gone ? "CAM: lens + lead cleared, blob gates off and unsaved, "
                      "sensor thresholds restored\n"
                    : "CAM: lens + lead cleared, blob gates off, sensor "
@@ -1022,7 +1081,7 @@ bool wiicam_cam_command(const char* line)
               "smooth=%d dead=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d "
               "lcxu=%d lcyu=%d beta=%d tmode=%d firk=%d firpct=%d res=%u dash=%u "
               "ext=%u fmt=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
-              "hwmax=%d hwmin=%d\n",
+              "pxmax=%u armax=%u hwmax=%d hwmin=%d\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
@@ -1032,8 +1091,9 @@ bool wiicam_cam_command(const char* line)
               (unsigned)s_res, (unsigned)s_dash,
               (unsigned)((s_ext_state & 3) >= WIICAM_FMT_EXT),
               (unsigned)(s_ext_state & 3), (unsigned)wiicam_aim_fullreg(),
-              (unsigned)s_bmin, (unsigned)s_bmax,
-              (unsigned)s_rtol, (int)(s_hwmax < 0 ? -1 : s_hwmax),
+              (unsigned)s_bmin, (unsigned)s_bmax, (unsigned)s_rtol,
+              (unsigned)s_pxmax, (unsigned)s_armax,
+              (int)(s_hwmax < 0 ? -1 : s_hwmax),
               (int)(s_hwmin < 0 ? -1 : s_hwmin));
         return true;
     }
@@ -1125,6 +1185,22 @@ bool wiicam_cam_command(const char* line)
         }
         // Size steps, so the whole useful range is 0..15 like the size itself.
         else if (!strcmp(key, "rtol")) { s_rtol = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
+        // The shape gate. Refused below the measured LED envelope rather than
+        // clamped to it: a pxmax under 12 or an armax under 16 would reject
+        // blobs we have watched 52,624 real LEDs produce, and a gate that can
+        // do that is not a gate, it is an outage waiting for the right angle.
+        else if (!strcmp(key, "pxmax")) {
+            const int v = val < 0 ? 0 : (val > 63 ? 63 : val);
+            if (v && v < 12)
+                reply("CAM: pxmax below 12 would reject measured LEDs -- not set\n");
+            else s_pxmax = (uint8_t)v;
+        }
+        else if (!strcmp(key, "armax")) {
+            const int v = val < 0 ? 0 : (val > 63 ? 63 : val);
+            if (v && v < 16)
+                reply("CAM: armax below 16 (2:1) would reject measured LEDs -- not set\n");
+            else s_armax = (uint8_t)v;
+        }
         // The sensor's own thresholds. -1 leaves the register alone; anything
         // else is written to it, on the pump core, at the next hw tick.
         else if (!strcmp(key, "hwmax")) {
@@ -1144,14 +1220,15 @@ bool wiicam_cam_command(const char* line)
     s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
     reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d tmode=%d firk=%d "
           "firpct=%d lens=%u res=%u dash=%u ext=%u fmt=%u fullreg=%u "
-          "bmin=%u bmax=%u rtol=%u hwmax=%d hwmin=%d\n",
+          "bmin=%u bmax=%u rtol=%u pxmax=%u armax=%u hwmax=%d hwmin=%d\n",
           s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
           aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
           (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash,
           (unsigned)((s_ext_state & 3) >= WIICAM_FMT_EXT),
           (unsigned)(s_ext_state & 3), (unsigned)wiicam_aim_fullreg(),
-          (unsigned)s_bmin, (unsigned)s_bmax,
-          (unsigned)s_rtol, (int)(s_hwmax < 0 ? -1 : s_hwmax),
+          (unsigned)s_bmin, (unsigned)s_bmax, (unsigned)s_rtol,
+          (unsigned)s_pxmax, (unsigned)s_armax,
+          (int)(s_hwmax < 0 ? -1 : s_hwmax),
           (int)(s_hwmin < 0 ? -1 : s_hwmin));
     return true;
 }

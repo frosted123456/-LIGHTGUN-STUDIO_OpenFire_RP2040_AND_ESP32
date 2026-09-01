@@ -36,11 +36,40 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 // stub has to know that key by name. Key-blind, an erase of "gate0" fell
 // through to the calibration blob: camreset wiped the calibration and left the
 // saved gate exactly where it was, which is both mistakes at once.
-static bool is_gate(const char* k){ return k && !strcmp(k, "gate0"); }
-static uint32_t g_u32=0; static bool g_uh=false;
+//
+// And there are TWO of them now: the size window in "gate0", the shape gate in
+// "gate1". They are separate on purpose -- the first word is full at 14 bits
+// under its tag, and re-packing it would make every gate already in a gun's
+// flash unreadable -- so the store they are tested against has to keep them
+// separate too. A key-blind u32 slot hides the exact failure the split exists
+// to prevent: camsave writes both, the second lands on top of the first, and
+// the next boot reads the shape gate's payload as a size window.
+static bool is_gate(const char* k){
+    return k && (!strcmp(k, "gate0") || !strcmp(k, "gate1")); }
+struct U32Slot { char key[16]; uint32_t v; bool have; };
+static U32Slot g_u32s[4];       // gate0 gate1, plus room
+static U32Slot* u32_find(const char* k){
+    for (auto& s : g_u32s) if (s.have && k && !strcmp(s.key, k)) return &s;
+    return nullptr; }
+// Dispatched by NAME, not by what happens to be present: an erase of a gate
+// key that is already absent must still be an erase of THAT key, not a
+// fall-through to the calibration blob.
+//
+// And an absent key answers ESP_ERR_NVS_NOT_FOUND, exactly as the real store
+// does. Answering OK for everything made "clearing a key that was never
+// written is not a failure" a test of nothing at all -- the one line it exists
+// to cover was never reached, and that line runs on every camreset on every
+// gun that has saved no gate.
 esp_err_t nvs_erase_key(nvs_handle_t, const char* k){
-    if(is_gate(k)) g_uh=false; else if(is_lens(k)) g_lh=false; else g_bh=false;
-    return ESP_OK; }
+    if(is_gate(k)) {
+        U32Slot* s = u32_find(k);
+        if(!s) return ESP_ERR_NVS_NOT_FOUND;
+        s->have = false; return ESP_OK; }
+    if(is_lens(k)) {
+        if(!g_lh) return ESP_ERR_NVS_NOT_FOUND;
+        g_lh = false; return ESP_OK; }
+    if(!g_bh) return ESP_ERR_NVS_NOT_FOUND;
+    g_bh = false; return ESP_OK; }
 // key-aware i16 store: lead and smoothing live under their own keys
 struct I16Slot { char key[16]; int16_t v; bool have; };
 static I16Slot g_i16s[8];   // lead0 smth0 dead0 tmod0 fir0, plus room
@@ -55,8 +84,14 @@ esp_err_t nvs_set_i16(nvs_handle_t, const char* k, int16_t v){
 esp_err_t nvs_get_i16(nvs_handle_t, const char* k, int16_t* v){
     if (I16Slot* s = i16_find(k)) { *v = s->v; return ESP_OK; }
     return ESP_ERR_NVS_NOT_FOUND; }
-esp_err_t nvs_set_u32(nvs_handle_t, const char*, uint32_t v){ g_u32=v; g_uh=true; return ESP_OK; }
-esp_err_t nvs_get_u32(nvs_handle_t, const char*, uint32_t* v){ if(!g_uh) return ESP_ERR_NVS_NOT_FOUND; *v=g_u32; return ESP_OK; }
+esp_err_t nvs_set_u32(nvs_handle_t, const char* k, uint32_t v){
+    if (U32Slot* s = u32_find(k)) { s->v = v; return ESP_OK; }
+    for (auto& s : g_u32s)
+        if (!s.have) { strncpy(s.key, k, 15); s.v = v; s.have = true; return ESP_OK; }
+    return -1; }
+esp_err_t nvs_get_u32(nvs_handle_t, const char* k, uint32_t* v){
+    if (U32Slot* s = u32_find(k)) { *v = s->v; return ESP_OK; }
+    return ESP_ERR_NVS_NOT_FOUND; }
 esp_err_t nvs_commit(nvs_handle_t){ return ESP_OK; }
 void nvs_close(nvs_handle_t){}
 esp_err_t nvs_flash_init(void){ return ESP_OK; }
@@ -1397,6 +1432,450 @@ int main()
         wiicam_set_fullread_hook(0);
     }
 
+    // ---- the SHAPE gate ---------------------------------------------------
+    // The 4-bit size is nearly useless on this rig: 52,624 confirmed LED blobs
+    // came in at size 1 or 2 with no response to a 1.8x change of distance.
+    // Full mode's bounding box and pixel count are a real measurement, and
+    // these two knobs gate on them -- as a ONE-CLASS envelope, both bounds
+    // taken from what an LED has actually looked like, so the gate can only
+    // ever refuse something outside everything anyone has measured.
+    //
+    // Driven through real 37-byte reports, because the numbers it judges reach
+    // the gate nowhere else: the box and the pixel count are filled by the
+    // full-mode unpack, indexed by HARDWARE SLOT, and the gate has to get at
+    // them through the same compaction the rest of the report goes through.
+    // Hand it the wrong index and it judges one blob by another blob's shape.
+    {
+        wiicam_aim_begin();
+        wiicam_set_fullread_hook(full_hook);
+        g_ffail_on = 0; g_fdrift = 0; g_fhdrdrift = 0;
+        wiicam_cam_command("cam=res:0,dash:2,dashhz:0,mirx:1");
+        wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,pxmax:0,armax:0");
+        wiicam_cam_command("cam=fmt:2");
+
+        int gpx[4] = {0, 0, 0, 0}, gpy[4] = {0, 0, 0, 0};
+        int gsz[4] = {-1, -1, -1, -1};
+        unsigned gseen = 0;
+        int gjit = 0;
+        // One full-mode frame end to end -- fill the sensor's slots, poll them
+        // the way the firmware does, hand the poll's OWN answer to the
+        // pipeline -- and report how many blobs came out the far side of the
+        // gates. The one pixel of jitter is not cosmetic: a byte-identical
+        // report is the previous camera frame seen again and returns the
+        // cached answer without touching a single stateful stage, the gate and
+        // its counters included, so an unjittered pair would measure one frame
+        // and report it as two.
+        auto shape_n = [&](const FullObj* o) {
+            memcpy(g_fobj, o, sizeof(g_fobj));
+            // Every slot, not just the first: the duplicate cache compares
+            // only the slots the mask says were SEEN, so jitter parked on an
+            // empty slot moves nothing it looks at.
+            const int j = (gjit++ & 1) ? 1 : -1;
+            for (int k = 0; k < 4; ++k) g_fobj[k].x += j;
+            wiicam_aim_full_poll(gpx, gpy, gsz, &gseen);
+            g_lines.clear();
+            t += DT;
+            wiicam_aim_process_sz(gpx, gpy, gsz, gseen, t, &sx, &sy);
+            int nn = -1; unsigned long mm;
+            if (!g_lines.empty())
+                sscanf(g_lines[0].c_str(), "Q,%lu,%d", &mm, &nn);
+            return nn;
+        };
+        // One counter out of '~camblob?'. They are cumulative since boot by
+        // design -- the tools show deltas -- so the test reads them that way.
+        auto blobstat = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            unsigned long v = 0;
+            if (!g_replies.empty()) {
+                const char* p = strstr(g_replies[0].c_str(), key);
+                if (p) sscanf(p + strlen(key), "%lu", &v);
+            }
+            return v;
+        };
+
+        // Four LEDs on a rectangle, every one of them what this rig actually
+        // produces: a 4x4 box at 12 pixels, the very top of the measured
+        // envelope. The last column is the report's intensity byte, which is
+        // the blob's pixel count and is what pxmax is measured in.
+        static const FullObj ROUND[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 14, 24, 12 },
+        };
+
+        // ---- pxmax, and which side of it the bound falls on ----------------
+        wiicam_cam_command("cam=pxmax:12,armax:0");
+        ck(shape_n(ROUND) == 4,
+           "a blob at EXACTLY pxmax is kept: the envelope was measured up to "
+           "12 pixels inclusive, so a '>=' here refuses the largest LED "
+           "anyone has ever recorded off this rig");
+        static const FullObj ONE_OVER[4] = {
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 14, 24, 13 },   // one pixel too many
+        };
+        {
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(ONE_OVER) == 3,
+               "and one pixel over it the blob is dropped before the resolver "
+               "-- the whole knob is that boundary");
+            ck(blobstat("bsrej=") == s0 + 1,
+               "...counted once, in the shape gate's own counter");
+        }
+
+        // ---- armax, in BOTH orientations -----------------------------------
+        // The ratio is longest side over shortest, not width over height. A
+        // w/h would let every TALL stray through and an h/w every wide one,
+        // and either mistake leaves a gate that looks like it works because
+        // half the strays a bench test throws at it still get caught.
+        wiicam_cam_command("cam=pxmax:0,armax:16");
+        static const FullObj AT_2TO1[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 14, 28, 12 },   // 4 wide, 8 tall -- 2:1
+            { 768, 240, 1,  10, 20, 18, 24, 12 },   // 8 wide, 4 tall -- 2:1
+            { 256, 528, 1,  10, 20, 14, 24, 12 },   // 4x4
+            { 768, 528, 1,  10, 20, 14, 24, 12 },   // 4x4
+        };
+        ck(shape_n(AT_2TO1) == 4,
+           "exactly at armax is kept, tall as well as wide -- 99.9% of the "
+           "measured LEDs are 2:1 or rounder, so 16 eighths is the last ratio "
+           "the envelope has to admit rather than the first it refuses");
+        static const FullObj TALL[4] = {
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 14, 29, 12 },   // 4 wide, 9 tall -- 2.25:1
+        };
+        ck(shape_n(TALL) == 3,
+           "a TALL blob past armax is dropped -- judged as width over height "
+           "its 4 by 9 reads as rounder than round and it sails through");
+        static const FullObj WIDE[4] = {
+            { 256, 240, 1,  10, 20, 14, 24, 12 },
+            { 768, 240, 1,  10, 20, 14, 24, 12 },
+            { 256, 528, 1,  10, 20, 14, 24, 12 },
+            { 768, 528, 1,  10, 20, 19, 24, 12 },   // 9 wide, 4 tall -- 2.25:1
+        };
+        ck(shape_n(WIDE) == 3,
+           "and so is a WIDE one -- height over width would have missed this "
+           "one instead, which is why both orientations are checked and not "
+           "whichever one the first stray happened to be");
+
+        // ---- a zero box side is not an infinitely elongated blob ------------
+        // It is the SMALLEST thing the sensor can report: a blob one pixel
+        // across in that axis, which is a faint LED at the far end of the play
+        // range. There is no ratio to take, and taking one anyway divides by
+        // zero on the way to rejecting the whole distant half of the room.
+        static const FullObj FLAT[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 10, 26, 12 },   // zero WIDTH, 6 tall
+            { 768, 240, 1,  10, 20, 22, 20, 12 },   // 12 wide, zero HEIGHT
+            { 256, 528, 1,  10, 20, 10, 20, 12 },   // zero both ways
+            { 768, 528, 1,  10, 20, 14, 24, 12 },   // an ordinary 4x4
+        };
+        ck(shape_n(FLAT) == 4,
+           "a zero-width, a zero-height and a zero-by-zero box are all kept "
+           "with armax at its tightest: a side the sensor rounded to nothing "
+           "is the faintest LED it can see, not a streak");
+
+        // ---- the gate reaches the box through the SAME compaction -----------
+        // The poll fills its box arrays by HARDWARE SLOT, 0..3 as the sensor
+        // numbers them; everything the report shows walks the COMPACTED seen
+        // list, because process_sz skips empty slots as it goes. Index the box
+        // by the compacted position and the gate judges the first blob by
+        // slot 0's box -- which belongs to no blob on screen the moment any
+        // slot but the last is empty. A slot goes empty exactly when a bright
+        // source has taken it, so the gate would be reading the wrong shape in
+        // precisely the case it exists for.
+        //
+        // The blob COUNT cannot show this: one blob is rejected either way.
+        // Which blob got the verdict can, so that is what is read.
+        wiicam_cam_command("cam=pxmax:12,armax:0");
+        static const FullObj GAP_FAT[4] = {
+        //    x     y  sz  xmn ymn xmx ymx  px
+            { 1023,1023, 15,  0,  0,  0,  0,  0 },   // EMPTY
+            {  256, 240,  1, 10, 20, 14, 24, 40 },   // the offender: 40 pixels
+            {  768, 240,  1, 10, 20, 14, 24, 12 },
+            {  256, 528,  1, 10, 20, 14, 24, 12 },
+        };
+        ck(shape_n(GAP_FAT) == 2,
+           "with slot 0 empty and one of the three remaining blobs too fat, "
+           "two survive");
+        {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            int gb[21];
+            int gotg = 0;
+            if (g_replies.size() >= 2)
+                gotg = sscanf(g_replies[1].c_str(),
+                              "CAM: blobs %d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d"
+                              " %d,%d,%d,%d,%d,%d,%d",
+                              &gb[0],&gb[1],&gb[2],&gb[3],&gb[4],&gb[5],&gb[6],
+                              &gb[7],&gb[8],&gb[9],&gb[10],&gb[11],&gb[12],&gb[13],
+                              &gb[14],&gb[15],&gb[16],&gb[17],&gb[18],&gb[19],&gb[20]);
+            ck(gotg == 21 && gb[6] == 40 && gb[13] == 12 && gb[20] == 12,
+               "the FIRST listed blob is slot 1, and it is the one carrying "
+               "the 40 pixels -- without that this check is measuring the "
+               "report's compaction rather than the gate's");
+            ck(gotg == 21 && gb[3] == 0 && gb[10] == 1 && gb[17] == 1,
+               "...and it is the first listed blob the gate rejected: judged "
+               "by the compacted index instead, slot 0's cleared box would "
+               "have acquitted it and an innocent blob further down the list "
+               "would have taken the verdict in its place");
+        }
+
+        // ---- both knobs at once, and then the format that switches them off -
+        wiicam_cam_command("cam=pxmax:12,armax:16");
+        static const FullObj MIXED[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 1,  10, 20, 14, 24, 12 },   // an LED
+            { 768, 240, 1,  10, 20, 14, 24, 12 },   // an LED
+            { 256, 528, 1,  10, 20, 14, 24, 40 },   // 4x4 but 40 pixels
+            { 768, 528, 1,  10, 20, 30, 24, 12 },   // 20x4 -- 5:1
+        };
+        ck(shape_n(MIXED) == 2,
+           "the two knobs act on the same keep[] in the same pass: the fat "
+           "blob and the long one both go, and neither knob undoes the "
+           "other's verdict");
+
+        // Outside full mode the box arrays mean nothing and the gate has to
+        // stand down ENTIRELY. The case that matters is not the tidy one where
+        // those arrays are empty: the command parser runs on one core and the
+        // camera poll on the other, so the poll goes on doing 37-byte reads
+        // until it notices the new epoch, and a frame reaches process_sz with
+        // a real full-mode box in the arrays while the format word already
+        // says extended. Judge a blob by a box the format says the sensor is
+        // not sending and the gate is acting on a number whose meaning it
+        // cannot know -- which is how a gate rejects everything.
+        wiicam_cam_command("cam=fmt:1");
+        ck(shape_n(MIXED) == 4,
+           "in extended the shape gate does nothing at all, both knobs still "
+           "set and a freshly unpacked box sitting in the arrays");
+        wiicam_cam_command("cam=fmt:0");
+        ck(shape_n(MIXED) == 4, "nor in basic, for the same reason");
+        wiicam_cam_command("cam=fmt:2");
+        ck(shape_n(MIXED) == 2,
+           "...and full mode turns it straight back on, so what stood the "
+           "gate down was the format and not some latch it never got out of");
+
+        // Off is off. Both knobs at 0 is the shipped state, and it has to be
+        // the state a user can get back to by hand.
+        wiicam_cam_command("cam=pxmax:0,armax:0");
+        {
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(MIXED) == 4,
+               "with both knobs at 0 the gate is inert, in full mode, on the "
+               "frame it had just been shredding");
+            ck(blobstat("bsrej=") == s0,
+               "...and counts nothing either: a gate that is off must not be "
+               "reporting rejections it did not make");
+        }
+
+        // ---- the size window gets first refusal, and keeps it ---------------
+        // The two gates run on one keep[] array, the window first. A blob it
+        // has already thrown out is not the shape gate's to throw out again --
+        // double-counted, bsrej reads as evidence that the shape knobs are
+        // earning their place when in fact the window did all the work, and
+        // the readout the gate has to be TUNED from says the opposite of the
+        // truth.
+        wiicam_cam_command("cam=bmin:0,bmax:8,pxmax:12,armax:16");
+        static const FullObj ALREADY_OUT[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240,  1, 10, 20, 14, 24, 12 },
+            { 768, 240,  1, 10, 20, 14, 24, 12 },
+            { 256, 528,  1, 10, 20, 14, 24, 12 },
+            { 768, 528, 14, 10, 20, 30, 24, 40 },   // out of the window AND
+        };                                          // 5:1 at 40 pixels
+        {
+            const unsigned long w0 = blobstat("brej=");
+            const unsigned long s0 = blobstat("bsrej=");
+            ck(shape_n(ALREADY_OUT) == 3,
+               "a blob that fails the window and both shape knobs is dropped "
+               "-- once");
+            ck(blobstat("brej=") == w0 + 1,
+               "...by the window, which saw it first");
+            ck(blobstat("bsrej=") == s0,
+               "...and NOT counted again by the shape gate: bsrej is what the "
+               "shape knobs are worth on their own, and it is the number they "
+               "get tuned from");
+        }
+        wiicam_cam_command("cam=bmin:0,bmax:15");
+
+        // ---- the floor is still downstream of it ----------------------------
+        // Below TWO points the resolver cannot fit anything and GetPosition
+        // falls through to the stock uncalibrated path -- the cursor jumps. A
+        // shape gate set so tight it would do that is set wrong, and giving
+        // blobs back is the correct response; running the gate AFTER the floor
+        // instead would let it undo the one guarantee the floor exists to make.
+        wiicam_cam_command("cam=pxmax:12,armax:0");
+        static const FullObj ALL_FAT[4] = {
+            { 256, 240, 1,  10, 20, 14, 24, 40 },
+            { 768, 240, 1,  10, 20, 14, 24, 40 },
+            { 256, 528, 1,  10, 20, 14, 24, 40 },
+            { 768, 528, 1,  10, 20, 14, 24, 40 },
+        };
+        {
+            const unsigned long s0 = blobstat("bsrej=");
+            const unsigned long v0 = blobstat("bvalve=");
+            ck(shape_n(ALL_FAT) == 2,
+               "a shape gate that rejects EVERY blob is held to the same floor "
+               "of two, never zero -- it cannot blind the gun any more than "
+               "the size window can");
+            ck(blobstat("bsrej=") == s0 + 4,
+               "...with all FOUR rejections counted, before the floor gave any "
+               "back: a count taken afterwards would report two on a gate that "
+               "refused everything, which is idle-looking in exactly the case "
+               "the number exists to reveal");
+            ck(blobstat("bvalve=") == v0 + 2,
+               "...and the two that came back are the FLOOR's doing, recorded "
+               "where a user tuning the knob can see the gate is being "
+               "overruled");
+        }
+        wiicam_cam_command("cam=pxmax:0,armax:0");
+
+        // ---- where the counter is reported ----------------------------------
+        {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            const std::string l1 = g_replies.empty() ? std::string() : g_replies[0];
+            const size_t at_drop = l1.find("bdrop=");
+            const size_t at_srej = l1.find("bsrej=");
+            const size_t at_far  = l1.find("bfar=");
+            ck(at_drop != std::string::npos && at_srej != std::string::npos
+               && at_far != std::string::npos
+               && at_drop < at_srej && at_srej < at_far,
+               "bsrej sits between bdrop and bfar on the blob line -- the "
+               "tools read this line positionally as well as by name, and a "
+               "counter inserted anywhere else shifts every column after it");
+        }
+
+        // ---- the refusals ----------------------------------------------------
+        // Refused BELOW the measured envelope rather than clamped up to it. A
+        // pxmax under 12 or an armax under 16 would reject blobs we have
+        // watched 52,624 real LEDs produce, and a gate that can do that is not
+        // a gate, it is an outage waiting for the right angle. Clamping would
+        // hide the mistake; refusing by name puts it on the wire.
+        // Standing at 14 and 20 rather than at the bound itself, so "the value
+        // did not move" can tell a refusal apart from a silent clamp up to the
+        // bound -- which is the shape this mistake actually takes, and which
+        // would look identical from a gate standing at 12 and 16.
+        wiicam_cam_command("cam=pxmax:14,armax:20");
+        g_replies.clear();
+        wiicam_cam_command("cam=pxmax:11");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax below 12") != std::string::npos,
+           "pxmax:11 is refused BY NAME -- one under the envelope is exactly "
+           "the value a spinner lands on and it would start dropping real "
+           "LEDs at the near end of the play range");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=14 ") != std::string::npos,
+           "...and the value does not move -- not to 11, and not quietly up to "
+           "12 either: a refusal that half-applied would leave behind a gate "
+           "nobody asked for");
+        g_replies.clear();
+        wiicam_cam_command("cam=armax:15");
+        ck(!g_replies.empty()
+           && g_replies[0].find("armax below 16") != std::string::npos,
+           "armax:15 likewise -- 15 eighths is under 2:1, and 2:1 is a shape "
+           "the measured LEDs actually reach");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("armax=20 ") != std::string::npos,
+           "...and it stays where it was, at 20 and not at the bound");
+
+        // The envelope itself is the first legal value on each knob.
+        g_replies.clear();
+        wiicam_cam_command("cam=pxmax:12,armax:16");
+        ck(g_replies.size() == 1
+           && g_replies[0].find("CMD ok (tune)") != std::string::npos,
+           "12 and 16 -- the envelope itself -- are accepted with no refusal "
+           "line at all");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=12 ") != std::string::npos
+           && g_replies[0].find("armax=16 ") != std::string::npos,
+           "...and they really land, which is also what says the two refusals "
+           "above left 14 and 20 in place rather than never writing at all");
+        wiicam_cam_command("cam=pxmax:14,armax:20");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=14 ") != std::string::npos
+           && g_replies[0].find("armax=20 ") != std::string::npos,
+           "and so are 14 and 20, a step of margin outside it -- the gate is "
+           "only ever allowed to be LOOSER than what was measured");
+
+        // Zero is always legal, on both knobs, from any value. It is off, and
+        // off is the state a user reaches for when the gate is the suspect.
+        g_replies.clear();
+        wiicam_cam_command("cam=pxmax:0");
+        ck(g_replies.size() == 1
+           && g_replies[0].find("not set") == std::string::npos,
+           "pxmax:0 is not refused: 0 is off, not a gate below the envelope");
+        g_replies.clear();
+        wiicam_cam_command("cam=armax:0");
+        ck(g_replies.size() == 1
+           && g_replies[0].find("not set") == std::string::npos,
+           "and neither is armax:0");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=0 ") != std::string::npos
+           && g_replies[0].find("armax=0 ") != std::string::npos,
+           "...and both really do land, so the one way out of a bad shape "
+           "gate is reachable by hand");
+
+        // Out of range at the top clamps rather than wrapping: both fields are
+        // six bits in the stored word, and an unclamped 200 comes back as 8.
+        wiicam_cam_command("cam=pxmax:999,armax:1000");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=63 ") != std::string::npos
+           && g_replies[0].find("armax=63 ") != std::string::npos,
+           "a value past the top clamps to 63, the widest the stored field "
+           "holds -- wrapping it would turn an absurdly loose gate into a "
+           "tight one nobody asked for");
+        wiicam_cam_command("cam=pxmax:-5,armax:-5");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=0 ") != std::string::npos
+           && g_replies[0].find("armax=0 ") != std::string::npos,
+           "and a negative one is off, not a refusal: the clamp runs first, so "
+           "typing a minus to mean 'no limit' does what it looks like");
+
+        // ---- where the two knobs are reported --------------------------------
+        wiicam_cam_command("cam=pxmax:14,armax:20");
+        g_replies.clear();
+        wiicam_cam_command("camblob?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=14 ") != std::string::npos
+           && g_replies[0].find("armax=20 ") != std::string::npos,
+           "the blob line carries both knobs, so the capture a gate is chosen "
+           "from records the gate that was in force while it was taken");
+        g_replies.clear();
+        wiicam_cam_command("cam=armax:20");
+        ck(!g_replies.empty()
+           && g_replies.back().find("CMD ok (tune)") != std::string::npos
+           && g_replies.back().find("pxmax=14 ") != std::string::npos
+           && g_replies.back().find("armax=20 ") != std::string::npos,
+           "and so does the tune echo, which is the only reply a tool gets "
+           "back from a 'cam=' line and therefore the only place it can read "
+           "what actually took");
+
+        wiicam_cam_command("cam=pxmax:0,armax:0,fmt:0");
+        wiicam_set_fullread_hook(0);
+    }
+
     // ---- the gate that survives a power cycle -----------------------------
     // The first real capture at the TV had the gun holding 99.7% four-corner
     // with rtol on, and every one of those settings died on the next power
@@ -1511,6 +1990,161 @@ int main()
            && g_replies[0].find("bmax=15") != std::string::npos
            && g_replies[0].find("rtol=0") != std::string::npos,
            "so the boot after that one really does come up inert");
+    }
+
+    // ---- the shape gate's OWN key -----------------------------------------
+    // A SECOND word rather than two more fields in the first. The first is
+    // full at 14 bits of payload under its tag, and re-packing it would make
+    // every gate already sitting in a gun's flash unreadable -- a silent
+    // downgrade to "no gate stored" on the one setting that survives a reboot,
+    // on exactly the guns that had bothered to save one.
+    //
+    // Which buys nothing unless the two keys really are independent, so that
+    // is most of what is checked here: neither may answer for the other, erase
+    // the other, or be readable out of the other's bits.
+    {
+        int gp = -1, ga = -1;
+        ck(aim_gate2_store(12, 20), "the shape gate stores as one word");
+        ck(aim_gate2_load(&gp, &ga), "and loads back");
+        ck(gp == 12 && ga == 20,
+           "with both knobs intact and not swapped -- pxmax and armax are the "
+           "same width, so an exchanged pair is two plausible numbers");
+        // Six bits each, so an unclamped value does not merely come back
+        // wrong: it bleeds into the field above it.
+        ck(aim_gate2_store(-3, 99), "an out-of-range pair still stores");
+        ck(aim_gate2_load(&gp, &ga) && gp == 0 && ga == 63,
+           "clamped on the way in, so an armax of 99 cannot land a carry bit "
+           "in the pxmax field above it and turn a gate nobody set into one "
+           "that rejects blobs");
+        // A stale or foreign word must read as NOTHING STORED. The tag is the
+        // only thing that can tell the difference, and it is the whole reason
+        // the second key could be added without disturbing the first.
+        nvs_set_u32(1, "gate1", 0x00005678u);
+        gp = ga = -1;
+        ck(!aim_gate2_load(&gp, &ga),
+           "an untagged word is 'nothing stored', not a shape gate");
+        ck(gp == -1 && ga == -1,
+           "and the caller's own defaults are left exactly where they were -- "
+           "wiicam_aim_begin passes in the shipped 0,0 and a load that wrote "
+           "before it failed would gate a gun that never asked for it");
+        ck(aim_gate2_clear(), "clearing it succeeds");
+        ck(!aim_gate2_load(&gp, &ga), "after which nothing is stored");
+        ck(aim_gate2_clear(),
+           "and clearing an ALREADY absent key is not a failure -- camreset "
+           "erases both gates on every gun it runs on, including the ones that "
+           "have neither, and it must not report that it could not");
+
+        // ---- the two keys do not touch each other --------------------------
+        int sf = -1, smn = -1, smx = -1, srt = -1;
+        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20),
+           "a gun with both gates saved");
+        ck(aim_gate_load(&sf, &smn, &smx, &srt)
+           && sf == 1 && smn == 4 && smx == 11 && srt == 6,
+           "the size window reads back its own four fields with a shape gate "
+           "written after it");
+        ck(aim_gate2_load(&gp, &ga) && gp == 12 && ga == 20,
+           "and the shape gate its own two -- one key never answers for the "
+           "other, which sharing a key is precisely how they would");
+        ck(aim_gate2_clear(), "clear the shape gate on its own");
+        ck(!aim_gate2_load(&gp, &ga), "...it is gone");
+        sf = smn = smx = srt = -1;
+        ck(aim_gate_load(&sf, &smn, &smx, &srt)
+           && sf == 1 && smn == 4 && smx == 11 && srt == 6,
+           "...and the size window is untouched: erasing one gate must not "
+           "take the other down with it");
+        ck(aim_gate2_store(12, 20) && aim_gate_clear(), "now the other way up");
+        ck(!aim_gate_load(&sf, &smn, &smx, &srt), "the size window is gone");
+        ck(aim_gate2_load(&gp, &ga) && gp == 12 && ga == 20,
+           "...and the shape gate outlives it");
+        // Corruption travels no further than its own key either. A word that
+        // fails its tag check is one unreadable setting, not two.
+        ck(aim_gate_store(1, 4, 11, 6), "both stored again");
+        nvs_set_u32(1, "gate0", 0x00001234u);
+        ck(!aim_gate_load(&sf, &smn, &smx, &srt),
+           "a corrupt size-gate word reads as nothing stored");
+        ck(aim_gate2_load(&gp, &ga) && gp == 12 && ga == 20,
+           "...and the shape gate beside it is still perfectly readable");
+        ck(aim_gate_store(1, 4, 11, 6), "repair the size gate");
+        nvs_set_u32(1, "gate1", 0x00005678u);
+        ck(!aim_gate2_load(&gp, &ga),
+           "and a corrupt shape-gate word reads as nothing stored too");
+        sf = smn = smx = srt = -1;
+        ck(aim_gate_load(&sf, &smn, &smx, &srt) && smn == 4 && smx == 11,
+           "...without stopping the size window loading, which is the whole "
+           "point of giving it a key of its own");
+
+        // ---- a gun flashed before the shape gate existed ---------------------
+        // It has a 'gate0' and no 'gate1' at all, and it has to come up with
+        // its size window exactly as it saved it and the shape gate OFF. Read
+        // out of the other key's bits, the perfectly ordinary saved gate
+        // fmt:1 bmin:4 bmax:11 rtol:6 spells pxmax=18 armax=54 -- a shape gate
+        // on a gun that has never had one, dropping blobs nobody asked it to.
+        wiicam_cam_command("cam=pxmax:0,armax:0");   // as the statics ship
+        ck(aim_gate_store(1, 4, 11, 6), "an old gun's saved size window");
+        ck(aim_gate2_clear(), "...and nothing at all under the second key");
+        wiicam_aim_begin();
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("fmt=1") != std::string::npos
+           && g_replies[0].find("bmin=4") != std::string::npos
+           && g_replies[0].find("bmax=11") != std::string::npos
+           && g_replies[0].find("rtol=6") != std::string::npos,
+           "it boots with its size window exactly as it was saved");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=0 ") != std::string::npos
+           && g_replies[0].find("armax=0 ") != std::string::npos,
+           "...and the shape gate off: an absent 'gate1' means no shape gate, "
+           "never a gate of zeroes and never one read out of gate0");
+
+        // ---- end to end through the serial surface ---------------------------
+        wiicam_cam_command("cam=pxmax:14,armax:20");
+        g_replies.clear();
+        wiicam_cam_command("camsave");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=14") != std::string::npos
+           && g_replies[0].find("armax=20") != std::string::npos,
+           "camsave names the shape gate it wrote alongside the size one, so a "
+           "tool can VERIFY what landed rather than assume it");
+        ck(aim_gate2_load(&gp, &ga) && gp == 14 && ga == 20,
+           "...and the second word really holds both knobs -- the reply is not "
+           "the thing that decides what the next boot does");
+        {
+            int cf = -1, cmn = -1, cmx = -1, crt = -1;
+            ck(aim_gate_load(&cf, &cmn, &cmx, &crt) && cmn == 4 && cmx == 11,
+               "...and the size window it was saved beside is still there, "
+               "written to its own key in the same camsave");
+        }
+        wiicam_cam_command("cam=pxmax:0,armax:0");   // forget the live copy
+        wiicam_aim_begin();
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=14 ") != std::string::npos
+           && g_replies[0].find("armax=20 ") != std::string::npos,
+           "a reboot brings the shape gate back, which is the only reason it "
+           "is worth saving and also the only reason camreset has to erase it");
+        g_replies.clear();
+        wiicam_cam_command("camreset");
+        ck(!aim_gate2_load(&gp, &ga),
+           "camreset erases the saved shape gate too: a gate that stops the "
+           "gun aiming would otherwise come back on the next boot and the one "
+           "command a user reaches for when nothing works would fix the "
+           "session and lose the argument");
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=0 ") != std::string::npos
+           && g_replies[0].find("armax=0 ") != std::string::npos,
+           "...and the LIVE knobs go to 0 with it, so the recovery command "
+           "does not leave the gate running until the next power cycle");
+        wiicam_aim_begin();
+        g_replies.clear();
+        wiicam_cam_command("cam?");
+        ck(!g_replies.empty()
+           && g_replies[0].find("pxmax=0 ") != std::string::npos
+           && g_replies[0].find("armax=0 ") != std::string::npos,
+           "so the boot after that one comes up with no shape gate either");
     }
 
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

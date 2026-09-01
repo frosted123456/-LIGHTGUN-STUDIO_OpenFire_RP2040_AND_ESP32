@@ -288,6 +288,7 @@ bool aim_dead_load(int* out_units)
 // a stale or foreign key read as "nothing stored" instead of as gate 0,0,0,0,
 // which would silently switch the size window off on a gun that had one.
 #define AIM_NVS_GATE "gate0"
+#define AIM_NVS_GATE2 "gate1"
 #define AIM_GATE_TAG 0x6A000000u
 
 bool aim_gate_store(int fmt, int bmin, int bmax, int rtol)
@@ -350,6 +351,60 @@ bool aim_gate_clear(void)
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
     const esp_err_t e = nvs_erase_key(h, AIM_NVS_GATE);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+bool aim_gate2_store(int pxmax, int armax)
+{
+    if (pxmax < 0)  pxmax = 0;
+    if (pxmax > 63) pxmax = 63;
+    if (armax < 0)  armax = 0;
+    if (armax > 63) armax = 63;
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)pxmax << 6)
+                     | (uint32_t)armax;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_u32(h, AIM_NVS_GATE2, v) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)v; return true;
+#endif
+}
+
+bool aim_gate2_load(int* out_pxmax, int* out_armax)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_pxmax || !out_armax) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint32_t v = 0;
+    const esp_err_t e = nvs_get_u32(h, AIM_NVS_GATE2, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
+    *out_pxmax = (int)((v >> 6) & 0x3F);
+    *out_armax = (int)(v & 0x3F);
+    return true;
+#else
+    (void)out_pxmax; (void)out_armax; return false;
+#endif
+}
+
+bool aim_gate2_clear(void)
+{
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t e = nvs_erase_key(h, AIM_NVS_GATE2);
     const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
     if (ok) nvs_commit(h);
     nvs_close(h);
