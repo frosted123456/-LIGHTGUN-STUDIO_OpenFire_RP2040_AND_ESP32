@@ -744,35 +744,192 @@ def main():
     app.step([], t + 9.4)
     ck(True, "camera screen renders with the blob readout")
 
-    # The readout must not be drawn ON TOP of the rows. The wiicam list grew to
-    # eleven entries and a fixed readout height landed over the last three.
-    row_bottom = max((r.rect.bottom for r in cam3.rows if r.rect), default=0)
-    txt_top = None
-    real_text = pical.Screen.text
-    def spy_text(self, x, y, msg, font=None, colour=None, centre=True):
-        r = real_text(self, x, y, msg, font, colour, centre)
-        if "blobs now" in str(msg) or "saw all four LEDs" in str(msg):
-            globals()["_spy_top"] = min(globals().get("_spy_top", 10**6), r.top)
-        return r
-    globals()["_spy_top"] = 10**6
-    pical.Screen.text = spy_text
-    app.step([], t + 9.45)
-    pical.Screen.text = real_text
-    txt_top = globals()["_spy_top"]
-    ck(txt_top == 10**6 or txt_top >= row_bottom,
-       "the blob readout sits below the last row, not over it (rows end %d, "
-       "readout starts %s)" % (row_bottom, txt_top))
+    # ---- full detail: seven fields per blob, and the worst-case readout ----
+    # This is the state the readout is TALLEST in, and the one the slice at
+    # the bottom of Camera.draw has to survive: box and brightness on every
+    # blob, three of them dropped, so the sentence wraps onto three rows and
+    # not two.
+    app.link.last.update({"fmt": 2, "fullreg": 85})
+    app.link.blobs = ("CAM: blobs 118,140,3,0,11,9,214 200,141,4,0,12,10,203 "
+                      "131,144,3,0,10,9,198 210,150,14,0,41,38,255")
+    cam3.log_toggle()                      # the LOGGING line, drawn last
+    # Two replies, because every counter on this screen is a DELTA: the first
+    # takes the baseline, the second is the window the user actually reads.
+    app.link.last.update({"bframes": 1900, "bms": 19000, "brej": 40,
+                          "brrej": 18, "bvalve": 4, "br4": 1000, "br3": 60,
+                          "br2": 20, "br1": 5, "br0": 0})
+    cam3._rate.feed(1900, 19000)
+    cam3.blob_lines()
+    app.link.last.update({"bframes": 2000, "bms": 20000, "brej": 90,
+                          "brrej": 39, "br4": 1200, "br3": 90, "br2": 30,
+                          "br1": 8, "br0": 1})
+    cam3._rate.feed(2000, 20000)
+    full = cam3.blob_lines()
+    joined = "\n".join(full)
+    ck("box 41x38 bright 255" in joined,
+       "full detail shows each blob's box and brightness")
+    ck(len(pical.wrap(full[0], 96)) == 3,
+       "the full-mode blob line wraps onto three rows, not two (%d)"
+       % len(pical.wrap(full[0], 96)))
+    wrapped = []
+    for ln in full:
+        wrapped.extend(pical.wrap(ln, 96))
+    ck(len(wrapped) >= 6,
+       "the worst-case readout is at least six rows deep, so the slice is "
+       "actually being tested (%d rows: %s)"
+       % (len(wrapped), [r[:18] for r in wrapped]))
 
-    # The sensor's own thresholds and the odd-one-out gate reach the gun.
+    # The drop counts have to STAY on screen between gun replies. blob_lines()
+    # runs from draw() at ~60 fps while link.last changes about once a second:
+    # re-baselining on every call made "N dropped by size" true for the one
+    # frame after each reply and blank for the other fifty-nine.
+    ck("50 dropped by size" in joined and "21 dropped as odd-one-out" in joined,
+       "the drop counts are the delta since the last reply: %s"
+       % [l for l in full if "dropped" in l])
+    ck(all("50 dropped by size" in "\n".join(cam3.blob_lines())
+           for _ in range(5)),
+       "and they survive the draws between one reply and the next, instead "
+       "of showing for 16 ms in every second")
+
+    # bvalve counts blobs the floor gave BACK, since boot. Read raw, one
+    # give-back at any time in the power cycle pinned this warning on screen
+    # for good -- permanently spending one of the six rows the readout has.
+    ck("SIZE WINDOW TOO TIGHT" not in joined,
+       "a since-boot bvalve is not a give-back happening now")
+    app.link.last.update({"bframes": 2100, "bms": 21000, "bvalve": 61,
+                          "br4": 1300, "br3": 120, "br2": 40, "br1": 10,
+                          "br0": 2})
+    ck("SIZE WINDOW TOO TIGHT" in "\n".join(cam3.blob_lines()),
+       "a give-back happening now says the size window is too tight")
+    app.link.last.update({"bframes": 2200, "bms": 22000,
+                          "br4": 1400, "br3": 150, "br2": 50, "br1": 12,
+                          "br0": 3})
+    ck("SIZE WINDOW TOO TIGHT" not in "\n".join(cam3.blob_lines()),
+       "and it clears once the give-backs stop, instead of latching for the "
+       "rest of the power cycle")
+
+    # The readout must not be drawn ON TOP of the rows, nor over the selected
+    # row's own hint below them. Measured at 1024x768, which is the mode the
+    # Pi actually runs in: at the 1280x720 the rest of this test renders at, a
+    # seventh row still clears the hint by 2 px and the collision the slice
+    # exists to avoid would go unnoticed.
+    pi_sc = pical.Screen(pygame.Surface((1024, 768)))
+
+    def readout_rows():
+        """Draw one camera frame and hand back the rect of EVERY readout row.
+
+        Spied through lines() as well as text(), so a sentence that wraps is
+        measured on all of its rows rather than only the one starting with
+        the words being matched -- and so a check that finds nothing at all
+        has something to fail on instead of quietly passing.
+        """
+        real_text, real_lines = pical.Screen.text, pical.Screen.lines
+        got = {"inside": False, "rows": []}
+
+        def spy_text(self, x, y, msg, font=None, colour=pical.C_FG,
+                     centre=True):
+            r = real_text(self, x, y, msg, font, colour, centre)
+            if got["inside"]:
+                got["rows"].append((r.top, r.bottom, str(msg)))
+            return r
+
+        def spy_lines(self, x, y, msgs, font=None, colour=pical.C_DIM,
+                      step=1.5):
+            got["inside"] = True
+            try:
+                return real_lines(self, x, y, msgs, font, colour, step)
+            finally:
+                got["inside"] = False
+
+        pical.Screen.text, pical.Screen.lines = spy_text, spy_lines
+        try:
+            cam3.draw(pi_sc)
+        finally:
+            pical.Screen.text, pical.Screen.lines = real_text, real_lines
+        return got["rows"]
+
+    def check_clear(rows, what):
+        ck(bool(rows), "there is a readout to measure at all, %s (drew %s)"
+                       % (what, [m[:20] for _, _, m in rows]))
+        if not rows:
+            return
+        row_bottom = max((r.rect.bottom for r in cam3.rows if r.rect),
+                         default=0)
+        top = min(r[0] for r in rows)
+        bottom = max(r[1] for r in rows)
+        # Where the selected row's own hint starts: draw_rows puts it at
+        # 0.90 h, centred, in f_s. Running the readout into it is what a
+        # wider slice buys.
+        tip_top = pi_sc.h * 0.90 - pi_sc.f_s.get_height() / 2.0
+        ck(top >= row_bottom,
+           "the blob readout sits below the last row, not over it, %s (rows "
+           "end %d, readout starts %d)" % (what, row_bottom, top))
+        ck(bottom <= tip_top,
+           "and its last wrapped row clears the row hint at 0.90 h, %s "
+           "(readout ends %d, hint starts %d)" % (what, bottom, tip_top))
+
+    rows_a = readout_rows()
+    ck(any("blobs now" in m for _, _, m in rows_a),
+       "the readout was actually drawn, so there is something to measure "
+       "(saw %s)" % [m[:20] for _, _, m in rows_a])
+    # Read off the rows pical ITSELF chose to draw, not a slice this test
+    # takes of its own: at five, a full-mode capture showed no frame rate and
+    # no sign at all that it was recording to the stick.
+    ck(any("LOGGING" in m for _, _, m in rows_a)
+       and any("new frames/s" in m for _, _, m in rows_a),
+       "the rows pical draws still reach the frame rate and the LOGGING "
+       "indicator (drew %s)" % [m[:18] for _, _, m in rows_a])
+    check_clear(rows_a, "with six rows of readout")
+
+    # And the deepest the readout ever gets: the give-back warning takes a row
+    # of its own on top of the three the blob line already wraps onto, so
+    # there are SEVEN rows of content and the slice is the only thing keeping
+    # the last of them out of the hint below.
+    app.link.last.update({"bframes": 2300, "bms": 23000, "bvalve": 90,
+                          "br4": 1500, "br3": 190, "br2": 60, "br1": 15,
+                          "br0": 4})
+    rows_b = readout_rows()
+    ck(any("SIZE WINDOW TOO TIGHT" in m for _, _, m in rows_b),
+       "the worst case really is the worst case (drew %s)"
+       % [m[:20] for _, _, m in rows_b])
+    check_clear(rows_b, "with the give-back warning taking a seventh")
+    cam3.log_toggle()
+
+    # The sensor's own thresholds, the odd-one-out gate, the report format and
+    # the full-mode register all reach the gun. fmt: is sent ONLY for full
+    # mode: the previous firmware has no such key and drops it in silence, so
+    # a gun on it could never be moved off detail 0 at all.
     for label, wire in (("Odd-one-out (size steps)", b"cam=rtol:"),
                         ("Sensor max size (0x06)", b"cam=hwmax:"),
-                        ("Sensor min size (0x1B)", b"cam=hwmin:")):
+                        ("Sensor min size (0x1B)", b"cam=hwmin:"),
+                        ("Full-mode register (0x33)", b"cam=fullreg:")):
         ck(label in labels, "the camera screen offers '%s'" % label)
         cam3.sel = labels.index(label)
         n0 = len(ser.written)
         app.step([key(pygame.K_RIGHT)], t + 9.5)
         ck(any(wire in w for w in ser.written[n0:]),
            "and nudging it sends %s to the gun" % wire.decode())
+
+    cam3.sel = labels.index("Blob detail (sizes)")
+    for k, want, gone in ((pygame.K_LEFT, b"cam=ext:1", b"cam=fmt:1"),
+                          (pygame.K_RIGHT, b"cam=fmt:2", None)):
+        app.link.last["fmt"] = 2 if k == pygame.K_LEFT else 1
+        n0 = len(ser.written)
+        app.step([key(k)], t + 9.6)
+        sent = b" ".join(ser.written[n0:])
+        ck(want in sent and (gone is None or gone not in sent),
+           "blob detail sends %s, which BOTH firmware generations take (%s)"
+           % (want.decode(), sent))
+
+    # What ~camsave really writes. The gun keeps the format and the software
+    # gates and nothing else, so a hint that says "these settings" flatly
+    # sends people away believing an hwmax they spent an evening on will
+    # still be there in the morning.
+    save_hint = cam3.rows[labels.index("Save to gun")].tip()
+    ck("full-mode register" in save_hint and "sensor thresholds" in save_hint,
+       "the Save hint names what does NOT persist: %r" % save_hint)
+    ck("NOT saved" in cam3.rows[labels.index("Full-mode register (0x33)")].tip(),
+       "and the register's own row says it too")
 
     # The camera's true frame rate, from the gun's own clock. Nobody has ever
     # measured it on this sensor, and it decides whether full mode is
@@ -804,6 +961,215 @@ def main():
     cam3.log_toggle()
     app.to_menu()
     ck(cam3._log is None, "leaving the screen closes the log")
+
+    # ---- shape learning ---------------------------------------------------
+    # What a confirmed LED actually looks like on this rig, measured by the
+    # gun and carried off on the stick. Everything here is driven through the
+    # real serial queue rather than by poking link.hists, because the whole
+    # difficulty is that the answer arrives as thirteen separate lines and any
+    # of them can go missing.
+    HFEATS = ("sz", "bw", "bh", "aspect", "area", "irel")
+
+    def learn_lines(on, frames, led, rej, feats):
+        """The gun's '~camlearn?' answer. A feature nothing was fed into comes
+        back as 32 zeros -- the firmware sends every line every time -- so
+        `feats` only names the ones that have something in them."""
+        out = ["CAM: learn on=%d frames=%d led=%d rej=%d bins=32\n"
+               % (on, frames, led, rej)]
+        for c in (0, 1):
+            for f in HFEATS:
+                b = feats.get((c, f), [0] * 32)
+                out.append("CAM: hist c=%d f=%s %s\n"
+                           % (c, f, " ".join(str(v) for v in b)))
+        return out
+
+    def feed(lines):
+        for ln in lines:
+            app.link.src.q.put(ln)
+        app.link.pump()
+
+    def csv_rows(path):
+        with open(path) as fh:
+            body = fh.read().strip().split("\n")
+        return body[0], [r.split(",") for r in body[1:]]
+
+    app.link.last["board"] = "rp2040-wiicam"
+    cam4 = pical.Camera(app)
+    app.open(cam4)
+    labels = [r.label for r in cam4.rows]
+    ck("Learn LED shape" in labels and "Write shape CSV to the stick" in labels,
+       "the wiicam camera screen offers the shape capture and its CSV")
+    csv_row = cam4.rows[labels.index("Write shape CSV to the stick")]
+    ck("shape-DATE.csv" in csv_row.tip() and "0 LED" not in csv_row.tip(),
+       "and before anything is captured its hint says what the file is, not "
+       "that it holds nothing: %r" % csv_row.tip())
+
+    # Starting it. The row follows the GUN, so nothing claims to be recording
+    # until the gun has said it is.
+    cam4.sel = labels.index("Learn LED shape")
+    n0 = len(ser.written)
+    app.step([key(pygame.K_RETURN)], t + 13.0)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"camlearn=on:1" in sent and b"camlearn?" in sent,
+       "selecting it starts the capture and asks straight back (%s)" % sent)
+    ck(cam4.learn_on() is False,
+       "and the row does not claim to be recording before the gun has "
+       "answered -- a gun on older firmware never will")
+
+    # A capture taken OUTSIDE full mode. Only the size histogram fills, and
+    # size is the one feature already known not to separate a window from an
+    # LED, so this has to be said out loud rather than discovered in the CSV.
+    app.link.last["fmt"] = 1
+    app.toast = ""
+    cam4.learn_toggle()                        # stop
+    cam4.learn_toggle()                        # ...and start again, in ext
+    ck("SIZE" in app.toast and "Blob detail" in app.toast,
+       "starting outside full mode warns that only size will fill: %r"
+       % app.toast)
+
+    sz0 = [0, 441, 58, 1] + [0] * 28
+    sz1 = [0, 12, 90, 33] + [0] * 28
+    feed(learn_lines(1, 1200, 4800, 90, {(0, "sz"): sz0, (1, "sz"): sz1}))
+    ck(cam4.learn_on() is True,
+       "once the gun answers, the row knows the capture is running")
+    ck("1200 confirmed frames, 4800 LED blobs" in cam4.learn_hint(),
+       "and the hint shows live progress, like the blob log's does: %r"
+       % cam4.learn_hint())
+    ck("SHAPE: 1200 frames 4800 LED blobs" in "\n".join(cam4.blob_lines()),
+       "the readout says a capture is running and how far it has got")
+    ck("4800 LED and 90 rejected" in csv_row.tip(),
+       "and the CSV row now says what there is to write: %r" % csv_row.tip())
+
+    # Both indicators on ONE row: six rows of readout are drawn, and a row
+    # each would push whichever came last off the bottom -- a capture running
+    # at the TV with nothing on screen to say so.
+    cam4.log_toggle()
+    rec = [l for l in cam4.blob_lines() if "LOGGING" in l]
+    ck(len(rec) == 1 and "SHAPE:" in rec[0],
+       "the shape capture and the blob log share one row rather than "
+       "spending two of the six: %s" % rec)
+    cam4.log_toggle()
+
+    # The CSV. Written from a set the gun sent AFTER the asking, so the queue
+    # is loaded first -- shape_save pumps the link itself.
+    feed([])                                   # drain anything left over
+    for ln in learn_lines(1, 1200, 4800, 90,
+                          {(0, "sz"): sz0, (1, "sz"): sz1}):
+        app.link.src.q.put(ln)
+    app.toast = ""
+    cam4.shape_save()
+    shapes = sorted(f for f in os.listdir(pical.OUT_DIR)
+                    if f.startswith("shape-"))
+    ck(len(shapes) == 1, "the CSV lands on the stick beside the blob logs "
+                         "(%s)" % shapes)
+    ext_path = os.path.join(pical.OUT_DIR, shapes[0])
+    hdr, rows = csv_rows(ext_path)
+    ck(hdr == "class,feature,frames,led_blobs,rej_blobs,"
+              + ",".join("b%d" % i for i in range(32)),
+       "with the header a spreadsheet needs: %r" % hdr[:60])
+    ck(len(rows) == 12 and all(len(r) == 37 for r in rows),
+       "one row per class and feature, all the same width (%d rows, widths %s)"
+       % (len(rows), sorted(set(len(r) for r in rows))))
+    got = {(r[0], r[1]): r for r in rows}
+    ck(sorted(got) == sorted((c, f) for c in ("led", "rej") for f in HFEATS),
+       "named by class and feature, not by the wire's c=0 and c=1: %s"
+       % sorted(k[0] for k in got)[:3])
+    ck(all(r[2] == "1200" and r[3] == "4800" and r[4] == "90" for r in rows),
+       "and the counts repeat on EVERY row, so a sorted sheet still says "
+       "what it was measured from")
+    ck(got[("led", "sz")][5:9] == ["0", "441", "58", "1"],
+       "the size histogram is written bin for bin: %s"
+       % got[("led", "sz")][5:10])
+    ck(set(got[("led", "aspect")][5:]) == {"0"},
+       "and the features full mode never fed are all-zero rows rather than "
+       "missing ones -- an empty histogram is a fact worth having")
+    ck("SIZE only" in app.toast,
+       "the toast says the capture was size-only rather than letting it be "
+       "found in the file: %r" % app.toast)
+
+    # A FULL capture: every feature fed, both classes.
+    full = {}
+    for c in (0, 1):
+        for i, f in enumerate(HFEATS):
+            full[(c, f)] = [(i + 1) * (c + 1) + b for b in range(32)]
+    for ln in learn_lines(0, 3400, 13120, 268, full):
+        app.link.src.q.put(ln)
+    app.toast = ""
+    time.sleep(1.1)                            # a new second, so a new name
+    cam4.shape_save()
+    shapes = sorted(f for f in os.listdir(pical.OUT_DIR)
+                    if f.startswith("shape-"))
+    ck(len(shapes) == 2, "a second capture writes a second file rather than "
+                         "overwriting the first (%s)" % shapes)
+    hdr, rows = csv_rows(os.path.join(pical.OUT_DIR, shapes[-1]))
+    got = {(r[0], r[1]): r for r in rows}
+    ck(len(rows) == 12 and got[("rej", "irel")][5] == "12",
+       "a full capture writes all twelve, each with its own bins (%s)"
+       % got[("rej", "irel")][5:9])
+    ck(all(r[3] == "13120" and r[4] == "268" for r in rows),
+       "with the LED and rejected counts on every row")
+    ck("13120 LED" in app.toast,
+       "and the toast reports what was captured: %r" % app.toast)
+
+    # ---- the twelve lines, out of order and cut short ----------------------
+    # They arrive interleaved with the frame stream and any of them can be
+    # lost. What must never happen is a file half from this capture and half
+    # from the last one: the numbers would all be plausible and nothing about
+    # the file afterwards would look wrong.
+    held = app.link.hists.counts()
+    seq0 = app.link.hists.seq
+    shuffled = learn_lines(1, 77, 88, 9, {(0, "sz"): sz0})
+    feed([shuffled[0]] + shuffled[:0:-1])      # summary first, rows backwards
+    ck(app.link.hists.counts() == (77, 88, 9)
+       and app.link.hists.seq == seq0 + 1,
+       "the twelve lines land whatever order they arrive in: %s"
+       % (app.link.hists.counts(),))
+    held = app.link.hists.counts()
+    seq0 = app.link.hists.seq
+    feed(learn_lines(1, 999, 999, 999, {})[:-4])   # four lines lost
+    ck(app.link.hists.counts() == held and app.link.hists.seq == seq0,
+       "a set cut short does not replace the one already held: %s"
+       % (app.link.hists.counts(),))
+    app.toast = ""
+    cam4.shape_save()                          # nothing fresh in the queue
+    ck("nothing written" in app.toast,
+       "and the CSV refuses rather than writing the old capture under "
+       "today's date: %r" % app.toast)
+    ck(len([f for f in os.listdir(pical.OUT_DIR)
+            if f.startswith("shape-")]) == 2,
+       "so no third file appeared")
+    # Merely LATE is not lost, though. pump() drains whatever has arrived and
+    # returns, so the thirteen lines routinely come in over several calls: a
+    # set that only counted the lines from one drain would never complete.
+    feed(learn_lines(1, 999, 999, 999, {})[-4:])
+    ck(app.link.hists.counts() == (999, 999, 999),
+       "the last four completing it later is a whole reply, not a partial one")
+    # What must be dropped is a tail with no summary in FRONT of it -- the
+    # reply we joined half way through. Kept, its bins would be written out
+    # under the previous capture's frame and blob counts.
+    held = app.link.hists.counts()
+    seq0 = app.link.hists.seq
+    feed(learn_lines(1, 5, 5, 5, {(0, "sz"): sz1})[1:])
+    ck(app.link.hists.counts() == held and app.link.hists.seq == seq0,
+       "rows with no summary in front of them are dropped, not labelled with "
+       "the last capture's counts: %s" % (app.link.hists.counts(),))
+
+    # With no port open there is nothing that could answer, and this row
+    # blocks the frame loop while it waits: two frozen seconds on a Pi with no
+    # console is indistinguishable from a crash.
+    src = app.link.src
+    app.link.src = None
+    app.toast = ""
+    t_wait = time.monotonic()
+    cam4.shape_save()
+    app.link.src = src
+    ck("connect the gun" in app.toast and time.monotonic() - t_wait < 0.5,
+       "with no gun it says so at once rather than freezing the screen: %r"
+       % app.toast)
+
+    app.step([], t + 14.0)
+    ck(True, "the camera screen renders with the shape rows on it")
+    app.to_menu()
 
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on

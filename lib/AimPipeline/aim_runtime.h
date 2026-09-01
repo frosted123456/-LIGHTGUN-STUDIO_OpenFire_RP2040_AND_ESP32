@@ -90,6 +90,17 @@ int  aim_fir_pct(void);
 bool aim_fir_load(int* out_k, int* out_pct);
 bool aim_fir_store(int k, int pct);
 
+// The wiicam's software blob gate: report format and the three size knobs.
+// Stored together because they are one setting -- the size window means
+// nothing without a format that reports sizes, and a gate that survives a
+// reboot only half-way is worse than one that does not survive at all: the
+// tolerance comes back while the format that feeds it does not, and the gun
+// reads as configured while gating nothing. Values are the wiicam's own
+// units: fmt 0 basic / 1 extended / 2 full, the rest 0..15.
+bool aim_gate_load(int* out_fmt, int* out_bmin, int* out_bmax, int* out_rtol);
+bool aim_gate_store(int fmt, int bmin, int bmax, int rtol);
+bool aim_gate_clear(void);
+
 // The capture layer owns the lead value and how much of the quad was really
 // seen; mode 1 needs both, so it reports them here. conf is the fraction of
 // corners MEASURED this frame (n_real/4), not the resolver's miss-damped

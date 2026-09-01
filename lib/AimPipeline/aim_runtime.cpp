@@ -282,6 +282,83 @@ bool aim_dead_load(int* out_units)
 #endif
 }
 
+// ---- wiicam blob gate ------------------------------------------------------
+// One packed word rather than four keys: the four values are meaningless apart
+// and a partial read is the failure that hurts (see the header). The tag makes
+// a stale or foreign key read as "nothing stored" instead of as gate 0,0,0,0,
+// which would silently switch the size window off on a gun that had one.
+#define AIM_NVS_GATE "gate0"
+#define AIM_GATE_TAG 0x6A000000u
+
+bool aim_gate_store(int fmt, int bmin, int bmax, int rtol)
+{
+    if (fmt  < 0)  fmt  = 0;
+    if (fmt  > 2)  fmt  = 2;
+    if (bmin < 0)  bmin = 0;
+    if (bmin > 15) bmin = 15;
+    if (bmax < 0)  bmax = 0;
+    if (bmax > 15) bmax = 15;
+    if (rtol < 0)  rtol = 0;
+    if (rtol > 15) rtol = 15;
+    // u32, not i32: neither the RP2040 LittleFS shim nor the host stub carries
+    // the i32 pair, and a key written through an API that does not exist is a
+    // link error on the one board this runs on.
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)fmt << 12)
+                     | ((uint32_t)bmin << 8) | ((uint32_t)bmax << 4)
+                     | (uint32_t)rtol;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_u32(h, AIM_NVS_GATE, v) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)v; return true;
+#endif
+}
+
+bool aim_gate_load(int* out_fmt, int* out_bmin, int* out_bmax, int* out_rtol)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_fmt || !out_bmin || !out_bmax || !out_rtol) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint32_t v = 0;
+    const esp_err_t e = nvs_get_u32(h, AIM_NVS_GATE, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
+    const int fmt = (int)((v >> 12) & 0x3);
+    *out_fmt  = (fmt > 2) ? 2 : fmt;
+    *out_bmin = (int)((v >> 8) & 0xF);
+    *out_bmax = (int)((v >> 4) & 0xF);
+    *out_rtol = (int)(v & 0xF);
+    return true;
+#else
+    (void)out_fmt; (void)out_bmin; (void)out_bmax; (void)out_rtol; return false;
+#endif
+}
+
+// Erasing matters as much as writing. A saved gate that stops the gun aiming
+// would otherwise come back on the next boot, and '~camreset' -- the command a
+// user reaches for when nothing works -- would fix the session and lose the
+// argument. Absent key counts as cleared.
+bool aim_gate_clear(void)
+{
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t e = nvs_erase_key(h, AIM_NVS_GATE);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    return true;
+#endif
+}
+
 // ---- temporal mode ---------------------------------------------------------
 // Mode 0 is the shipped pair: One Euro here, latency lead on the quad in the
 // capture layer. Mode 1 replaces both with one causal least-squares fit.

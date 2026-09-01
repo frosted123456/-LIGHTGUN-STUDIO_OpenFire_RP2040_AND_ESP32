@@ -39,14 +39,14 @@ from aim_finetune import (BETA_MAX, LEAD_MAX, LEAD_STEP, SHOT_FRAMES,
 from aim_verify import GRID_3x3
 import gun_studio
 from gun_studio import (BlobLog, CAM_KEYS, CAM_RANGE, FrameRate, LENS_KEYS,
-                        Link, QUIET_REARM_S, auto_tune, quiet_plan,
-                        sigma_gates)
+                        Link, QUIET_REARM_S, auto_tune, parse_blobs,
+                        quiet_plan, sigma_gates, write_shape_csv)
 
 # The shared serial layer lives in tools/ beside this file, and this file is
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
 # every feature whose parsing lives in tools/ stops working -- silently, in a
 # way that looks exactly like a broken screen. So it is checked, out loud.
-LINK_API_NEEDED = 4
+LINK_API_NEEDED = 6
 LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
@@ -442,9 +442,13 @@ class Camera(RowScreen):
         self._blob_t = 0.0
         self._built_wii = None     # which row set is currently built
         self._blob_ref = {}        # counter values at the last readout
-        self._drop_ref = {}        # ...and for the drop counters
+        self._drop_ref = {}        # ...and for the drop counters, as
+                                   # key -> (value, bframes, delta shown), so
+                                   # the sentence survives the ~60 draws
+                                   # between one gun reply and the next
         self._rate = FrameRate()   # the camera's own new-frame rate
         self._log = None           # CSV on the stick, when logging
+        self._learn_t = 0.0        # last '~camlearn?' poll, monotonic
         self._blob_last = ""       # keeps the last percentage on screen while
                                    # the next window fills, so it stops flashing
         self.build()
@@ -473,16 +477,46 @@ class Camera(RowScreen):
             # Ambient light. The wiicam finds blobs in HARDWARE and reports
             # four slots: a bright window does not add a fifth point, it TAKES
             # one, and an LED goes missing. The only hardware fact that tells
-            # them apart is blob SIZE, and only the extended report carries it.
+            # them apart is blob SIZE, which the basic report does not carry.
             # Read the sizes first (the line under the preview), THEN set a
             # window -- a gate guessed at is worth nothing.
+            #
+            # fmt is what the gun reports back; ext is the same answer from a
+            # gun on older firmware, which only ever knew two formats and does
+            # not send fmt at all. Without the fallback such a gun would show 0
+            # here while it was busily reporting sizes.
+            #
+            # And it is sent as ext: for 0 and 1 for the same reason. Both
+            # firmware generations take ext:; the older one has never heard of
+            # fmt and drops the key silently, so this row could never move off
+            # 0 on such a gun and every gate row below it stayed dead. Only
+            # full mode -- which the old firmware cannot do at all -- goes out
+            # as fmt:2.
             self.rows.append(Row(
                 "Blob detail (sizes)", "spin",
-                get=lambda: link.last.get("ext"),
-                set=lambda v: link.send("~cam=ext:%d" % v),
-                lo=0, hi=1, step=1,
-                hint="1 asks the sensor for each blob's size, so the readout "
-                     "below can show it. Resets on power-cycle."))
+                get=lambda: link.last.get("fmt", link.last.get("ext")),
+                set=lambda v: link.send("~cam=%s:%d"
+                                        % ("fmt" if v == 2 else "ext", v)),
+                lo=0, hi=2, step=1,
+                hint="0 position only, 1 adds each blob's size for the gates "
+                     "below, 2 adds its box and brightness. Save to keep it"))
+            # Directly under the row that turns full detail on, because this
+            # is the only thing to try when full detail comes back as
+            # nonsense: which byte the sensor wants for that mode is the one
+            # part of it nobody can look up, so it is a setting rather than a
+            # reflash.
+            self.rows.append(Row(
+                "Full-mode register (0x33)", "spin",
+                get=lambda: link.last.get("fullreg"),
+                set=lambda v: link.send("~cam=fullreg:%d" % v),
+                vals=(85, 5), fmt="0x%02x",
+                # "NOT saved" belongs in the hint, not only in the firmware's
+                # camsave reply that nobody on the TV can read: ~camsave
+                # writes fmt, bmin, bmax and rtol and nothing else, so a user
+                # who found the byte that works, pressed Save and power-cycled
+                # would come back to nonsense and no idea why.
+                hint="the byte that asks for full mode -- nobody is sure "
+                     "which. Try the other if 2 shows nonsense; NOT saved"))
             self.rows.append(Row(
                 "Smallest blob kept", "spin",
                 get=lambda: link.last.get("bmin"),
@@ -524,6 +558,15 @@ class Camera(RowScreen):
                      "unknown default. Risky knob: our LEDs are already small"))
             self.rows.append(Row("Log blobs to the stick", act=self.log_toggle,
                                  hint=self.log_hint))
+            # Measuring what an LED actually looks like on this rig, from the
+            # couch. The gun does the accumulating; both of these exist
+            # because the Pi has no console and the LED bar is at the TV, so
+            # a capture that could only be started over a serial terminal
+            # could never be taken from where the light actually goes wrong.
+            self.rows.append(Row("Learn LED shape", act=self.learn_toggle,
+                                 hint=self.learn_hint))
+            self.rows.append(Row("Write shape CSV to the stick",
+                                 act=self.shape_save, hint=self.shape_hint))
         else:
             self.subtitle = "aim for a blob noise floor under 0.30 px"
             for k, tip in (("thr", "threshold: raise it if the background shows up"),
@@ -539,8 +582,18 @@ class Camera(RowScreen):
             self.rows.append(Row(
                 "Auto tune", act=self.run_auto,
                 hint="sweeps exposure and threshold, then keeps a safety margin"))
-        self.rows.append(Row("Save to gun", act=self.save,
-                             hint="keeps these settings across power cycles"))
+        # What ~camsave actually writes, on the board it is written from. The
+        # gun stores the blob format, the size window and the odd-one-out
+        # tolerance and stops there: the full-mode register and the two SENSOR
+        # thresholds are left out on purpose, because they are the settings
+        # that can leave a gun dark and a power cycle has to stay a way back.
+        # A flat "keeps these settings" sent people away believing an hwmax
+        # they had spent an evening on would still be there in the morning.
+        self.rows.append(Row(
+            "Save to gun", act=self.save,
+            hint=("keeps these across power cycles, except the full-mode "
+                  "register and the two sensor thresholds") if self.wiicam()
+            else "keeps these settings across power cycles"))
         self.rows.append(Row("Back", act=self.app.to_menu))
 
     def log_toggle(self):
@@ -579,6 +632,128 @@ class Camera(RowScreen):
         if self._log is not None:
             self._log.close()
             self._log = None
+
+    # ---- shape learning --------------------------------------------------
+    def full_mode(self):
+        """Is the gun in FULL report mode? fmt is what this firmware answers;
+        ext is the same question to a gun too old to have full mode at all,
+        and such a gun can never be in it."""
+        return self.app.link.last.get("fmt", self.app.link.last.get("ext")) == 2
+
+    def learn_on(self):
+        """What the GUN last said, not what we last asked for. A '~camreset'
+        stops the capture from anywhere, and a row still offering to 'stop'
+        would be claiming something is being measured when nothing is."""
+        return self.app.link.hists.running()
+
+    def learn_toggle(self):
+        """Start or stop the shape capture.
+
+        Starting CLEARS what was measured -- that is the firmware's rule, and
+        it is the right one: a distribution accumulated across a change of
+        sensitivity or of the LED bar is two rigs averaged into one wide
+        spread, which reads as 'these cannot be separated' when in truth
+        neither rig was measured. Both the toast and the hint say so, because
+        the CSV is the only copy and nothing warns twice."""
+        link = self.app.link
+        on = not self.learn_on()
+        link.send("~camlearn=on:%d" % (1 if on else 0))
+        # Ask straight back so the row follows the gun's own answer rather
+        # than this screen's memory of the press.
+        link.send("~camlearn?")
+        self._learn_t = time.monotonic()
+        if not on:
+            frames, led, _rej = link.hists.counts()
+            self.app.toast_now("shape capture stopped after %d frames and %d "
+                               "LED blobs -- write the CSV before starting "
+                               "another" % (frames, led))
+            return
+        if not self.full_mode():
+            # Plainly, and short enough to fit the toast at 1024 px: this is
+            # the one way to spend a whole capture and have nothing at the end
+            # of it. Without full mode the gun feeds only the 4-bit size, and
+            # size is the feature we already know does not tell a window from
+            # an LED -- so the fix goes in the same sentence as the warning.
+            self.app.toast_now("Blob detail is not 2: only SIZE will fill, and "
+                               "size cannot tell a window from an LED. Set it "
+                               "to 2 and start again")
+            return
+        self.app.toast_now("shape capture ON, from empty -- aim at the bar "
+                           "from where you play and let it run")
+
+    def learn_hint(self):
+        frames, led, _rej = self.app.link.hists.counts()
+        if self.learn_on():
+            return ("measuring: %d confirmed frames, %d LED blobs so far -- "
+                    "select again to stop" % (frames, led))
+        if led:
+            return ("stopped with %d frames and %d LED blobs -- write the CSV, "
+                    "starting again CLEARS them" % (frames, led))
+        return ("measures what a confirmed LED looks like here; set Blob "
+                "detail to 2 first")
+
+    def shape_save(self):
+        """Write the histograms to the stick, beside the blob logs.
+
+        Asks the gun and WAITS for a set it sent after the asking, rather than
+        writing whatever the last poll left behind: the file carries no clue
+        about its own age, so one written from a capture that ended ten
+        minutes ago is indistinguishable from one taken just now."""
+        link = self.app.link
+        if not link.src:
+            # Said at once rather than after the two-second wait below, which
+            # this screen spends blocked: with no port there is nothing that
+            # could answer, and a frozen screen is how a Pi looks when it has
+            # crashed.
+            self.app.toast_now("connect the gun first")
+            return
+        seq0 = link.hists.seq
+        link.send("~camlearn?")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.0:
+            # Pumped from here, because this runs off a key press rather than
+            # from the frame loop and the reply would otherwise not be read
+            # until the next draw -- long after this function has given up.
+            link.pump()
+            if link.hists.seq != seq0 and link.hists.ready():
+                break
+            time.sleep(0.02)
+        if link.hists.seq == seq0 or not link.hists.ready():
+            self.app.toast_now("no complete set of histograms came back in "
+                               "2 s -- nothing written")
+            return
+        try:
+            if not os.path.isdir(OUT_DIR):
+                os.makedirs(OUT_DIR)
+            path = os.path.join(OUT_DIR, "shape-%s.csv"
+                                % time.strftime("%Y%m%d-%H%M%S"))
+            n = write_shape_csv(path, link.hists)
+        except Exception as e:
+            self.app.toast_now("could not write the shape CSV: %s" % e)
+            return
+        frames, led, rej = link.hists.counts()
+        name = os.path.basename(path)
+        if not led:
+            self.app.toast_now("wrote %s, but every bin in it is EMPTY -- no "
+                               "confirmed LED blobs were measured" % name)
+        elif link.hists.total(0, "aspect") == 0:
+            self.app.toast_now("wrote %s -- SIZE only, %d blobs: the shape "
+                               "features need Blob detail 2" % (name, led))
+        else:
+            self.app.toast_now("wrote %d rows to %s -- %d frames, %d LED, %d "
+                               "rejected" % (n, name, frames, led, rej))
+
+    def shape_hint(self):
+        frames, led, rej = self.app.link.hists.counts()
+        # Only once there is something to write. "writes the 0 LED and 0
+        # rejected blobs measured over 0 frames" reads like a broken counter
+        # rather than like a capture nobody has started yet.
+        if led or rej:
+            return ("writes the %d LED and %d rejected blobs measured over %d "
+                    "frames to the stick, as shape-DATE.csv"
+                    % (led, rej, frames))
+        return ("writes the histograms to the stick as shape-DATE.csv, one row "
+                "per class and feature")
 
     def diag(self):
         self.app.link.send("~camdiag")
@@ -640,18 +815,46 @@ class Camera(RowScreen):
                 except Exception as e:
                     self.app.toast_now("log write failed: %s" % e)
                     self.close_log()
+        # The shape capture's counters, polled on their own clock and much
+        # slower than the blob line. That answer is thirteen lines and up to
+        # 2.5 KB, which is a fifth of a second of a 115200 wire: asked for at
+        # the blob poll's rate it would cost the aim stream real frames, on
+        # the one screen a user sits on while judging whether the light is
+        # costing them frames. Two seconds is enough for a progress line that
+        # visibly moves; six when nothing is running is enough to notice a
+        # capture started from Studio, or one a '~camreset' has stopped.
+        every_l = 2.0 if self.learn_on() else 6.0
+        if self.wiicam() and now_m - self._learn_t > every_l:
+            self._learn_t = now_m
+            self.app.link.send("~camlearn?")
         RowScreen.handle(self, acts, mouse)
 
     def _delta(self, key):
-        """How much a since-boot counter moved since the last readout."""
-        v = self.app.link.last.get(key)
+        """How much a since-boot counter moved since the last gun REPLY.
+
+        Keyed on bframes, not on being called. This runs out of blob_lines(),
+        which draw() calls at about 60 fps, while link.last only changes when
+        a '~camblob?' answer lands -- roughly once a second. Re-baselining on
+        every call meant the counter had already moved to its new value by the
+        second frame, so "3 dropped by size" was on screen for the one frame
+        after each reply and blank for the other fifty-nine: 16 ms in every
+        second, which the eye reads as never. The last answer is kept and
+        handed back until a genuinely newer frame count arrives.
+        """
+        last = self.app.link.last
+        v = last.get(key)
         if v is None:
             return 0
-        prev = self._drop_ref.get(key)
-        self._drop_ref[key] = v
-        if prev is None or v < prev:      # first sample, or the gun rebooted
-            return 0
-        return v - prev
+        frames = last.get("bframes")
+        prev, at, shown = self._drop_ref.get(key, (None, None, 0))
+        # frames is None only on a gun that does not report it at all; there
+        # is nothing to key on there, so fall through and behave as before
+        # rather than freeze on the first sample for ever.
+        if frames is not None and frames == at:
+            return shown
+        d = 0 if (prev is None or v < prev) else v - prev   # or the gun rebooted
+        self._drop_ref[key] = (v, frames, d)
+        return d
 
     def blob_lines(self):
         """What the sensor is handing us right now, in words.
@@ -666,21 +869,29 @@ class Camera(RowScreen):
         raw = getattr(link, "blobs", "")
         if raw:
             parts = raw.replace("CAM: blobs", "").strip()
-            if "(sizes need ext:1)" in parts:
+            if "(sizes need fmt:1)" in parts:
                 out.append("blob sizes: set Blob detail to 1 to read them")
-                parts = parts.replace("(sizes need ext:1)", "").strip()
+                parts = parts.replace("(sizes need fmt:1)", "").strip()
             shown = []
-            for tok in parts.split():
-                f = tok.split(",")
-                if len(f) == 4:
-                    shown.append("%s,%s size %s%s"
-                                 % (f[0], f[1], f[2],
-                                    "" if f[3] == "1" else " DROPPED"))
+            for b in parse_blobs(parts):
+                txt = "%d,%d size %d" % (b[0], b[1], b[2])
+                # The box and the brightness only exist in full mode. Printed
+                # as a fixed part of the line they would read as a measured
+                # 0x0 box on every gun that is not in it.
+                if len(b) == 7:
+                    txt += " box %dx%d bright %d" % (b[4], b[5], b[6])
+                if b[3] != 1:
+                    txt += " DROPPED"
+                shown.append(txt)
             if shown:
                 out.append("blobs now: " + "    ".join(shown))
         # First, always: this one means the window is set so tight it would
         # blind the gun, and it was previously last and cut off by the slice.
-        if link.last.get("bvalve"):
+        # The DELTA, like the drop counts below: bvalve counts since boot, so
+        # the raw value pinned this warning on screen for the rest of the
+        # power cycle after a single give-back -- burning one of the six
+        # readout rows on a window the user had already widened.
+        if self._delta("bvalve"):
             out.append("SIZE WINDOW TOO TIGHT -- widen it or set it to 0..15")
         keys = ("br4", "br3", "br2", "br1", "br0")
         now = [link.last.get(k) for k in keys]
@@ -721,9 +932,20 @@ class Camera(RowScreen):
             bits.append("%d dropped as odd-one-out" % drrej)
         if bits:
             out.append("   ".join(bits))
+        # The two "something is being recorded" indicators, on ONE row. A row
+        # each would have made seven of content where six are drawn, and the
+        # one pushed off the bottom would be whichever came last -- which is
+        # exactly the failure that widened the slice to six: a capture running
+        # at the TV with nothing on screen to say so.
+        rec = []
+        if self.learn_on():
+            frames, led, _rej = self.app.link.hists.counts()
+            rec.append("SHAPE: %d frames %d LED blobs" % (frames, led))
         if self._log is not None:
-            out.append("LOGGING: %d frames -> %s"
+            rec.append("LOGGING: %d frames -> %s"
                        % (self._log.rows, os.path.basename(self._log.path)))
+        if rec:
+            out.append("   ".join(rec))
         return out
 
     def draw(self, sc):
@@ -736,7 +958,7 @@ class Camera(RowScreen):
             RowScreen.draw(self, sc)
             self.app.draw_noise(sc, sc.h * 0.74)
             return
-        # The wiicam list grew to eleven rows, so a readout at a FIXED height
+        # The wiicam list grew to twelve rows, so a readout at a FIXED height
         # landed on top of the last three of them. It is placed from where the
         # rows actually end instead, and the rows are given a shorter run.
         sc.text(sc.w / 2, sc.h * 0.09, self.title, sc.f_l, C_FG)
@@ -748,7 +970,15 @@ class Camera(RowScreen):
         lines = []
         for ln in self.blob_lines():
             lines.extend(wrap(ln, 96))
-        sc.lines(sc.w / 2, y + sc.h * 0.02, lines[:4], sc.f_xs, C_DIM)
+        # Six, not five: in full mode the per-blob line carries a box and a
+        # brightness as well, and with the gate dropping blobs it wraps onto
+        # THREE rows, not two -- 194 characters of it. At five that pushed the
+        # camera's frame rate and the "LOGGING: N frames" indicator off the
+        # bottom, so a capture at the TV gave no sign it was recording.
+        # Six is the most that fits: measured at 1024x768, the sixth row ends
+        # 13 px above the selected row's own hint at 0.90 h and a seventh
+        # would land 8 px INSIDE it.
+        sc.lines(sc.w / 2, y + sc.h * 0.02, lines[:6], sc.f_xs, C_DIM)
         sc.text(sc.w / 2, sc.h * 0.96, "Esc goes back", sc.f_xs, C_DIM)
 
 

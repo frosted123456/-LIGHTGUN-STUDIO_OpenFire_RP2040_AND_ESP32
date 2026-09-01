@@ -12,7 +12,38 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIRElights.h"
  #include "OpenFIREserial.h"
-@@ -210,6 +215,16 @@ void FW_Common::CameraSet()
+@@ -161,6 +166,30 @@
+     #endif // USES_DISPLAY
+ }
+ 
++#ifdef USE_AIM_PIPELINE
++// A bare two-byte write to a camera register, on the same bus CameraSet chose
++// and from the same pin test. Used only by the format switch below, which runs
++// on the camera-poll core: that core already owns the bus by being the thing
++// that polls, so it must NOT take the overlay's hold -- it would be waiting
++// for an acknowledgement only it can send. This is dfrIRPos->dataFormat()
++// spelled out, because the driver cannot select the full format.
++//
++// It lives here rather than in the sketch because a file-static in the sketch
++// is not reachable from this translation unit.
++static int aim_camreg_raw(int reg, int val)
++{
++    if(!FW_Common::dfrIRPos) return 0;
++    TwoWire& w = (bitRead(OF_Prefs::pins[OF_Const::camSCL], 1) &&
++                  bitRead(OF_Prefs::pins[OF_Const::camSDA], 1)) ? Wire1 : Wire;
++    w.beginTransmission(0x58);      // 0xB0 >> 1, the sensor's 7-bit address
++    w.write((uint8_t)reg);
++    w.write((uint8_t)val);
++    const int ok = (w.endTransmission() == 0);
++    delay(10);                      // the driver's own settling delay
++    return ok;
++}
++#endif
++
+ void FW_Common::CameraSet()
+ {
+     // Sanity check: which channel do these pins correlate to?
+@@ -210,6 +239,16 @@
              PrintIrError();
          } else camNotAvailable = false;
      } else PrintIrError();
@@ -29,7 +60,7 @@
  }
  
  void FW_Common::SetMode(const FW_Const::GunMode_e &newMode)
-@@ -358,6 +373,14 @@ void FW_Common::ExecCalMode(const bool &
+@@ -358,6 +397,14 @@
  
          if(irPosUpdateTick) {
              irPosUpdateTick = 0;
@@ -44,7 +75,7 @@
              GetPosition();
          }
  
-@@ -562,6 +585,10 @@ void FW_Common::ExecCalMode(const bool &
+@@ -562,6 +609,10 @@
  
                          if(irPosUpdateTick) {
                              irPosUpdateTick = 0;
@@ -55,7 +86,7 @@
                              GetPosition();
                          }
  
-@@ -648,8 +675,58 @@ void FW_Common::ExecCalMode(const bool &
+@@ -648,11 +699,120 @@
  void FW_Common::GetPosition()
  {
      if(dfrIRPos != nullptr) {
@@ -78,15 +109,57 @@
 +        // then never correct itself -- a permanent desync with every frame
 +        // decoding as garbage and reporting success.
 +        static int aim_fmt_state = -1;
-+        const int aim_st = wiicam_aim_ext_state();
-+        const int aim_ext = aim_st & 1;
++        static int aim_fmt_tries = 0;
++        const int aim_st  = wiicam_aim_fmt_state();
++        const int aim_fmt = aim_st & 3;
 +        if(aim_fmt_state != aim_st) {
-+            aim_fmt_state = aim_st;
-+            dfrIRPos->dataFormat(aim_ext ? DFRobotIRPositionEx::DataFormat_Extended
-+                                         : DFRobotIRPositionEx::DataFormat_Basic);
++            if(aim_fmt == WIICAM_FMT_FULL) {
++                // The driver cannot select this one: its receive union is 13
++                // bytes and a full report is 37. Same register, same two
++                // bytes, same settling delay dataFormat() would have used.
++                //
++                // The epoch is latched only if the write is ACKNOWLEDGED.
++                // Discarding this return and latching anyway was a silent
++                // permanent desync: one NAK leaves the sensor in its old
++                // format, the 37-byte read still returns 37 bytes and still
++                // matches on the retry, and the frame reports success while
++                // the resolver aims from four registers that are not blob
++                // coordinates. Unlatched, the next poll simply tries again.
++                if(aim_camreg_raw(0x33, wiicam_aim_fullreg())) {
++                    aim_fmt_state = aim_st;
++                    aim_fmt_tries = 0;
++                } else if(++aim_fmt_tries >= 5) {
++                    // Five refusals is not a glitch. Retrying forever costs a
++                    // 10 ms settling delay on every poll and the gun crawls,
++                    // so go back to the format we know this sensor takes --
++                    // the tools watch fmt and will show it drop back by itself,
++                    // which is the only way the user finds out at all.
++                    aim_fmt_tries = 0;
++                    wiicam_aim_fmt_fallback(WIICAM_FMT_EXT);
++                }
++            } else {
++                aim_fmt_state = aim_st;
++                aim_fmt_tries = 0;
++                dfrIRPos->dataFormat(aim_fmt == WIICAM_FMT_EXT
++                                     ? DFRobotIRPositionEx::DataFormat_Extended
++                                     : DFRobotIRPositionEx::DataFormat_Basic);
++            }
 +        }
-+        int error = aim_ext ? dfrIRPos->extendedAtomic(DFRobotIRPositionEx::Retry_2)
-+                            : dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
++        // Full mode is read here rather than by the driver, into arrays that
++        // stand in for its own everywhere below -- including the stock
++        // fallback, which would otherwise warp from whatever the driver
++        // happened to hold the last time it did a read.
++        static int      aim_fx[4], aim_fy[4], aim_fsz[4];
++        static unsigned aim_fseen = 0;
++        int error;
++        if(aim_fmt == WIICAM_FMT_FULL)
++            error = wiicam_aim_full_poll(aim_fx, aim_fy, aim_fsz, &aim_fseen)
++                  ? DFRobotIRPositionEx::Error_Success
++                  : DFRobotIRPositionEx::Error_IICerror;
++        else
++            error = (aim_fmt == WIICAM_FMT_EXT)
++                  ? dfrIRPos->extendedAtomic(DFRobotIRPositionEx::Retry_2)
++                  : dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
 +#else
          int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
 +#endif
@@ -96,12 +169,23 @@
 +            // no calibration is loaded. The seen() mask is applied inside
 +            // the adapter. Sizes are handed over only when the sensor is
 +            // actually in the format that carries them.
++            // One set of pointers for the whole block. In full mode they are
++            // ours; otherwise they are the driver's. Everything downstream --
++            // the pipeline AND the stock warp below -- reads through these, so
++            // there is no path that can pick up the driver's stale arrays.
++            const int* aim_px  = (aim_fmt == WIICAM_FMT_FULL) ? aim_fx
++                                                              : dfrIRPos->xPositions();
++            const int* aim_py  = (aim_fmt == WIICAM_FMT_FULL) ? aim_fy
++                                                              : dfrIRPos->yPositions();
++            const int* aim_psz = (aim_fmt == WIICAM_FMT_FULL) ? aim_fsz
++                               : (aim_fmt == WIICAM_FMT_EXT)  ? dfrIRPos->sizes()
++                                                              : nullptr;
++            const unsigned aim_pseen = (aim_fmt == WIICAM_FMT_FULL)
++                                     ? aim_fseen : dfrIRPos->seen();
 +            bool aim_ok = false;
 +            {
 +                float asx = 0.0f, asy = 0.0f;
-+                if (wiicam_aim_process_sz(dfrIRPos->xPositions(), dfrIRPos->yPositions(),
-+                                       aim_ext ? dfrIRPos->sizes() : nullptr,
-+                                       dfrIRPos->seen(),
++                if (wiicam_aim_process_sz(aim_px, aim_py, aim_psz, aim_pseen,
 +                                       to_us_since_boot(get_absolute_time()),
 +                                       &asx, &asy)) {
 +                    mouseX = (int32_t)lroundf(asx * (float)res_x);
@@ -110,11 +194,30 @@
 +                }
 +            }
 +            if(!aim_ok) {
++#else
++            // Same names for the stock build, so the warp below has exactly
++            // one way to reach the sensor data whichever way this is compiled.
++            const int* aim_px = dfrIRPos->xPositions();
++            const int* aim_py = dfrIRPos->yPositions();
++            const unsigned aim_pseen = dfrIRPos->seen();
 +#endif
              // if diamond layout, or square
              if(OF_Prefs::profiles[OF_Prefs::currentProfile].irLayout) {
-                 OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
-@@ -699,6 +776,9 @@ void FW_Common::GetPosition()
+-                OpenFIREdiamond.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
++                OpenFIREdiamond.begin(aim_px, aim_py, aim_pseen);
+                 OpenFIREper.warp(OpenFIREdiamond.X(0), OpenFIREdiamond.Y(0),
+                                 OpenFIREdiamond.X(1), OpenFIREdiamond.Y(1),
+                                 OpenFIREdiamond.X(2), OpenFIREdiamond.Y(2),
+@@ -661,7 +821,7 @@
+                                 res_y / 2, res_x / 2,
+                                 res_y, res_x, res_y / 2);
+             } else {
+-                OpenFIREsquare.begin(dfrIRPos->xPositions(), dfrIRPos->yPositions(), dfrIRPos->seen());
++                OpenFIREsquare.begin(aim_px, aim_py, aim_pseen);
+                 OpenFIREper.warp(OpenFIREsquare.X(0), OpenFIREsquare.Y(0),
+                                 OpenFIREsquare.X(1), OpenFIREsquare.Y(1),
+                                 OpenFIREsquare.X(2), OpenFIREsquare.Y(2),
+@@ -699,6 +859,9 @@
                  default:
                      break;
                  }
@@ -124,7 +227,7 @@
  
              // Constrain that bisch so negatives don't cause underflow
              int32_t conMoveX = constrain(mouseX, 0, res_x);
-@@ -753,9 +833,18 @@ void FW_Common::GetPosition()
+@@ -753,9 +916,18 @@
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  
@@ -146,7 +249,7 @@
  
              } else {
                  if(gunMode == FW_Const::GunMode_Verification) {
-@@ -970,6 +1059,13 @@ void FW_Common::SetIrSensitivity(const i
+@@ -970,6 +1142,13 @@
      }
  
      if(dfrIRPos != nullptr) dfrIRPos->sensitivityLevel((DFRobotIRPositionEx::Sensitivity_e)sensitivity);

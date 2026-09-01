@@ -207,7 +207,8 @@ fi
 if g++ -std=c++17 -O2 -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
        -Ilib/QuadResolver -Ilib/AimPipeline -Ilib/RecoilFx \
        hostcheck/wiicam_adapter_test.cpp \
-       lib/WiicamAim/wiicam_aim.cpp lib/QuadResolver/quad_resolver.cpp \
+       lib/WiicamAim/wiicam_aim.cpp lib/WiicamAim/wiicam_learn.cpp \
+       lib/QuadResolver/quad_resolver.cpp \
        lib/WiicamAim/wiicam_diag.cpp lib/WiicamAim/wiicam_diag_glue.cpp \
        lib/RecoilFx/recoil_fx.cpp lib/RecoilFx/recoil_fx_cmd.cpp \
        lib/AimPipeline/aim_runtime.cpp lib/AimPipeline/aim_core.cpp \
@@ -218,6 +219,28 @@ if g++ -std=c++17 -O2 -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
 else
     tail -20 /tmp/ov_wiicam.out 2>/dev/null
     echo "wiicam adapter (rp2040 front end): FAILED"; exit 1
+fi
+
+# The shape-learning sink: every feature's documented bin mapping including the
+# clamps, the cases that must record NOTHING rather than a large false peak,
+# and -- driven through wiicam_aim_process_sz, because that is where it lives --
+# the safety property that only resolver-confirmed frames are ever learned from.
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror \
+       -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
+       -Ilib/QuadResolver -Ilib/AimPipeline -Ilib/RecoilFx \
+       hostcheck/wiicam_learn_test.cpp \
+       lib/WiicamAim/wiicam_aim.cpp lib/WiicamAim/wiicam_learn.cpp \
+       lib/QuadResolver/quad_resolver.cpp \
+       lib/WiicamAim/wiicam_diag.cpp lib/WiicamAim/wiicam_diag_glue.cpp \
+       lib/RecoilFx/recoil_fx.cpp lib/RecoilFx/recoil_fx_cmd.cpp \
+       lib/AimPipeline/aim_runtime.cpp lib/AimPipeline/aim_core.cpp \
+       -o /tmp/ov_wlearn -lm \
+   && /tmp/ov_wlearn > /tmp/ov_wlearn.out 2>&1 \
+   && grep -q "wiicam learn: ALL PASS" /tmp/ov_wlearn.out; then
+    echo "wiicam shape-learning sink: OK"
+else
+    tail -20 /tmp/ov_wlearn.out 2>/dev/null
+    echo "wiicam shape-learning sink: FAILED"; exit 1
 fi
 
 # Lens fit machinery: recover known synthetic lenses, refuse bad sweeps.
@@ -372,9 +395,16 @@ else
     echo "gui renders: SKIPPED (no xvfb-run)"
 fi
 
-# The studio front-end, same rendering guard as the calibration GUI.
+# The studio front-end, same rendering guard as the calibration GUI -- but at
+# 768 px of HEIGHT, which is the machine Studio claims to support. Taller
+# screens let the window grow until the tab area is exactly as tall as the
+# camera panel asks for, so the "panel taller than its tab area" assertion can
+# never fail there: at 900 px it passed with zero pixels of slack while the
+# wiicam panel needed 340 px of the 307 a 768p laptop actually offers, and
+# "Save to gun" rendered four pixels high. Width stays generous; it is the
+# height that runs out.
 if [ -n "$OV_PY" ] && command -v xvfb-run >/dev/null 2>&1; then
-    if timeout 60 xvfb-run -a -s "-screen 0 1280x900x24" \
+    if timeout 60 xvfb-run -a -s "-screen 0 1400x768x24" \
          "$OV_PY" hostcheck/studio_render_test.py > /tmp/ov_studio.out 2>&1 \
        && grep -q "studio render: OK" /tmp/ov_studio.out; then
         echo "studio renders: OK"

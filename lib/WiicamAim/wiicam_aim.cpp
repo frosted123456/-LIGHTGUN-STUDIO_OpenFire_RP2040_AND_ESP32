@@ -1,5 +1,6 @@
 // wiicam_aim.cpp -- see header. All processing is in 240x176 space.
 #include "wiicam_aim.h"
+#include "wiicam_learn.h"
 #include "quad_resolver.h"
 #include "aim_runtime.h"
 #include "recoil_fx.h"
@@ -95,12 +96,15 @@ static float    s_cache_sx = 0.0f, s_cache_sy = 0.0f;
 // gate, whatever the limits say.
 //
 // The wanted format and its epoch live in ONE word, written with one store:
-// bit 0 is the flag, the rest is the epoch. The camera poll runs on the other
-// core from the command parser, and reading a flag and an epoch as two
-// separate values lets a poll pair a NEW epoch with the OLD flag -- it would
+// bits 0-1 are the format, the rest is the epoch. The camera poll runs on the
+// other core from the command parser, and reading a format and an epoch as two
+// separate values lets a poll pair a NEW epoch with the OLD format -- it would
 // then write the old format, latch the new epoch, and never correct itself.
-// One word cannot tear that way.
-static volatile int s_ext_state = 0;        // (epoch << 1) | wanted
+// One word cannot tear that way. Two bits rather than one because there are
+// three formats now; widening the field and leaving a reader on the old shift
+// is exactly the desync this word exists to prevent, so every reader goes
+// through the accessors below.
+static volatile int s_ext_state = 0;        // (epoch << 2) | fmt
 static uint8_t  s_bmin = 0, s_bmax = 15;    // accepted blob size window
 // Relative gate tolerance, in SIZE STEPS away from the consensus; 0 = off.
 // Steps rather than a percentage because the reported size is a 4-bit number:
@@ -146,6 +150,84 @@ static int (*s_blobreg)(int reg, int val) = 0;
 
 void wiicam_set_blobreg_hook(int (*fn)(int reg, int val)) { s_blobreg = fn; }
 
+// ---- full mode -------------------------------------------------------------
+// Kept out of the vendored driver on purpose: its receive union is 13 bytes,
+// a full report is 37, and widening a library the working build depends on to
+// chase a format we have never seen work is the wrong risk to take. The hook
+// does the bus transaction and nothing else; the unpack lives here where the
+// host tests can reach it.
+static int (*s_fullread)(unsigned char* buf, int len) = 0;
+// Per-blob box and intensity from the last full frame. Reported, not gated:
+// a discriminator invented before anyone has seen a real number from it is
+// the same guess the size window would have been.
+//
+// TWO arrays, and the difference is the whole bug. The poll fills s_f* by
+// HARDWARE SLOT, 0..3 as the sensor numbers them. Everything the report shows
+// -- position, size, kept -- is indexed by the COMPACTED position in the seen
+// list, because process_sz skips empty slots as it walks. Publish the box
+// straight from s_f* and the two disagree the moment any slot but the last is
+// empty: blob 0 gets slot 0's box, which belongs to no blob on screen and may
+// be left over from an earlier frame entirely. That is precisely the
+// ambient-light case this instrumentation exists to measure, so it would have
+// been wrong exactly when it mattered. process_sz compacts s_f* into s_b*
+// alongside the coordinates, through the same index.
+static uint8_t  s_fw[4], s_fh[4], s_fi[4];   // by hardware slot
+static uint8_t  s_bw[4], s_bh[4], s_bi[4];   // by compacted report index
+
+void wiicam_set_fullread_hook(int (*fn)(unsigned char* buf, int len))
+{
+    s_fullread = fn;
+}
+int wiicam_aim_full_poll(int* px, int* py, int* sizes, unsigned* seen)
+{
+    if (!s_fullread || !px || !py || !sizes || !seen) return 0;
+    unsigned char a[WIICAM_FULL_LEN], b[WIICAM_FULL_LEN];
+    if (!s_fullread(a, WIICAM_FULL_LEN)) return 0;
+    // The same atomic workaround the driver uses for the other two formats:
+    // the sensor offers no frame sync, so a report can be read across an
+    // update and come back half old. Read again and accept only a match,
+    // ignoring the header byte, which is not part of the frame.
+    //
+    // Two retries and then GIVE UP, because that is what the other two formats
+    // do here: GetPosition asks for Retry_2, whose even value makes the driver
+    // return Error_DataMismatch rather than use the frame, and the caller
+    // drops it. An earlier version of this comment claimed to match Retry_1s
+    // and kept the newest frame -- which would have made full mode quietly
+    // more permissive than the paths it stands in for, and fed the resolver a
+    // torn frame in the one case the check exists to catch.
+    int matched = 0;
+    for (int i = 0; i < 2 && !matched; ++i) {
+        if (!s_fullread(b, WIICAM_FULL_LEN)) return 0;
+        if (!memcmp(a + 1, b + 1, WIICAM_FULL_LEN - 1)) matched = 1;
+        else memcpy(a, b, WIICAM_FULL_LEN);
+    }
+    if (!matched) return 0;
+    *seen = 0;
+    // Cleared for every slot, not just the ones that report: an unseen slot
+    // must read as "no box measured", never as last frame's box.
+    for (int i = 0; i < 4; ++i) { s_fw[i] = 0; s_fh[i] = 0; s_fi[i] = 0; }
+    for (int i = 0; i < 4; ++i) {
+        // Byte 0 of the report is a header; each object is 9 bytes, and its
+        // first three are laid out exactly as in extended.
+        const unsigned char* f = a + 1 + i * 9;
+        const int y = (int)f[1] | (((int)(f[2] & 0xC0u)) << 2);
+        if (y > 767) continue;              // the driver's "not seen" test
+        py[i] = y;
+        px[i] = (int)f[0] | (((int)(f[2] & 0x30u)) << 4);
+        sizes[i] = (int)(f[2] & 0x0Fu);
+        // Box fields are 7-bit, in the sensor's native 128x96 array -- NOT the
+        // 1024x768 the positions are reported in. Stored as width and height
+        // because that is what a shape test wants and the corners are not.
+        const int xmn = f[3] & 0x7F, ymn = f[4] & 0x7F;
+        const int xmx = f[5] & 0x7F, ymx = f[6] & 0x7F;
+        s_fw[i] = (uint8_t)(xmx > xmn ? xmx - xmn : 0);
+        s_fh[i] = (uint8_t)(ymx > ymn ? ymx - ymn : 0);
+        s_fi[i] = f[8];
+        *seen |= 1u << i;
+    }
+    return 1;
+}
+
 // ---- camera bus ownership -------------------------------------------------
 // Whoever wants the sensor bus for a configuration write TAKES it, and the
 // core polling the camera ACKNOWLEDGES that it has seen the request and is
@@ -178,6 +260,14 @@ static uint32_t s_brrej   = 0;   // blobs dropped for not matching the others
 static uint32_t s_bvalve  = 0;   // blobs the floor had to give back: the window
                                  // is set so tight it would blind the gun
 static uint32_t s_bdrop   = 0;   // frames the resolver could not turn into a quad
+// The two halves of "was that rejection right?", judged on position alone.
+// bfar is a blob the gate dropped that sat nowhere near any corner -- a stray,
+// correctly refused. bnear is one that sat exactly where the missing LED
+// should have been, which means the gate almost certainly took a real corner.
+// bnear climbing is the earliest warning that a size window is too tight, and
+// it arrives long before the symptom does.
+static uint32_t s_bfar    = 0;
+static uint32_t s_bnear   = 0;
 static uint32_t s_breal[5] = {0, 0, 0, 0, 0};   // frames by corners actually SEEN
 // Last frame's blobs, for '~camblob?': pipeline space, size, and whether the
 // gate kept it. Evidence first -- a gate set from a guess is worth nothing.
@@ -185,20 +275,53 @@ static int      s_bn = 0;
 static int16_t  s_bx[4], s_by[4];
 static int8_t   s_bsz[4], s_bkeep[4];
 
-int wiicam_aim_ext_state(void)  { return s_ext_state; }
-int wiicam_aim_ext(void)        { return s_ext_state & 1; }
-int wiicam_aim_ext_epoch(void)  { return s_ext_state >> 1; }
+int wiicam_aim_fmt_state(void)  { return s_ext_state; }
+int wiicam_aim_fmt(void)        { return s_ext_state & 3; }
+int wiicam_aim_fmt_epoch(void)  { return s_ext_state >> 3; }
+// Bit 2 chooses which byte full mode writes to the format register. It lives
+// in the state word for the same reason the format does: it is payload the
+// camera poll reads when it acts on an epoch, and an ordinary variable beside
+// a volatile one has no ordering guarantee between the two stores. Kept out,
+// the one knob that exists to rescue a broken full mode could be latched a
+// version late -- the poll would re-init with the OLD byte while cam? cheerily
+// reported the new one, and nothing would ever correct it.
+int wiicam_aim_fullreg(void)    { return (s_ext_state & 4) ? 0x05 : 0x55; }
 
-// One store, so a reader on the other core sees the flag and the epoch move
-// together or not at all.
-static void ext_set(int want)
+// One store, so a reader on the other core sees the format, the register byte
+// and the epoch move together or not at all. Unchanged is a no-op: every epoch
+// bump costs the camera poll a re-init with the sensor's settling delay, and
+// the tools re-send a value on every keypress.
+static void fmt_set(int want, int freg05)
 {
-    s_ext_state = (((s_ext_state >> 1) + 1) << 1) | (want ? 1 : 0);
+    if (want < 0) want = 0;
+    if (want > WIICAM_FMT_FULL) want = WIICAM_FMT_FULL;
+    if (want != WIICAM_FMT_FULL)
+        for (int i = 0; i < 4; ++i) { s_fw[i] = 0; s_fh[i] = 0; s_fi[i] = 0; }
+    const int cur = s_ext_state;
+    const int payload = (freg05 ? 4 : 0) | want;
+    if ((cur & 7) == payload) return;
+    // The register byte only means anything to a poll that is APPLYING full
+    // mode. Changing it in any other format still has to be recorded -- it is
+    // what full mode will use when it is next selected -- but it must not bump
+    // the epoch, or flipping the compatibility switch while the gun is in
+    // basic costs a camera re-init that writes basic again, and the tools'
+    // two-value ladder re-sends on every keypress.
+    const int bump = (want == WIICAM_FMT_FULL) || ((cur & 3) != want);
+    s_ext_state = bump ? ((((cur >> 3) + 1) << 3) | payload)
+                       : ((cur & ~7) | payload);
 }
+// Format only, keeping whichever register byte is selected.
+static void ext_set(int want) { fmt_set(want, s_ext_state & 4); }
+
+void wiicam_aim_fmt_fallback(int fmt) { ext_set(fmt); }
 
 void wiicam_aim_format_dirty(void)
 {
-    ext_set(s_ext_state & 1);
+    // Forced, not conditional: the sensor was re-initialised behind our back,
+    // so the format has to be written again even though nothing we hold
+    // changed. fmt_set() would correctly decide there was nothing to do.
+    const int cur = s_ext_state;
+    s_ext_state = (((cur >> 3) + 1) << 3) | (cur & 7);
     // A rebuilt camera has been re-initialised from the sensitivity preset,
     // which writes register 0x06 -- so our MAXSIZE is gone and has to go back.
     s_hw_dirty = true;
@@ -211,8 +334,11 @@ void wiicam_aim_hw_tick(void)
 {
     if (!s_hw_dirty || !s_blobreg) return;
     // Both pump sites can run this -- core 1 in Run mode, core 0 when the gun
-    // is paused or docked -- and during a mode change both can be in their
-    // pump at once. Two masters clocking the same bus is how a bus locks up,
+    // is paused or docked. A careful trace of every call site could not
+    // actually produce an interleaving where both are inside at once, so this
+    // guard may well be unnecessary; it stays because the cost is one branch
+    // and the thing it would prevent -- two masters clocking the same bus --
+    // is how a bus locks up,
     // so the second one leaves and the request stays pending.
     if (s_hw_busy) return;
     s_hw_busy = true;
@@ -330,6 +456,18 @@ void wiicam_aim_begin(void)
     if (aim_tmode_load(&tmode)) aim_tmode_set(tmode);
     int fk = 0, fp = 0;
     if (aim_fir_load(&fk, &fp)) aim_fir_set(fk, fp);
+    // The blob gate, as one unit. ext_set() rather than a bare assignment so
+    // the epoch moves with it and the camera poll applies the format on its
+    // first tick -- a stored format that never reaches the sensor is a read
+    // length that does not match the report, which decodes to nonsense.
+    {
+        int gfmt = 0, gmin = 0, gmax = 15, grtol = 0;
+        if (aim_gate_load(&gfmt, &gmin, &gmax, &grtol)) {
+            s_bmin = (uint8_t)gmin; s_bmax = (uint8_t)gmax;
+            s_rtol = (uint8_t)grtol;
+            ext_set(gfmt);
+        }
+    }
     // Recoil engine: defaults (dormant), then whatever was saved. The reply
     // sink is shared so FX: lines reach the tools the same way CAM: does.
     {
@@ -435,6 +573,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // coordinates, so unmasked reads would feed the resolver stale points.
     float ax[4], ay[4];
     int   asz[4];
+    int   aslot[4] = {0, 0, 0, 0};   // which hardware slot each entry came from
     int   an = 0;
     for (int i = 0; i < 4; ++i) {
         if (!(seen & (1u << i))) continue;
@@ -445,6 +584,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         lens_undistort(&x, &y);
         ax[an] = x; ay[an] = y;
         asz[an] = sizes ? sizes[i] : -1;      // -1 = basic format, size unknown
+        aslot[an] = i;                        // see the s_f*/s_b* note above
         ++an;
     }
 
@@ -509,6 +649,9 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         s_by[i]   = (int16_t)lroundf(ay[i]);
         s_bsz[i]  = (int8_t)asz[i];
         s_bkeep[i] = (int8_t)keep[i];
+        s_bw[i] = s_fw[aslot[i]];
+        s_bh[i] = s_fh[aslot[i]];
+        s_bi[i] = s_fi[aslot[i]];
         if (!keep[i]) continue;              // already tallied by its own gate
         xs[n] = ax[i]; ys[n] = ay[i]; ++n;
     }
@@ -543,6 +686,85 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         if (nr > 4) nr = 4;
         ++s_breal[nr];
     }
+    // ---- shape learning -----------------------------------------------
+    // Fed only from frames whose label came from GEOMETRY -- where the blobs
+    // sit, which no size or shape gate has a vote in. Nothing being taught is
+    // downstream of the teacher, so the gate can never learn its own drift.
+    //
+    // Two labels, and the second one took a rewrite to get right. The obvious
+    // reading -- "kept blobs in a confirmed frame are LEDs, rejected ones are
+    // not" -- cannot produce a single negative sample on this sensor. It has
+    // four object slots and only KEPT blobs reach the resolver, so a rejection
+    // leaves three points and n_real can never be 4 in the same frame. The
+    // positive class filled and the negative class was structurally empty,
+    // which would have quietly reduced this whole exercise to "here is what an
+    // LED looks like" with no way to ask the question that matters.
+    if (wl_enabled()) {
+        const int fmt = s_ext_state & 3;
+        const int flags = (fmt == WIICAM_FMT_FULL) ? WL_HAS_BOX : 0;
+        int nkept = 0, jrej = -1;
+        for (int i = 0; i < an; ++i) {
+            if (keep[i]) ++nkept;
+            else jrej = i;
+        }
+        // Median intensity over the KEPT blobs, so WL_IREL is measured against
+        // this frame's own brightness rather than a number that only held at
+        // the distance it was learned from.
+        int imed = 0;
+        if (flags && nkept) {
+            int v[4], m = 0;
+            for (int i = 0; i < an; ++i) if (keep[i]) v[m++] = (int)s_bi[i];
+            for (int i = 1; i < m; ++i) {          // insertion sort, m <= 4
+                const int t = v[i];
+                int j = i - 1;
+                while (j >= 0 && v[j] > t) { v[j + 1] = v[j]; --j; }
+                v[j + 1] = t;
+            }
+            imed = (m & 1) ? v[m / 2] : (v[m / 2 - 1] + v[m / 2]) / 2;
+        }
+        if (r.n_real == 4) {
+            // Four corners really seen: every blob in this frame is an LED.
+            for (int i = 0; i < an; ++i)
+                wl_note(0, asz[i], (int)s_bw[i], (int)s_bh[i],
+                        (int)s_bi[i], imed, flags);
+            wl_note_frame();
+        } else if (r.locked && r.count == 4 && r.n_real == 3
+                   && jrej >= 0 && nkept == an - 1) {
+            // Three real corners and a reconstructed fourth, with exactly one
+            // blob rejected. The reconstruction says where the missing LED
+            // must be, so the rejected blob can be judged on POSITION alone:
+            // far from every corner and it was not an LED, whatever its size.
+            // That is a negative label the size gate had no part in.
+            //
+            // Twice the resolver's own association radius, not once. Being
+            // wrong here poisons the negative distribution with real LEDs and
+            // teaches the gate to reject them, so the bar for calling
+            // something a stray is deliberately higher than the bar the
+            // resolver uses for calling something a corner.
+            const float gate2 = 2.0f * quad_default_config().gate;
+            float dmin = 1e9f;
+            for (int k = 0; k < 4; ++k) {
+                const float dx = ax[jrej] - r.p[k].x;
+                const float dy = ay[jrej] - r.p[k].y;
+                const float d = dx * dx + dy * dy;
+                if (d < dmin) dmin = d;
+            }
+            if (dmin > gate2 * gate2) {
+                wl_note(1, asz[jrej], (int)s_bw[jrej], (int)s_bh[jrej],
+                        (int)s_bi[jrej], imed, flags);
+                ++s_bfar;
+            } else {
+                // It was sitting where the missing LED should be. The gate
+                // almost certainly threw away a real corner -- so this is not
+                // evidence about strays, it is evidence about the gate, and it
+                // is counted where the user can see it. This is the
+                // false-negative meter: a gate that is too tight shows up here
+                // long before it shows up as a cursor that will not track.
+                ++s_bnear;
+            }
+        }
+    }
+
     if (r.count < 4) { ++s_bdrop; emit_q(now_us, xs, ys, n); return false; }
 
     // Latency lead: extrapolate the published quad along its velocity,
@@ -613,6 +835,24 @@ bool wiicam_cam_command(const char* line)
         ok = aim_tmode_store(aim_tmode_get()) && ok;
         ok = aim_fir_store(aim_fir_k(), aim_fir_pct()) && ok;
         ok = (fx_store() != 0) && ok;       // recoil knobs ride the same save
+        // The software gate rides it too. It has to: the first real capture
+        // showed the gun holding 99.7% four-corner with rtol on, and every
+        // one of those settings died on the next power cycle -- including the
+        // format, without which the size arrives as -1 and the gate silently
+        // judges nothing at all. The two SENSOR thresholds stay out on
+        // purpose: they are the only settings that can leave a gun dark, and
+        // a power cycle has to remain a way out.
+        // The FORMAT is clamped to extended on the way to flash. Full mode is
+        // still unproven on this sensor -- we do not even know for certain
+        // which byte selects it -- and a gun that boots into a format the
+        // sensor does not honour reads a length that does not match the
+        // report, which decodes to plausible nonsense and aims wildly. On a
+        // Pi with no console that is unrecoverable without a terminal. Same
+        // rule as hwmax/hwmin: anything that can leave the gun unusable has to
+        // be one power cycle from gone. Lift this once full mode is confirmed.
+        const int save_fmt = (int)(s_ext_state & 3);
+        ok = aim_gate_store(save_fmt > WIICAM_FMT_EXT ? WIICAM_FMT_EXT : save_fmt,
+                            (int)s_bmin, (int)s_bmax, (int)s_rtol) && ok;
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
                           s_lcx, s_lcy };
@@ -622,10 +862,12 @@ bool wiicam_cam_command(const char* line)
         // beta rides in the reply so a tool can VERIFY what was written rather
         // than assume it; cam? reports the live value, this reports the stored one.
         reply(ok && lens_ok
-              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d (sens lives in the OpenFIRE profile; blob gates and sensor thresholds are NOT saved)\n"
+              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d fmt=%d bmin=%d bmax=%d rtol=%d (sens lives in the OpenFIRE profile; full mode and the two SENSOR thresholds hwmax/hwmin are NOT saved, so a power cycle always clears them)\n"
               : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), aim_beta_get(),
-              (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct());
+              (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
+              save_fmt > WIICAM_FMT_EXT ? WIICAM_FMT_EXT : save_fmt,
+              (int)s_bmin, (int)s_bmax, (int)s_rtol);
         return true;
     }
     if (!strncmp(line, "camdiag", 7)) {
@@ -648,27 +890,99 @@ bool wiicam_cam_command(const char* line)
         // has ever measured on this sensor, and the one that decides whether a
         // bigger read per frame costs us anything. Timing it host-side instead
         // would measure the tool's poll jitter, not the camera.
-        reply("CAM: blob ext=%u bmin=%u bmax=%u rtol=%u hwmax=%d hwmin=%d "
+        // ONE read of the count, used by both lines. The two replies are
+        // emitted back to back but the camera poll runs on the other core and
+        // can publish a new frame between them: read separately, the count
+        // came from one frame and the list from the next, and 1.4% of the rows
+        // in the first real capture disagreed with themselves. Nothing in the
+        // pipeline reads these fields, but every log we analyse does.
+        const int fmt = s_ext_state & 3;
+        const int bn  = s_bn;
+        // And copy the entries, not just the count. The count alone stopped
+        // the two lines DISAGREEING, but the poll core republishes the arrays
+        // at frame rate and the second reply is emitted after the first: a
+        // frame landing in between left line 2 printing this frame's first two
+        // blobs and the previous frame's last two, under a count that looked
+        // consistent. Four blobs is 28 bytes of stack to make the whole reply
+        // one frame's worth of truth.
+        int16_t bx[4], by[4];
+        int8_t  bsz[4], bkeep[4];
+        uint8_t bw[4], bh[4], bi[4];
+        for (int i = 0; i < 4; ++i) {
+            bx[i] = s_bx[i]; by[i] = s_by[i];
+            bsz[i] = s_bsz[i]; bkeep[i] = s_bkeep[i];
+            bw[i] = s_bw[i]; bh[i] = s_bh[i]; bi[i] = s_bi[i];
+        }
+        reply("CAM: blob fmt=%u ext=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
+              "hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
-              "bdrop=%lu br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu\n",
-              (unsigned)(s_ext_state & 1), (unsigned)s_bmin, (unsigned)s_bmax,
+              "bdrop=%lu bfar=%lu bnear=%lu "
+              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu\n",
+              (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
+              (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
               (unsigned)s_rtol, (int)(s_hwmax < 0 ? -1 : s_hwmax),
-              (int)(s_hwmin < 0 ? -1 : s_hwmin), s_bn,
+              (int)(s_hwmin < 0 ? -1 : s_hwmin), bn,
               (unsigned long)s_brej, (unsigned long)s_brrej,
               (unsigned long)s_bvalve, (unsigned long)s_bframes,
               (unsigned long)(fx_now() / 1000ull),
-              (unsigned long)s_bdrop, (unsigned long)s_breal[4],
+              (unsigned long)s_bdrop,
+              (unsigned long)s_bfar, (unsigned long)s_bnear,
+              (unsigned long)s_breal[4],
               (unsigned long)s_breal[3], (unsigned long)s_breal[2],
               (unsigned long)s_breal[1], (unsigned long)s_breal[0]);
-        char b[128];
+        // In full mode each blob carries three more numbers -- box width, box
+        // height and intensity -- so the line grows and the buffer with it.
+        char b[256];
         int o = snprintf(b, sizeof(b), "CAM: blobs");
-        for (int i = 0; i < s_bn && o > 0 && o < (int)sizeof(b) - 20; ++i)
+        const int need = (fmt == WIICAM_FMT_FULL) ? 34 : 20;
+        for (int i = 0; i < bn && i < 4 && o > 0 && o < (int)sizeof(b) - need; ++i) {
             o += snprintf(b + o, sizeof(b) - o, " %d,%d,%d,%d",
-                          (int)s_bx[i], (int)s_by[i], (int)s_bsz[i],
-                          (int)s_bkeep[i]);
-        if (!(s_ext_state & 1) && o > 0 && o < (int)sizeof(b) - 34)
-            o += snprintf(b + o, sizeof(b) - o, " (sizes need ext:1)");
+                          (int)bx[i], (int)by[i], (int)bsz[i], (int)bkeep[i]);
+            if (fmt == WIICAM_FMT_FULL && o > 0 && o < (int)sizeof(b) - 14)
+                o += snprintf(b + o, sizeof(b) - o, ",%d,%d,%d",
+                              (int)bw[i], (int)bh[i], (int)bi[i]);
+        }
+        if (fmt == WIICAM_FMT_BASIC && o > 0 && o < (int)sizeof(b) - 34)
+            o += snprintf(b + o, sizeof(b) - o, " (sizes need fmt:1)");
         reply("%s\n", b);
+        return true;
+    }
+    if (!strncmp(line, "camlearn", 8)) {
+        const char* p = line + 8;
+        if (!strncmp(p, "=reset", 6)) {
+            wl_reset();
+            reply("CAM: learn cleared\n");
+            return true;
+        }
+        if (!strncmp(p, "=on:", 4)) {
+            // Turning it on clears first (see wl_enable): a distribution
+            // accumulated across a change of sensitivity or of the LED bar is
+            // two rigs averaged into one wide spread, which reads as "cannot
+            // be separated" when in truth neither rig was measured.
+            wl_enable(p[4] != '0');
+            reply("CAM: learn %s -- feeding only resolver-confirmed frames\n",
+                  wl_enabled() ? "ON" : "off");
+            return true;
+        }
+        // The histograms, one line per class and feature. Split rather than
+        // packed because a single reply carrying 384 numbers would not fit any
+        // sane buffer, and because a tool that loses one line should lose one
+        // feature rather than the whole capture.
+        reply("CAM: learn on=%d frames=%lu led=%lu rej=%lu bins=%d\n",
+              wl_enabled(), (unsigned long)wl_frames(),
+              (unsigned long)wl_blobs(0), (unsigned long)wl_blobs(1), WL_BINS);
+        for (int cls = 0; cls < WL_CLASSES; ++cls) {
+            for (int f = 0; f < WL_NFEAT; ++f) {
+                const uint16_t* h = wl_hist(cls, f);
+                if (!h) continue;
+                char b[224];
+                int o = snprintf(b, sizeof(b), "CAM: hist c=%d f=%s", cls,
+                                 wl_feat_name(f));
+                for (int i = 0; i < WL_BINS && o > 0 && o < (int)sizeof(b) - 8; ++i)
+                    o += snprintf(b + o, sizeof(b) - o, " %u", (unsigned)h[i]);
+                reply("%s\n", b);
+            }
+        }
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
@@ -678,7 +992,7 @@ bool wiicam_cam_command(const char* line)
         // The blob gate goes back to inert here too: it is the one setting
         // that can stop a gun aiming if it is set wrong, so the command a user
         // reaches for when nothing works must undo it.
-        if (s_ext_state & 1) ext_set(0);
+        if (s_ext_state & 3) ext_set(0);
         s_bmin = 0; s_bmax = 15;
         s_rtol = 0;
         // RESTORE, not "leave alone". Marking them untouched left whatever we
@@ -688,15 +1002,27 @@ bool wiicam_cam_command(const char* line)
         // MINSIZE goes to 0, the direction that cannot cost an LED.
         s_hwmax = WIICAM_HW_RESTORE; s_hwmin = WIICAM_HW_RESTORE;
         s_hw_dirty = true;
-        reply("CAM: lens + lead cleared, blob gates off, sensor thresholds "
-              "restored\n");
+        // The capture stops with everything else. Leaving it running past a
+        // reset would keep filling one distribution from two configurations.
+        wl_enable(0);
+        // And erase the SAVED copy. Now that the gate survives a reboot, a
+        // gate that stops the gun aiming would come back on the next boot and
+        // the one command a user reaches for when nothing works would fix the
+        // session and lose the argument.
+        const bool gone = aim_gate_clear();
+        reply(gone ? "CAM: lens + lead cleared, blob gates off and unsaved, "
+                     "sensor thresholds restored\n"
+                   : "CAM: lens + lead cleared, blob gates off, sensor "
+                     "thresholds restored -- SAVED GATE NOT ERASED, it will "
+                     "come back on the next boot\n");
         return true;
     }
     if (!strncmp(line, "cam?", 4)) {
         reply("CAM: board=rp2040-wiicam sens=%d mirx=%d miry=%d lead=%d "
               "smooth=%d dead=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d "
               "lcxu=%d lcyu=%d beta=%d tmode=%d firk=%d firpct=%d res=%u dash=%u "
-              "ext=%u bmin=%u bmax=%u rtol=%u hwmax=%d hwmin=%d\n",
+              "ext=%u fmt=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
+              "hwmax=%d hwmin=%d\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
@@ -704,7 +1030,9 @@ bool wiicam_cam_command(const char* line)
               (int)(s_lcx*10.0f), (int)(s_lcy*10.0f),
               aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
               (unsigned)s_res, (unsigned)s_dash,
-              (unsigned)(s_ext_state & 1), (unsigned)s_bmin, (unsigned)s_bmax,
+              (unsigned)((s_ext_state & 3) >= WIICAM_FMT_EXT),
+              (unsigned)(s_ext_state & 3), (unsigned)wiicam_aim_fullreg(),
+              (unsigned)s_bmin, (unsigned)s_bmax,
               (unsigned)s_rtol, (int)(s_hwmax < 0 ? -1 : s_hwmax),
               (int)(s_hwmin < 0 ? -1 : s_hwmin));
         return true;
@@ -750,12 +1078,51 @@ bool wiicam_cam_command(const char* line)
         else if (!strcmp(key, "firk"))   { aim_fir_set(val, aim_fir_pct()); }
         else if (!strcmp(key, "firpct")) { aim_fir_set(aim_fir_k(), val); }
         else if (!strcmp(key, "sens")) { if (s_sens_set && val >= 0 && val <= 2) s_sens_set(val); }
-        else if (!strcmp(key, "ext"))  { const int v = val ? 1 : 0;
-                                         if (v != (s_ext_state & 1)) ext_set(v); }
+        // fmt is the canonical key (0 basic, 1 extended, 2 full); ext is the
+        // name the tools used when there were only two formats and still
+        // works, clamped the same way. Only bump the epoch on a real change:
+        // every bump costs the camera poll a re-init with its settling delay.
+        else if (!strcmp(key, "fmt") || !strcmp(key, "ext")) {
+            // ext is clamped to its own documented range, not fmt's. It named
+            // a two-value setting for the whole time it was the only name, and
+            // a hand-typed 'ext:2' silently selecting a format we have never
+            // seen work is not a reading anyone intended.
+            const int hi = !strcmp(key, "ext") ? WIICAM_FMT_EXT : WIICAM_FMT_FULL;
+            ext_set(val < 0 ? 0 : (val > hi ? hi : val));
+        }
+        // The mode byte for full mode. Refused outside the two candidates so a
+        // typo cannot write a random value into the format register and leave
+        // the sensor in a state no read length matches.
+        else if (!strcmp(key, "fullreg")) {
+            if (val == 0x05 || val == 0x55) {
+                // One store with the format, so the poll can never act on a
+                // new epoch holding the previous byte. fmt_set() skips the
+                // epoch bump when nothing actually changed, which matters
+                // here: a held-down key on the tools' two-value ladder re-sends
+                // the same value several times a second, and every bump would
+                // be another camera re-init with its settling delay.
+                fmt_set(s_ext_state & 3, val == 0x05);
+            } else {
+                reply("CAM: fullreg must be 5 or 85 (0x05 or 0x55) -- not set\n");
+            }
+        }
         // Kept exactly as asked (0..15); the gate orders them when it runs, so
         // typing the two ends in either order gives the same window.
-        else if (!strcmp(key, "bmin")) { s_bmin = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
-        else if (!strcmp(key, "bmax")) { s_bmax = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
+        //
+        // Except for a window whose upper end is 0, which admits no size the
+        // sensor can report and so rejects every blob. The give-back floor
+        // keeps the gun aiming on two reconstructed corners, but badly -- and
+        // now that the gate is PERSISTED, one fat-finger on a spinner that
+        // starts at 0 followed by any calibration writes that to flash and it
+        // comes back on every boot. Refused by name, the same way hwmax:0 is.
+        else if (!strcmp(key, "bmin") || !strcmp(key, "bmax")) {
+            const int v = val < 0 ? 0 : (val > 15 ? 15 : val);
+            const uint8_t nmin = !strcmp(key, "bmin") ? (uint8_t)v : s_bmin;
+            const uint8_t nmax = !strcmp(key, "bmin") ? s_bmax : (uint8_t)v;
+            if ((nmin > nmax ? nmin : nmax) < 1)
+                reply("CAM: a size window of 0..0 rejects every blob -- not set\n");
+            else { s_bmin = nmin; s_bmax = nmax; }
+        }
         // Size steps, so the whole useful range is 0..15 like the size itself.
         else if (!strcmp(key, "rtol")) { s_rtol = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
         // The sensor's own thresholds. -1 leaves the register alone; anything
@@ -776,12 +1143,14 @@ bool wiicam_cam_command(const char* line)
     }
     s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
     reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d tmode=%d firk=%d "
-          "firpct=%d lens=%u res=%u dash=%u ext=%u bmin=%u bmax=%u "
-          "rtol=%u hwmax=%d hwmin=%d\n",
+          "firpct=%d lens=%u res=%u dash=%u ext=%u fmt=%u fullreg=%u "
+          "bmin=%u bmax=%u rtol=%u hwmax=%d hwmin=%d\n",
           s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
           aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
           (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash,
-          (unsigned)(s_ext_state & 1), (unsigned)s_bmin, (unsigned)s_bmax,
+          (unsigned)((s_ext_state & 3) >= WIICAM_FMT_EXT),
+          (unsigned)(s_ext_state & 3), (unsigned)wiicam_aim_fullreg(),
+          (unsigned)s_bmin, (unsigned)s_bmax,
           (unsigned)s_rtol, (int)(s_hwmax < 0 ? -1 : s_hwmax),
           (int)(s_hwmin < 0 ? -1 : s_hwmin));
     return true;

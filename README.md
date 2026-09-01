@@ -561,14 +561,19 @@ All are prefixed `~` on the native USB port.
 | `~cam=lens:2,lfeq:900,lfpx:840` | Set the lens correction live |
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only) |
 | `~cam=beta:24` | Smoothing speed sensitivity, 0–60; −1 = default (15) |
-| `~cam=ext:1` | Extended sensor report: adds each blob's size, 0–15 (wiicam only). Off by default, not saved — a power cycle clears it |
-| `~cam=bmin:2,bmax:9` | Blob size window. Blobs outside it are dropped before the quad resolver, so a bright window is refused instead of taking an LED's slot. Needs `ext:1`; 0–15 accepts everything |
+| `~cam=fmt:1` | Sensor report format (wiicam only): 0 basic, 1 extended (adds each blob's size, 0–15), 2 full (adds the blob's bounding box and an 8-bit intensity). Basic by default; saved by `~camsave`. `~cam=ext:` is the old name and still works |
+| `~cam=fullreg:85` | The byte written to the mode register for full mode — 85 (0x55) or 5 (0x05). The driver's working constants for the other two formats are the doubled nibble, so 0x55 is the default; try 5 if full mode returns nonsense. Not saved |
+| `~cam=bmin:2,bmax:9` | Blob size window. Blobs outside it are dropped before the quad resolver, so a bright window is refused instead of taking an LED's slot. Needs `fmt:1` or higher; 0–15 accepts everything |
 | `~cam=rtol:3` | Odd-one-out gate, in blob-size steps (0–15). Drops a blob whose size is more than this far from the other three in the same frame. Needs no distance tuning; 0 = off |
 | `~cam=hwmax:150` | The sensor's OWN maximum blob size, register 0x06. Gates inside the camera, before it allocates its four object slots. −1 leaves the register alone |
 | `~cam=hwmin:3` | The sensor's own minimum blob size, register 0x1B — never written by the stock driver, so it otherwise sits at an unknown default. −1 leaves it alone |
-| `~camblob?` | Each blob the sensor last reported — position, size, and whether a gate kept it — the share of recent frames that saw four, three or two LEDs, and the gun's frame counter and clock, from which the camera's true frame rate is measured |
+| `~camblob?` | Each blob the sensor last reported — position, size, and whether a gate kept it, plus its bounding box and intensity in full mode — the share of recent frames that saw four, three or two LEDs, how many rejected blobs sat nowhere near a corner versus exactly where a missing LED should have been (the false-negative meter for a size window that is too tight), and the gun's frame counter and clock, from which the camera's true frame rate is measured |
+| `~camreset` | Undo everything that can stop a gun aiming: lens, lead, the software blob gate and its saved copy, and the sensor's own thresholds, which go back to the sensitivity preset |
+| `~camlearn=on:1` | Start measuring what an LED actually looks like on this rig. Two histograms per feature — blobs the quad resolver confirmed as corners, and blobs it placed nowhere near one — so the question "can a window and an LED be told apart at all" is answered from data instead of guessed. Needs `fmt:2` for anything beyond size. Starting clears; nothing is gated on it and nothing is saved |
+| `~camlearn?` | The histograms: a summary line, then one line per class and feature |
+| `~camlearn=reset` | Clear the capture without stopping it |
 | `~camdiag` | Sensor connection test: power, both data wires, swapped lines, the sensor itself, and whether frames actually flow |
-| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens and temporal mode. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
+| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens, temporal mode and the software blob gate (`fmt`, `bmin`, `bmax`, `rtol`). The two SENSOR thresholds `hwmax` and `hwmin` are deliberately left out: they are the only settings that can leave a gun dark, so a power cycle has to remain a way out. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
 | `~fx?` | Recoil engine state: every knob, dry-fire and quiet countdowns, and the trigger path's last temperature reading |
 | `~fx=on:1,drive:45,hold:0` | Tune the recoil engine live. `on:0` is stock OpenFIRE behaviour |
 | `~fx=quiet:1` / `:0` | Silence the gun: nothing fires, and the engine holds both the solenoid and the rumble motor so OpenFIRE's own recoil cannot run either. Used by the calibration screens; lapses by itself after five minutes |

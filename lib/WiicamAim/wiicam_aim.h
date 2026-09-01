@@ -35,22 +35,73 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
                            unsigned seen, uint64_t now_us,
                            float* sx, float* sy);
 
-// Extended data format. OFF by default -- the sensor is read exactly as
-// before until '~cam=ext:1' asks otherwise.
+// Report format. Basic by default -- the sensor is read exactly as it was
+// before this code existed until '~cam=fmt:' asks otherwise.
+//   0 basic     x,y only
+//   1 extended  + a 4-bit size per blob
+//   2 full      + the blob's bounding box and an 8-bit intensity
 //
 // The read LENGTH must match the sensor's format register: a basic-length read
 // of an extended frame still returns bytes and still reports success, it just
 // decodes to nonsense. So the format switch belongs to whoever owns the camera
-// poll: it reads wiicam_aim_ext(), and re-applies whenever the epoch changes.
+// poll: it reads wiicam_aim_fmt(), and re-applies whenever the epoch changes.
 // Read the STATE word, not the two halves: it carries the wanted format in
-// bit 0 and the epoch above it, in one value. The camera poll and the command
-// parser run on different cores, and reading the flag and the epoch separately
-// lets a poll pair a new epoch with the old flag -- it writes the old format,
-// latches the new epoch, and then never corrects itself.
-int  wiicam_aim_ext_state(void);
-int  wiicam_aim_ext(void);            // convenience: bit 0 of the state
-int  wiicam_aim_ext_epoch(void);      // convenience: the epoch half
+// bits 0-1 and the epoch above it, in one value. The camera poll and the
+// command parser run on different cores, and reading the format and the epoch
+// separately lets a poll pair a new epoch with the old format -- it writes the
+// old format, latches the new epoch, and then never corrects itself.
+#define WIICAM_FMT_BASIC 0
+#define WIICAM_FMT_EXT   1
+#define WIICAM_FMT_FULL  2
+int  wiicam_aim_fmt_state(void);
+int  wiicam_aim_fmt(void);            // convenience: bits 0-1 of the state
+int  wiicam_aim_fmt_epoch(void);      // convenience: the epoch half
 void wiicam_aim_format_dirty(void);   // camera was rebuilt: re-apply the format
+
+// ---- full mode -------------------------------------------------------------
+// The vendored driver declares this format and cannot read it: its receive
+// union is 13 bytes and a full report is 37, there is no rawFull[4], and the
+// enumerator is commented out. Rather than patch a library the working build
+// depends on, the read lives here and the hook owns nothing but the bus
+// transaction: write 0x36, then read len bytes. Non-zero means the bytes
+// arrived. The first three bytes of each object are laid out exactly as in
+// extended, so x, y and size decode with the same arithmetic.
+void wiicam_set_fullread_hook(int (*fn)(unsigned char* buf, int len));
+#define WIICAM_FULL_LEN 37            // 1 header + 4 objects x 9 bytes
+
+// One full-mode poll. Fills px/py/sizes/seen exactly as the driver's
+// extendedAtomic would, and keeps each blob's box and intensity for the
+// report. Returns 1 when a frame was read, 0 on a bus error or no hook.
+int  wiicam_aim_full_poll(int* px, int* py, int* sizes, unsigned* seen);
+
+// The byte written to the mode register (0x33) to select full mode.
+//
+// Settable because we are honestly not certain of it. The driver's own WORKING
+// constants for the other two formats are the doubled nibble -- 0x11 basic,
+// 0x33 extended -- so 0x55 is the value consistent with what this sensor
+// already accepts every time it is powered on. Wiibrew documents the modes as
+// 1 / 3 / 5, under which 0x05 works too because only the low nibble is read.
+// 0x55 is right under both readings and 0x05 only under one, so it is the
+// default; '~cam=fullreg:5' tries the other without a reflash. Not persisted.
+//
+// It rides in the state word above, for the same reason the format does: the
+// camera poll reads it when it acts on an epoch, and a plain variable stored
+// beside a volatile one carries no ordering guarantee between the two writes.
+// Kept outside, the one knob that exists to rescue a broken full mode could
+// be latched a version late -- the poll re-initialising with the OLD byte
+// while cam? reported the new one, and nothing ever correcting it.
+int  wiicam_aim_fullreg(void);
+
+// Give up on a format the sensor will not accept, and go back to one that
+// works. The camera poll calls this when the format register refuses the
+// write: an I2C master clocks out every byte it asks for whether or not the
+// sensor is producing them, so a 37-byte read against a sensor still in
+// extended returns 37 bytes, matches on the retry (the trailing registers are
+// static), unpacks four plausible coordinates and reports SUCCESS. There is no
+// error anywhere for the user to see -- just a cursor that is wrong until the
+// next reboot. Falling back is the only outcome that is both safe and visible:
+// the tools watch fmt and will show it drop back on its own.
+void wiicam_aim_fmt_fallback(int fmt);
 
 // The sensor's own blob-size thresholds, registers 0x06 (MAXSIZE) and 0x1B
 // (MINSIZE). They gate inside the sensor, BEFORE it allocates its four object

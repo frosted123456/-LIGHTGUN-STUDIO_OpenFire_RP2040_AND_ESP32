@@ -25,7 +25,11 @@ from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
 #   1  original                       2  FX: state parsing
 #   3  quiet mode, blob gate keys, send failure + liveness reporting
 #   4  camera frame-rate meter, blob CSV log, sensor threshold keys
-LINK_API = 4
+#   5  three-way report format (fmt), the full-mode register, and the box and
+#      intensity a full report adds to every blob
+#   6  the shape-learning capture: the multi-line 'CAM: hist' reply, held
+#      until it is whole, and the CSV both front ends write out of it
+LINK_API = 6
 
 SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
 # Board-scaled noise gates: the wiicam's 33-deg lens has ~2.2x less screen
@@ -134,16 +138,31 @@ class FrameRate:
 
 
 def parse_blobs(line):
-    """The per-blob list from a '~camblob?' reply -> [(x, y, size, kept), ...].
+    """The per-blob list from a '~camblob?' reply.
+
+    Four fields per blob -- (x, y, size, kept) -- in basic and extended mode,
+    and seven in full mode, where the sensor also reports the blob's bounding
+    box and its brightness: (x, y, size, kept, boxw, boxh, intensity). The box
+    is in the sensor's own 128x96 pixel array; x and y are NOT. The gun
+    normalises those out of the sensor's 1024x768 report into the pipeline's
+    240x176 space before it records them (wiicam_aim.cpp, x = nx * SX), so a
+    box pixel is nearly two units of x or y and the two still cannot be
+    compared without scaling -- but by 1.9, not by the 8 that reading them as
+    1024x768 would imply.
 
     Fields are positional and belong together, so they are parsed as a unit
-    rather than scattered into the key/value store."""
+    rather than scattered into the key/value store. The tuple keeps whatever
+    length the gun sent: padding a four-field blob out to seven would hand
+    every caller a 0x0 box that reads exactly like a measured one. Any other
+    length is a line the gun's send buffer cut short -- that blob is dropped
+    and the whole ones before it are kept, because a truncated tail is not a
+    reason to throw away a good frame."""
     out = []
     if not line:
         return out
     for tok in line.replace("CAM: blobs", "").split():
         f = tok.split(",")
-        if len(f) != 4:
+        if len(f) not in (4, 7):
             continue
         try:
             out.append(tuple(int(v) for v in f))
@@ -164,12 +183,20 @@ class BlobLog:
     samples, not frames, and a file full of repeated frames would overstate
     every rate computed from it."""
 
+    # Anything new goes on the END, even when it belongs beside a column that
+    # is already there: the captures taken at the TV are the whole reason this
+    # file exists, and they are read months later against whatever this tuple
+    # said at the time. Slotting w0,h0,i0 in after k0 would be tidier and would
+    # quietly turn every one of those files into nonsense.
     COLS = ("wall", "gun_ms", "bframes", "hz", "bn",
             "ext", "bmin", "bmax", "rtol", "hwmax", "hwmin", "sens",
             "brej", "brrej", "bvalve", "bdrop",
             "br4", "br3", "br2", "br1", "br0",
             "x0", "y0", "s0", "k0", "x1", "y1", "s1", "k1",
-            "x2", "y2", "s2", "k2", "x3", "y3", "s3", "k3")
+            "x2", "y2", "s2", "k2", "x3", "y3", "s3", "k3",
+            "fmt", "fullreg",
+            "w0", "h0", "i0", "w1", "h1", "i1",
+            "w2", "h2", "i2", "w3", "h3", "i3")
 
     def __init__(self, path):
         self.path = path
@@ -202,9 +229,18 @@ class BlobLog:
         blobs = parse_blobs(blobs_line)
         for i in range(4):
             if i < len(blobs):
-                vals.extend(blobs[i])
+                vals.extend(blobs[i][:4])
             else:
                 vals.extend(("", "", "", ""))
+        vals.append(last.get("fmt", ""))
+        vals.append(last.get("fullreg", ""))
+        # Empty, not zero, when the gun was not in full mode: a 0x0 box and a
+        # brightness of 0 are what an unlit blob would look like, and a reader
+        # averaging these columns months later has no way to tell a
+        # measurement of nothing from a measurement that never happened.
+        for i in range(4):
+            b = blobs[i] if i < len(blobs) else ()
+            vals.extend(b[4:7] if len(b) == 7 else ("", "", ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
         # an empty file, because the writes are still in the page cache.
@@ -220,6 +256,179 @@ class BlobLog:
             return True
         except Exception:
             return False
+
+
+# ---------------------------------------------------------------------------
+# the shape-learning histograms
+# ---------------------------------------------------------------------------
+# '~camlearn?' answers with a summary line and then ONE LINE PER class and
+# feature -- twelve of them, because a single reply carrying 384 numbers fits
+# no buffer the gun has. The names, the two classes and the bin count are the
+# firmware's own (lib/WiicamAim/wiicam_learn.h) and are pinned here rather
+# than read off the wire: a build that changes any of them is a different
+# generation of this parsing, which is what LINK_API is for.
+HIST_FEATS = ("sz", "bw", "bh", "aspect", "area", "irel")
+HIST_CLASSES = 2
+HIST_BINS = 32
+# Class 0 is a blob in a frame where the quad resolver confirmed all four
+# corners -- a known-good LED. Class 1 is a blob a gate rejected in one of
+# those same frames. Written into the CSV by NAME rather than as 0 and 1: the
+# file is opened weeks later in a spreadsheet with nothing beside it to say
+# which number meant which, and a distribution read under the wrong label is
+# worse than no distribution at all.
+CLASS_NAMES = ("led", "rej")
+SHAPE_COLS = (("class", "feature", "frames", "led_blobs", "rej_blobs")
+              + tuple("b%d" % i for i in range(HIST_BINS)))
+
+
+class HistSet:
+    """The multi-line '~camlearn?' reply, held until it is WHOLE.
+
+    Twelve lines arrive one after another behind a summary line, in among the
+    frame stream, and any of them can be missed: a front end can start
+    listening half way through a reply, and two replies run together when the
+    gun is asked twice. So a set is assembled off to one side and only
+    PUBLISHED once every class and feature is present -- nothing half-arrived
+    ever replaces what is held.
+
+    That matters because the only thing done with a held set is writing it to
+    a file. A CSV with four rows from this capture and eight from the previous
+    one is not a measurement of anything, and there is nothing about the file
+    afterwards that would look wrong -- the numbers are all plausible, they
+    just came from two different rigs.
+
+    `seq` counts published sets, so a caller that has just asked the gun can
+    tell a fresh answer from the one that was already there."""
+
+    def __init__(self):
+        self.summary = {}       # the counts that arrived WITH the held set
+        self.rows = {}          # (class index, feature name) -> bin counts
+        self.seq = 0            # bumped only when a whole new set is published
+        self._sum = None        # the reply being collected right now
+        self._rows = {}
+
+    def reset(self):
+        """Forget everything, keeping seq. Used when the port is reopened: a
+        histogram belongs to the gun and the light it was measured under, and
+        a reconnect may be onto a different gun entirely. seq keeps counting
+        so a caller waiting for a fresh set is not fooled by the reset."""
+        self.summary, self.rows = {}, {}
+        self._sum, self._rows = None, {}
+
+    def feed(self, line):
+        """Take one 'CAM: learn' / 'CAM: hist' line. True if it was ours."""
+        if line.startswith("CAM: learn "):
+            s = {}
+            for tok in line.split():
+                k, sep, v = tok.partition("=")
+                if sep:
+                    try:
+                        s[k] = int(v)
+                    except ValueError:
+                        pass
+            # 'CAM: learn ON -- ...' and 'CAM: learn cleared' are status
+            # messages for a human, not reports; only the report carries the
+            # bin count, so that is what a report is recognised by.
+            if "bins" not in s:
+                return False
+            # A report starts here, and it drops whatever was half collected:
+            # the counts on THIS line are the ones the rows below it were
+            # measured with, and rows from an older reply are not.
+            self._sum, self._rows = s, {}
+            return True
+        if not line.startswith("CAM: hist "):
+            return False
+        cls, feat, counts = None, None, []
+        for tok in line.split()[2:]:
+            k, sep, v = tok.partition("=")
+            if sep:
+                if k == "c":
+                    try:
+                        cls = int(v)
+                    except ValueError:
+                        return False
+                elif k == "f":
+                    feat = v
+                continue
+            try:
+                counts.append(int(tok))
+            except ValueError:
+                pass
+        if feat not in HIST_FEATS or cls is None \
+                or not (0 <= cls < HIST_CLASSES):
+            return False
+        if self._sum is None:
+            # The summary says how many frames these bins came from, and it
+            # comes first. Rows with no summary in front of them are the tail
+            # of a reply we joined half way through; kept, they would be
+            # written out under the PREVIOUS capture's counts.
+            return False
+        key = (cls, feat)
+        if key in self._rows:
+            # The same feature twice means two replies have run together --
+            # one of them lost its summary line, so neither is trustworthy as
+            # a whole. The part-built set goes; what is already published is
+            # left alone, and the next clean reply is waited for.
+            self._sum, self._rows = None, {}
+            return False
+        self._rows[key] = counts
+        if len(self._rows) == HIST_CLASSES * len(HIST_FEATS):
+            # Published by rebinding, not by mutating: a caller that took a
+            # reference to the last set goes on reading a whole one.
+            self.summary, self.rows = self._sum, self._rows
+            self.seq += 1
+            self._sum, self._rows = None, {}
+        return True
+
+    def ready(self):
+        """Is a whole set held? False until the gun has answered once."""
+        return bool(self.rows)
+
+    def counts(self):
+        """(frames, LED blobs, rejected blobs) from the held set's summary."""
+        s = self.summary
+        return (s.get("frames", 0), s.get("led", 0), s.get("rej", 0))
+
+    def running(self):
+        """Whether the GUN said the capture was on, not whether we asked for
+        it: '~camreset' stops a capture from anywhere, and a front end that
+        believed its own last click would go on claiming to be recording."""
+        return bool(self.summary.get("on"))
+
+    def total(self, cls, feat):
+        """How many samples landed in one histogram. Zero means the feature
+        was never fed -- which is what every box-derived feature looks like
+        after a capture taken outside full mode."""
+        return sum(self.rows.get((cls, feat), ()))
+
+
+def write_shape_csv(path, hs):
+    """The held histograms, one row per (class, feature). Returns the rows.
+
+    Wide and repetitive on purpose. This file is carried to a PC on the stick
+    and opened in a spreadsheet, so the counts are repeated on every row
+    rather than kept on a header line of their own: the first sort would put
+    such a line in the middle of the data and the rest of the file would no
+    longer say what it was measured from."""
+    frames, led, rej = hs.counts()
+    n = 0
+    with open(path, "w") as fh:
+        fh.write(",".join(SHAPE_COLS) + "\n")
+        for cls in range(HIST_CLASSES):
+            for feat in HIST_FEATS:
+                counts = hs.rows.get((cls, feat))
+                if counts is None:
+                    continue
+                # Fewer than 32 numbers means the gun's line buffer cut the
+                # tail off this feature. Blank, not zero: zero is a bin
+                # nothing landed in, which is a measurement, and a missing
+                # tail written as zeros is a distribution that leans left.
+                bins = [str(c) for c in counts[:HIST_BINS]]
+                bins += [""] * (HIST_BINS - len(bins))
+                fh.write(",".join([CLASS_NAMES[cls], feat, str(frames),
+                                   str(led), str(rej)] + bins) + "\n")
+                n += 1
+    return n
 
 
 def port_is_free(port):
@@ -283,6 +492,11 @@ class Link:
         self.sink = None          # called with (quad, gun_time_s)
         self.trig_sink = None     # called on a trigger marker
         self.blobs = ""           # last "CAM: blobs ..." line, raw
+        # The shape-learning histograms, assembled across the twelve lines
+        # they arrive on. Kept whole in one object rather than as loose keys
+        # for the same reason the blob list is: the bins of one feature are a
+        # distribution, and half of one is not a smaller distribution.
+        self.hists = HistSet()
         # Writes that failed. A serial write throwing is how a gun that
         # rebooted or re-enumerated announces itself, and swallowing it made a
         # dead link look exactly like a screen whose keys had stopped working.
@@ -310,6 +524,11 @@ class Link:
             # a connect refill all of it within a frame or two.
             self.last.clear()
             self.blobs = ""
+            # And the histograms with them. A distribution measured on the
+            # previous gun, under the previous light, written out as this
+            # one's is exactly the two-rigs-in-one-spread failure the capture
+            # clears itself to avoid.
+            self.hists.reset()
             self.replies = []
             self.src.start()
             return True
@@ -387,6 +606,18 @@ class Link:
                         try: self.last["fx" + k] = int(v)
                         except ValueError: pass
                 continue
+            # The shape-learning reply. Its twelve 'CAM: hist' lines are DATA,
+            # and they stop here: Studio's log box is six lines tall and
+            # pical's log is a 200-line ring, so one poll of a running capture
+            # would push every message the user was told to watch for -- the
+            # diag verdict, the save result -- straight off the end of both.
+            # The summary line above them is one line a human can read, so it
+            # goes on through to the log like any other answer.
+            if line.startswith("CAM: hist "):
+                self.hists.feed(line)
+                continue
+            if line.startswith("CAM: learn "):
+                self.hists.feed(line)
             if line.startswith("CAM:") or line.startswith("AIM:") or "CMD ok" in line:
                 self.replies.append(line)
                 # The per-blob list is kept whole: its fields are positional
@@ -411,8 +642,15 @@ class Link:
                                     or k in ("sens", "dead", "lead", "smooth",
                                                  "beta", "tmode",
                                                  "firk", "firpct",
-                                                 # blob gate + its counters
-                                                 "ext", "bmin", "bmax", "bn",
+                                                 # blob gate + its counters.
+                                                 # fmt is the report format
+                                                 # (0/1/2); ext is the same
+                                                 # gun saying only whether
+                                                 # sizes are available, kept
+                                                 # because a gun on older
+                                                 # firmware sends nothing else.
+                                                 "ext", "fmt", "fullreg",
+                                                 "bmin", "bmax", "bn",
                                                  "brej", "bframes", "bdrop",
                                                  "br4", "br3", "br2", "br1",
                                                  "br0", "brrej", "bvalve", "bms",
@@ -780,35 +1018,48 @@ def main():
     nb = ttk.Notebook(right)
     tab_cam = tk.Frame(nb, bg=C_BG)
     nb.add(tab_cam, text="  Camera  ")
-    nb.pack(fill="x", pady=(12, 0))
+    # 6 px above the tab strip, not 12: the notebook is packed WITHOUT expand,
+    # so the tab area is only ever as tall as the window has left over -- 307
+    # px on a 768p laptop -- and every pixel spent outside it is one the
+    # camera panel cannot have.
+    nb.pack(fill="x", pady=(6, 0))
 
     # ESP32 (OV2640) tuning widgets live in one frame, wiicam's in another;
     # the gun's own ~ping board tag decides which is shown.
     frame_esp = tk.Frame(tab_cam, bg=C_BG); frame_esp.pack(fill="x")
     frame_wii = tk.Frame(tab_cam, bg=C_BG)   # packed on detect
 
-    lab(frame_wii, "wiicam sensitivity (persisted in the OpenFIRE profile):",
-        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(2, 1))
+    # Every line this panel spends is a line the Save row at the bottom does
+    # not get: the window is 800 px tall on a 768p laptop and the tab area
+    # under it is 307 px, no matter how tall the panel asks to be. It went
+    # over once already -- "Save to gun" rendered four pixels high and could
+    # not be clicked -- so headings ride ON the row they name rather than
+    # above it, and the paddings here are deliberately mean.
     roww = tk.Frame(frame_wii, bg=C_BG); roww.pack(fill="x", pady=1)
+    lab(roww, "wiicam sensitivity (persisted in the OpenFIRE profile):",
+        (F[0], 9), C_DIM).pack(side="left", padx=(0, 8))
     for sv, nm in ((0, "Default"), (1, "High"), (2, "Max")):
         tk.Button(roww, text=nm, font=F, bg="#161b22", fg=C_FG, relief="flat",
-                  padx=12, pady=4,
+                  padx=10, pady=2,
                   command=lambda v=sv: (link.send("~cam=sens:%d" % v),
                                         log("sensitivity -> %d" % v))
                   ).pack(side="left", padx=(0, 6))
     lab(frame_wii, "Default fits most rigs. The noise floor above still "
         "measures on this board.",
-        (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(2, 2))
+        (F[0], 8), C_DIM, justify="left", anchor="w").pack(fill="x", pady=(1, 1))
     # Sensor connection test: which of power, wiring and the sensor itself is
     # broken, straight from the gun's own pins -- and a live camera restart
     # when the fault turns out to be fixed.
-    rowdg = tk.Frame(frame_wii, bg=C_BG); rowdg.pack(fill="x", pady=2)
+    rowdg = tk.Frame(frame_wii, bg=C_BG); rowdg.pack(fill="x", pady=1)
     tk.Button(rowdg, text="Test sensor connection", font=FB, bg="#1f6feb",
-              fg="white", relief="flat", padx=12, pady=4,
+              fg="white", relief="flat", padx=12, pady=2,
               command=lambda: (link.send("~camdiag"),
                                log("~camdiag sent -- the gun answers with "
                                    "CAM: diag lines; the VERDICT line names "
                                    "what is broken"))).pack(side="left")
+    # Two lines, deliberately: on one line this sentence is 490 px wide and
+    # the panel is 585, which leaves the button no room -- and it costs no
+    # height, because the button beside it is the taller of the two anyway.
     lab(rowdg, "checks power, both data wires, swapped\n"
         "lines and the sensor itself",
         (F[0], 8), C_DIM, justify="left").pack(side="left", padx=8)
@@ -820,31 +1071,56 @@ def main():
     # be done is refuse the impostor, so the resolver rebuilds the missing
     # corner from the three real ones instead of trusting four points one of
     # which is a lie -- and the only fact that separates them is blob size,
-    # which the sensor reports in its extended format.
+    # which the sensor leaves out of its basic report.
     lab(frame_wii, "ambient light (a window or a lamp in view) -- read the "
         "sizes before setting a window:",
-        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(6, 1))
+        (F[0], 9), C_DIM, anchor="w").pack(fill="x", pady=(4, 1))
     rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x", pady=1)
-    fx_ext = tk.IntVar(value=0)
-    def send_ext():
-        link.send("~cam=ext:%d" % fx_ext.get())
+    # Three report formats, not a switch: each one costs a longer read per
+    # frame, so the question is how much detail is worth the bus time and not
+    # whether sizes are on. Named for what the user gets rather than for the
+    # sensor's words -- "extended" and "full" are the datasheet's names for
+    # two read lengths, and neither of them says which one anybody wants.
+    cam_fmt = tk.IntVar(value=0)
+    def send_fmt():
+        n = cam_fmt.get()
+        # 'ext' for the two formats that predate full mode, 'fmt' only for
+        # full. Both firmware generations accept ext:0 and ext:1; the older
+        # one has never heard of 'fmt' and drops the whole key without a
+        # word, so a gun on it would sit at detail 0 for ever while the
+        # control insisted otherwise -- and every gate row under it is dead
+        # until sizes arrive. fmt:2 is the one thing only the new firmware
+        # can do, so it is the one thing worth asking for by that name.
+        link.send("~cam=%s:%d" % ("fmt" if n == 2 else "ext", n))
         link.send("~camblob?")
-        if fx_ext.get():
-            # The full reasoning goes in the log rather than on the panel: it
-            # is read once, and the panel has to stay short enough to fit.
-            log("blob sizes ON (resets on power-cycle). Aim at the screen and "
-                "read the sizes, then swing past the window and read them "
-                "again. If the two are DIFFERENT, set the size window to keep "
-                "the LEDs and drop the rest. If they are the SAME, no setting "
-                "here can separate them -- a curtain, an angle change or "
-                "moving the LED bar is the only real fix.")
-        else:
-            log("blob sizes off")
-    tk.Checkbutton(rowb, text="report blob sizes", variable=fx_ext,
-                   command=send_ext, font=F, bg=C_BG, fg=C_FG,
-                   selectcolor="#161b22", activebackground=C_BG,
-                   activeforeground=C_FG, highlightthickness=0
-                   ).pack(side="left")
+        if n == 0:
+            log("blob detail off -- the sensor reports position only, and the "
+                "size window and odd-one-out gate have nothing to judge")
+            return
+        # The full reasoning goes in the log rather than on the panel: it
+        # is read once, and the panel has to stay short enough to fit.
+        log("blob sizes ON (Save to gun keeps them; without a save they are "
+            "back off on the next power-cycle). Aim at the screen and read "
+            "the sizes, then swing past the window and read them again. If "
+            "the two are DIFFERENT, set the size window to keep the LEDs and "
+            "drop the rest. If they are the SAME, no setting here can "
+            "separate them -- a curtain, an angle change or moving the LED "
+            "bar is the only real fix.")
+        if n == 2:
+            log("full detail also reports each blob's bounding box and its "
+                "brightness. The box is in the sensor's own 128x96 pixels, "
+                "while the positions beside it are already normalised into "
+                "the gun's 240x176 pipeline space -- nearly two position "
+                "units to the box pixel -- so the box is a shape, not a "
+                "distance. If those numbers do not move with the LEDs, the "
+                "mode register below is the thing to try.")
+    lab(rowb, "blob detail", (F[0], 9), C_DIM).pack(side="left")
+    for fv, nm in ((0, "off"), (1, "sizes"), (2, "full detail")):
+        tk.Radiobutton(rowb, text=nm, value=fv, variable=cam_fmt,
+                       command=send_fmt, font=(F[0], 9), bg=C_BG, fg=C_FG,
+                       selectcolor="#161b22", activebackground=C_BG,
+                       activeforeground=C_FG, highlightthickness=0, bd=0
+                       ).pack(side="left")
     bgate = {}
     bspin = {}
 
@@ -868,6 +1144,38 @@ def main():
         sp.pack(side="left")
         sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
         bspin[key] = sp
+    # Which byte selects full mode is the one thing about it nobody can look
+    # up: the driver's own working constants for the other two formats are the
+    # doubled nibble (0x11, 0x33), which makes 0x55 the consistent choice,
+    # while the published tables say the mode is simply 5. Both readings can be
+    # right, so the switch is here rather than in a reflash -- a user who sees
+    # full detail come back as nonsense has something to try.
+    #
+    # On a row of its own, and it has to be: the detail radios above already
+    # need 500 px of the 585 this panel gets at the fixed 1020 px window
+    # width, and the label and two radios below need 228 more. The line this
+    # would have saved was taken off the headings instead.
+    rowfr = tk.Frame(frame_wii, bg=C_BG); rowfr.pack(fill="x", pady=1)
+    cam_fullreg = tk.IntVar(value=85)
+    def send_fullreg():
+        v = cam_fullreg.get()
+        link.send("~cam=fullreg:%d" % v)
+        link.send("~camblob?")
+        log("full-mode register -> 0x%02x. Which byte this sensor wants for "
+            "full mode is not documented anywhere we trust, so it is a "
+            "setting rather than a reflash: if 'full detail' reports boxes "
+            "and brightness that do not follow the LEDs, the other value is "
+            "the thing to try. Not saved -- 0x55 comes back on the next "
+            "power-cycle." % v)
+    lab(rowfr, "full-mode register", (F[0], 9), C_DIM).pack(side="left")
+    for rv, nm in ((85, "0x55"), (5, "0x05")):
+        tk.Radiobutton(rowfr, text=nm, value=rv, variable=cam_fullreg,
+                       command=send_fullreg, font=(F[0], 9), bg=C_BG, fg=C_FG,
+                       selectcolor="#161b22", activebackground=C_BG,
+                       activeforeground=C_FG, highlightthickness=0, bd=0
+                       ).pack(side="left")
+    lab(rowfr, "'full detail' only -- flip if it reads as nonsense",
+        (F[0], 8), C_DIM).pack(side="left", padx=(6, 0))
     # wraplength, not hope: these two lines carry live numbers whose length is
     # not known in advance, and a label that overflows this tab is CLIPPED with
     # no sign that anything is missing.
@@ -891,13 +1199,13 @@ def main():
         sp.bind("<Return>", lambda _e, k=key, v=gv: gate_send(k, v))
         bspin[key] = sp
 
-    blob_lbl = lab(frame_wii, "blob readout: tick 'report blob sizes' to fill "
-                   "this line",
+    blob_lbl = lab(frame_wii, "blob readout: set blob detail to 'sizes' to "
+                   "fill this line",
                    (F[0], 8), C_DIM, justify="left", anchor="w", wraplength=560)
-    blob_lbl.pack(fill="x", pady=(2, 0))
+    blob_lbl.pack(fill="x", pady=(1, 0))
     blob_lbl2 = lab(frame_wii, "", (F[0], 8), C_DIM, justify="left", anchor="w",
                     wraplength=560)
-    blob_lbl2.pack(fill="x", pady=(0, 4))
+    blob_lbl2.pack(fill="x", pady=(0, 2))
     # Wrap to the width this panel ACTUALLY has, measured, not guessed. These
     # lines carry live numbers of unpredictable length, and a Tk label that
     # overruns its frame is clipped silently -- the reader simply never sees
@@ -910,14 +1218,113 @@ def main():
                 lb.config(wraplength=w)
     frame_wii.bind("<Configure>", wrap_blob)
 
-    barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=4)
+    # No padding under the last row: the tab page adds its own inset, and this
+    # is the row that gets squeezed to nothing when the panel overruns.
+    barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=(2, 0))
     tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
                                      log("~camsave sent -- the gun answers "
                                          "with a CAM: saved / SAVE FAILED line "
                                          "listing what it wrote")),
-              font=FB, bg="#238636", fg="white", relief="flat", padx=14, pady=6).pack(side="left")
+              font=FB, bg="#238636", fg="white", relief="flat", padx=14, pady=3).pack(side="left")
     tk.Button(barw, text="Read from gun", command=lambda: link.send("~cam?"),
-              font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=6).pack(side="left", padx=8)
+              font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=3).pack(side="left", padx=8)
+
+    # ---- shape learning ----------------------------------------------------
+    # What a confirmed LED actually looks like on this rig, measured instead of
+    # guessed: the gun accumulates six per-blob features in two classes, and
+    # the label comes from the quad resolver rather than from any gate, so
+    # nothing here is a gate being taught by its own decisions.
+    #
+    # On THIS bar, and not on a row of its own, because there is no room for a
+    # row: measured at 768 px of screen, the wiicam panel asks for 278 px of a
+    # tab area that stops growing at 313, and a button row costs 29 of the 35
+    # that leaves -- which would put the panel back inside the margin the
+    # render test guards. The bar had 297 px of unused width, so the pair goes
+    # at its right-hand end where it reads as its own group. Everything these
+    # two have to explain goes to the log, which is where this panel already
+    # sends the reasoning that will not fit beside a control.
+    learn_state = {"on": False}
+
+    def learn_label():
+        return "Stop learning" if learn_state["on"] else "Learn LED shape"
+
+    def learn_toggle():
+        on = not learn_state["on"]
+        learn_state["on"] = on
+        link.send("~camlearn=on:%d" % (1 if on else 0))
+        # Ask straight back, so the button and the counts follow the GUN's
+        # answer within a tick instead of this app's memory of the click.
+        link.send("~camlearn?")
+        btn_learn.config(text=learn_label())
+        if not on:
+            log("shape capture stopped. Press 'Shape CSV' to write the "
+                "histograms out -- starting another capture CLEARS them.")
+            return
+        log("shape capture ON, starting from empty. It counts only blobs from "
+            "frames where the resolver found all four corners, so aim at the "
+            "bar from where you actually play and let it run; then press "
+            "'Shape CSV'.")
+        if cam_fmt.get() != 2:
+            # Last, so it is the line still visible in a six-line log box.
+            log("WARNING: blob detail is not 'full detail', so the only "
+                "histogram that will fill is blob SIZE -- and size is the one "
+                "feature already known NOT to separate a window from an LED. "
+                "Set 'full detail' above and start the capture again.")
+
+    def shape_write(hs):
+        outdir = os.path.join(HERE, "calib_out")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            path = os.path.join(outdir,
+                                time.strftime("shape-%Y%m%d-%H%M%S.csv"))
+            n = write_shape_csv(path, hs)
+        except Exception as e:
+            log("could not write the shape CSV: %s" % e)
+            return
+        frames, led, rej = hs.counts()
+        log("wrote %d rows to %s -- %d confirmed frames, %d LED blobs, %d "
+            "rejected blobs" % (n, path, frames, led, rej))
+        if not led:
+            log("...and every bin in it is empty: no confirmed LED blobs were "
+                "measured. Either the capture was never on, or the resolver "
+                "never saw four corners while it was.")
+        elif hs.total(0, "aspect") == 0:
+            log("...but only the SIZE histogram has anything in it: the box, "
+                "aspect, area and brightness features need 'full detail', "
+                "which this capture did not run in.")
+
+    def shape_save():
+        # Ask, then WAIT for a set the gun sent AFTER the asking. Writing
+        # whatever is held would happily produce a file from a capture that
+        # ended ten minutes ago, and the file gives no hint of its own age.
+        seq0 = link.hists.seq
+        link.send("~camlearn?")
+        deadline = time.monotonic() + 2.0
+
+        def check():
+            hs = link.hists
+            if hs.seq != seq0 and hs.ready():
+                shape_write(hs)
+                return
+            if time.monotonic() > deadline:
+                log("no complete set of histograms came back in 2 s -- "
+                    "nothing written. A gun on older firmware does not have "
+                    "'~camlearn' at all and answers nothing.")
+                return
+            root.after(100, check)
+        root.after(100, check)
+
+    tk.Button(barw, text="Shape CSV", command=shape_save, font=F,
+              bg="#161b22", fg=C_FG, relief="flat", padx=12,
+              pady=3).pack(side="right")
+    # A fixed width in characters, so the label swapping between "Learn LED
+    # shape" and "Stop learning" cannot change how wide this row is: the panel
+    # is 585 px and its widest row already needs 571, and a row that grows past
+    # the panel runs off the right-hand edge with nothing to say so.
+    btn_learn = tk.Button(barw, text=learn_label(), command=learn_toggle,
+                          font=F, width=15, bg="#161b22", fg=C_FG,
+                          relief="flat", padx=6, pady=3)
+    btn_learn.pack(side="right", padx=(0, 8))
 
     sliders = {}
     for k in CAM_KEYS:
@@ -1476,21 +1883,53 @@ def main():
                     continue            # mid-edit, not a number yet
                 if cur != v:
                     gv.set(v)
-            e = link.last.get("ext")
-            if e is not None and fx_ext.get() != e:
-                fx_ext.set(e)
+            # fmt is what the gun holds; ext is the same answer from a gun on
+            # older firmware, which knows only "sizes on" and never sends fmt
+            # at all. Falling back keeps the control showing the truth on such
+            # a gun instead of insisting the detail is off while sizes arrive.
+            e = link.last.get("fmt", link.last.get("ext"))
+            if e is not None and cam_fmt.get() != e:
+                cam_fmt.set(e)
+            fr = link.last.get("fullreg")
+            # Only the two the gun accepts: anything else came from a build
+            # that means something different by the key, and snapping the
+            # control to it would claim a setting the radio cannot even send.
+            if fr in (85, 5) and cam_fullreg.get() != fr:
+                cam_fullreg.set(fr)
+            # The gun's own word on the shape capture beats this app's memory
+            # of the last click: '~camreset' stops a capture from anywhere,
+            # including from pical on the same gun, and a button still reading
+            # "Stop learning" is a claim that something is recording when
+            # nothing is. Only ever read off a WHOLE reply, so a set that
+            # arrived half way through cannot flip it.
+            if link.hists.ready() and link.hists.running() != learn_state["on"]:
+                learn_state["on"] = link.hists.running()
+                btn_learn.config(text=learn_label())
             raw = getattr(link, "blobs", "")
             if raw:
+                # The gun appends this trailer in basic mode, where every size
+                # comes back as the placeholder -1. Dropped on the floor, the
+                # line read as four blobs genuinely measured at size -1 and
+                # the gates under it looked broken rather than simply unfed.
+                # pical already surfaces it; this panel did not.
+                unfed = "(sizes need fmt:1)" in raw
                 shown = []
-                for tok in raw.replace("CAM: blobs", "").split():
-                    f = tok.split(",")
-                    if len(f) == 4:
-                        shown.append("%s,%s size %s%s"
-                                     % (f[0], f[1], f[2],
-                                        "" if f[3] == "1" else " DROPPED"))
+                for b in parse_blobs(raw):
+                    # Box and brightness only exist in full mode, so they are
+                    # shown only when the gun actually sent them -- a "box 0x0"
+                    # printed in extended mode reads as a measured shape.
+                    txt = "%d,%d size %d" % (b[0], b[1], b[2])
+                    if len(b) == 7:
+                        txt += " box %dx%d bright %d" % (b[4], b[5], b[6])
+                    if b[3] != 1:
+                        txt += " DROPPED"
+                    shown.append(txt)
                 blob_lbl.config(
-                    text=("blobs now: " + "   ".join(shown)) if shown
-                    else "blobs now: none -- the sensor sees nothing at all",
+                    text=(("blobs now: " + "   ".join(shown)) if shown
+                          else "blobs now: none -- the sensor sees nothing "
+                               "at all")
+                    + ("   (size -1: nothing measured it -- set blob detail "
+                       "to 'sizes')" if unfed else ""),
                     fg=C_FG if shown else C_BAD)
             keys = ("br4", "br3", "br2", "br1", "br0")
             now = [link.last.get(k) for k in keys]
@@ -1511,8 +1950,12 @@ def main():
                     # The drop counters are since-boot too; spliced raw into
                     # a sentence about "the last N frames" they made a window
                     # that had been fixed still read as dropping thousands.
+                    # bvalve is one of them and was missed: read raw, a single
+                    # give-back at any point in the power cycle left "SIZE
+                    # WINDOW TOO TIGHT" on the panel for good, long after the
+                    # user had widened the window it was complaining about.
                     d_rej = []
-                    for k in ("brej", "brrej"):
+                    for k in ("brej", "brrej", "bvalve"):
                         cur = link.last.get(k, 0)
                         prev = blob_state["ref"].get(k, cur)
                         d_rej.append(max(0, cur - prev))
@@ -1531,7 +1974,7 @@ def main():
                            if hz else "measuring camera rate...",
                            d_rej[0], d_rej[1])
                         + ("   SIZE WINDOW TOO TIGHT: it would drop nearly "
-                           "every blob" if link.last.get("bvalve") else ""))
+                           "every blob" if d_rej[2] else ""))
                 if blob_state["line"]:
                     blob_lbl2.config(
                         text=blob_state["line"],
