@@ -289,6 +289,7 @@ bool aim_dead_load(int* out_units)
 // which would silently switch the size window off on a gun that had one.
 #define AIM_NVS_GATE "gate0"
 #define AIM_NVS_GATE2 "gate1"
+#define AIM_NVS_FIT  "fit0"
 #define AIM_GATE_TAG 0x6A000000u
 
 bool aim_gate_store(int fmt, int bmin, int bmax, int rtol)
@@ -408,6 +409,71 @@ bool aim_gate2_clear(void)
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
     const esp_err_t e = nvs_erase_key(h, AIM_NVS_GATE2);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    return true;
+#endif
+}
+
+// ---- provenance ------------------------------------------------------------
+// The two numbers the shape ceiling was derived from. Deliberately in their own
+// key: a gun whose flash predates this build has no 'fit0', and the load has to
+// report that plainly rather than hand back a pair of zeroes that would read as
+// "LEDs measured 0 tall, stray starts at 0" -- a rig on which no gate could
+// ever work. Its own key also means a bad write here can never cost the gate
+// itself, which is the setting that actually matters.
+bool aim_fit_store(int led_max_h, int stray_min_h, int led_max_px)
+{
+    if (led_max_h < 0)    led_max_h = 0;
+    if (led_max_h > 63)   led_max_h = 63;
+    if (stray_min_h < 0)  stray_min_h = 0;
+    if (stray_min_h > 63) stray_min_h = 63;
+    if (led_max_px < 0)   led_max_px = 0;
+    if (led_max_px > 63)  led_max_px = 63;
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)led_max_px << 12)
+                     | ((uint32_t)led_max_h << 6) | (uint32_t)stray_min_h;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_u32(h, AIM_NVS_FIT, v) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)v; return true;
+#endif
+}
+
+bool aim_fit_load(int* out_led_max_h, int* out_stray_min_h, int* out_led_max_px)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_led_max_h || !out_stray_min_h || !out_led_max_px) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint32_t v = 0;
+    const esp_err_t e = nvs_get_u32(h, AIM_NVS_FIT, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
+    *out_led_max_h   = (int)((v >> 6) & 0x3F);
+    *out_stray_min_h = (int)(v & 0x3F);
+    *out_led_max_px  = (int)((v >> 12) & 0x3F);
+    return true;
+#else
+    (void)out_led_max_h; (void)out_stray_min_h; (void)out_led_max_px;
+    return false;
+#endif
+}
+
+bool aim_fit_clear(void)
+{
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t e = nvs_erase_key(h, AIM_NVS_FIT);
     const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
     if (ok) nvs_commit(h);
     nvs_close(h);

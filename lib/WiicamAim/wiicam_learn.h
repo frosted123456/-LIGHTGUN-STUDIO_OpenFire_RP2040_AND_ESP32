@@ -13,28 +13,31 @@
 // from where they sit, not from what they look like. Nothing downstream of the
 // size gate votes on what the size gate is taught.
 //
-// The negative class is labelled by geometry too, and it took a second attempt
+// The negative class is labelled by geometry too, and it took three attempts
 // to get there. "A blob the gate rejected" is the obvious answer and it cannot
-// produce a single sample on this sensor: there are four object slots, only
-// KEPT blobs reach the resolver, so a rejection leaves three points and the
-// frame can never be confirmed. The positive class would have filled while the
-// negative one stayed structurally empty -- and the module would have looked
-// like it was working.
+// produce a single sample on a gun as shipped: every gate defaults to off, so
+// nothing is ever rejected, and the negative class stays structurally empty
+// on exactly the gun that most needs a verdict. Nor is a rejection what a
+// window looks like on this sensor -- with four object slots a bright window
+// DISPLACES an LED, and arrives as an ordinary kept blob.
 //
-// So a negative comes from a frame with three real corners and a reconstructed
-// fourth, where exactly one blob was rejected. The reconstruction says where
-// the missing LED must be, and a rejected blob sitting nowhere near ANY corner
-// was not an LED whatever its size. That is still a positional verdict the
-// size gate had no vote in.
+// So a negative comes from a frame the resolver has LOCKED with three real
+// corners and a reconstructed fourth, where exactly one blob -- kept or not
+// -- sits farther than twice the association radius from every corner. The
+// reconstruction says where the missing LED must be, and a blob nowhere near
+// ANY corner was not an LED whatever its size. That is a positional verdict
+// no size or shape gate had a vote in.
 //
 // Having both classes is the whole point: one distribution tells you what an
 // LED looks like, two tell you whether an LED and a window can be told apart
 // at all. If they overlap, no gate can separate them and the honest answer is
 // to say so rather than tune in the dark.
 //
-// This module MEASURES. It does not gate, it does not persist, and nothing in
-// the aim path reads it. That is deliberate: the features worth gating on are
-// the ones the data picks, and the data does not exist yet.
+// This module MEASURES; it does not gate. What reads it: '~camfit' turns the
+// two edges into a ceiling (wiicam_aim.cpp), the bhmax/pxmax setters use the
+// LED edge as a refusal floor, and camsave / camfit=apply persist that edge in
+// the 'fit0' key (aim_runtime.h) so the floor survives a power cycle. Nothing
+// in the per-frame aim path reads it.
 #pragma once
 #include <stdint.h>
 
@@ -42,7 +45,7 @@
 extern "C" {
 #endif
 
-#define WL_CLASSES 2      // 0 = resolver-confirmed LED, 1 = gate-rejected blob
+#define WL_CLASSES 2      // 0 = resolver-confirmed LED, 1 = resolver-placed stray
 #define WL_NFEAT   6
 #define WL_BINS    32
 
@@ -96,6 +99,47 @@ void     wl_note_frame(void);      // one frame contributed to the positive clas
 // Feature names, for the report and the tools. Index with the enum above;
 // out of range returns "?".
 const char* wl_feat_name(int feat);
+
+// ---- the envelope -----------------------------------------------------------
+// What the two distributions say at their edges, which is all a ceiling needs.
+// Read from the histograms rather than tracked separately so there is one
+// source of truth.
+//
+// The LED HEIGHT edge is the top of the CONTIGUOUS body of the distribution --
+// the connected run of bins holding the most samples -- not the absolute
+// highest occupied bin. The reason
+// is in the data: a daylight capture with no gate came back with LED heights
+// 2..7 and then, after twenty-three empty bins, 32 samples at 31 -- the sun,
+// learned as an LED. The resolver's lock is self-consistency, not geometry: at
+// a cold start it seeds on whichever four blobs it sees and learns that shape,
+// so sun-plus-three-LEDs locks like anything else until the player moves and
+// the parallax breaks it. Those frames are honest "locked, four real corners"
+// and there is no flag to exclude them by. What they cannot do is CONNECT to
+// the LED body -- a point source and a window are a dozen bins apart -- and
+// that is the only signature the sink can act on.
+//
+// It matters because this edge is also the refusal FLOOR under bhmax. Read as
+// the absolute max, that capture would have set the floor at 31 and refused
+// the bhmax of 8 that was measured to catch 84% of strays at zero LED cost:
+// the lamp learned as an LED is then what refuses the cut that would have
+// caught it. Read as the body, the floor is 7 and 8 is accepted.
+//
+// Only HEIGHT gets this treatment. Area is a product (w*h) and has arithmetic
+// holes -- no blob has area 13 -- so a contiguity walk on it stops at the
+// first prime and reports a floor far below the real LEDs, which is the
+// dangerous direction. The stray edge stays an absolute MIN: an outlier there
+// can only shrink the gap, which refuses a gate rather than loosening it.
+typedef struct {
+    int led_max_h;      // top of the LED height body; -1 if nothing measured
+    int led_max_px;     // absolute largest LED box area; -1 if none
+    int stray_min_h;    // shortest confirmed stray box; -1 if none measured
+    int stray_min_px;
+    int led_abs_max_h;  // absolute highest LED-height bin, for the report
+    unsigned long led_outliers_h;   // LED samples ABOVE the body: contamination
+    unsigned long led_n, stray_n;
+} wl_envelope_t;
+
+void wl_envelope(wl_envelope_t* out);
 
 #ifdef __cplusplus
 }

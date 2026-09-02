@@ -16,7 +16,12 @@
 static uint16_t s_hist[WL_CLASSES][WL_NFEAT][WL_BINS];
 static uint32_t s_blobs[WL_CLASSES];
 static uint32_t s_frames;
-static uint8_t  s_on;
+// volatile: read by wl_note() on the aim core, written by the serial core.
+// Without it the store-clear-restore in wl_reset() is two writes with no read
+// between them in this translation unit, which the compiler is entitled to
+// collapse into one -- and the guard it exists to provide would silently not
+// be there.
+static volatile uint8_t s_on;
 
 static const char* const s_names[WL_NFEAT] = {
     "sz", "bw", "bh", "aspect", "area", "irel"
@@ -29,9 +34,20 @@ const char* wl_feat_name(int feat)
 
 void wl_reset(void)
 {
+    // Off around the clear. wl_note() runs on the other core and checks s_on
+    // first, so dropping it here means at most one in-flight increment lands
+    // in a bin the memset is about to zero, rather than one landing AFTER it
+    // and surviving the reset as a phantom sample. On the LED side a phantom
+    // is an outlier the body walk sets aside; on the STRAY side it is an
+    // absolute minimum, and one surviving low sample shrinks the gap for the
+    // whole of the next capture -- a silently tighter ceiling, or a refusal,
+    // from a blob that was cleared. Two lines against that is cheap.
+    const uint8_t was = s_on;
+    s_on = 0;
     memset(s_hist, 0, sizeof(s_hist));
     memset(s_blobs, 0, sizeof(s_blobs));
     s_frames = 0;
+    s_on = was;
 }
 
 void wl_enable(int on)
@@ -78,6 +94,74 @@ static void bump(int cls, int feat, int bin)
     if (bin >= WL_BINS) bin = WL_BINS - 1;
     uint16_t* h = &s_hist[cls][feat][bin];
     if (*h != 0xFFFFu) ++*h;
+}
+
+// The highest / lowest bin that actually holds anything. WL_BINS - 1 is a
+// clamp bucket, so a value there means "at least this", which is the honest
+// reading for a ceiling and the conservative one for a floor.
+static int top_bin(int cls, int feat)
+{
+    const uint16_t* h = s_hist[cls][feat];
+    for (int i = WL_BINS - 1; i >= 0; --i) if (h[i]) return i;
+    return -1;
+}
+static int bot_bin(int cls, int feat)
+{
+    const uint16_t* h = s_hist[cls][feat];
+    for (int i = 0; i < WL_BINS; ++i) if (h[i]) return i;
+    return -1;
+}
+
+// The top of the HEAVIEST contiguous run -- the connected group of bins that
+// holds the most samples -- with everything above it counted as outliers. See
+// the header for why: the sun, learned as an LED during a cold-start lock,
+// sits a dozen empty bins above the real LEDs, and the absolute max would hand
+// it the floor.
+//
+// Heaviest run, not the run containing the tallest single bin. The first cut
+// of this walked up from the mode, and that inverts on a short capture: LEDs
+// at 2..7 with ten samples a bin against thirty-two at 31 makes bin 31 the
+// mode, so the walk STARTED in the contamination, reported it as the body,
+// counted zero outliers, and printed no warning -- worse than the absolute max
+// it replaced, because it claimed to have handled the very thing it had just
+// let through. Sixty samples of LED against thirty-two of sun is still mostly
+// LED, and mass is what says so. The answer flips only when the capture holds
+// more sun than LED, at which point nothing derived from it could be trusted
+// and camfit's 500-sample gate is the thing standing in the way.
+static int body_top(int cls, int feat, unsigned long* above)
+{
+    const uint16_t* h = s_hist[cls][feat];
+    if (above) *above = 0;
+    int best_top = -1;
+    unsigned long best_mass = 0;
+    for (int i = 0; i < WL_BINS; ) {
+        if (!h[i]) { ++i; continue; }
+        unsigned long mass = 0;
+        int j = i;
+        while (j < WL_BINS && h[j]) { mass += h[j]; ++j; }
+        // Strictly heavier wins, so equal mass keeps the LOWER run: on a tie
+        // the safe reading is the shorter body, since the floor built on it
+        // refuses less and the ceiling built on it is tighter -- and a tie
+        // between LEDs and sun is a capture nobody should derive from anyway.
+        if (mass > best_mass) { best_mass = mass; best_top = j - 1; }
+        i = j;
+    }
+    if (best_top < 0) return -1;
+    if (above)
+        for (int j = best_top + 1; j < WL_BINS; ++j) *above += h[j];
+    return best_top;
+}
+
+void wl_envelope(wl_envelope_t* out)
+{
+    if (!out) return;
+    out->led_max_h     = body_top(0, WL_BH, &out->led_outliers_h);
+    out->led_abs_max_h = top_bin(0, WL_BH);
+    out->led_max_px    = top_bin(0, WL_AREA);
+    out->stray_min_h   = bot_bin(1, WL_BH);
+    out->stray_min_px  = bot_bin(1, WL_AREA);
+    out->led_n         = s_blobs[0];
+    out->stray_n       = s_blobs[1];
 }
 
 void wl_note(int cls, int sz, int bw, int bh, int intens, int imed, int flags)

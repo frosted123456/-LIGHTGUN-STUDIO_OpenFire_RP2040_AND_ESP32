@@ -5,6 +5,8 @@ runs the Studio steps that do not need Windows, from the TV itself:
 
 Everything from **step 2 of the main README's setup section** onwards is here.
 Only step 1 is missing, and only because the app it needs runs on Windows.
+Step 4b is pical's own: it is offered at the end of a calibration, it is
+skippable with one press, and skipping it leaves the calibration finished.
 
 | Step | In pical | Notes |
 |---|---|---|
@@ -12,6 +14,7 @@ Only step 1 is missing, and only because the app it needs runs on Windows.
 | 2 camera tuning | yes | sliders and auto-tune, or the wiicam's sensitivity |
 | 3 lens / FOV | yes | preset, 20 s measured sweep, dead-band |
 | 4 aim calibration | yes | five dots at two or three distances |
+| 4b room light sweep | yes | optional, ~15 s: measures your LEDs against the room so the gun can gate out a lamp |
 | 5 fine tune | yes | iron sights, then smoothing, then lead |
 | 6 verify | yes | nine shots, pipeline error vs the OS cursor |
 

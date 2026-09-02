@@ -112,6 +112,26 @@ bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax);
 bool aim_gate2_store(int pxmax, int armax, int bhmax);
 bool aim_gate2_clear(void);
 
+// What THIS rig's LEDs have measured as, in a third key. Not a setting --
+// nothing reads it to gate anything. led_max_h / led_max_px are the tallest
+// and largest box a resolver-confirmed LED has ever produced on this gun, and
+// they serve as the refusal floor under bhmax / pxmax after a power cycle:
+// written by camfit=apply, and RAISED (never lowered) by camsave once a
+// capture holds 500 LED blobs. stray_min_h is the stray edge the last
+// camfit=apply derived its ceiling from, so "why is bhmax 8?" has an answer a
+// year later; it is 0 when no camfit has ever applied on this gun, since no
+// stray is one pixel tall and the tools read 0 as "not recorded". Bin
+// indices, 0..31; absent key means nothing has been measured.
+//
+// The LED pixel-count edge rides along for one reason: it is the floor under
+// 'pxmax', and without a stored copy a thin live capture is the ONLY thing that
+// floor can consult. A handful of small blobs from a dim room would then read
+// as "this rig's LEDs are tiny" and let a user set a ceiling that blinds the
+// gun at play distance, with the real, larger measurement sitting unused.
+bool aim_fit_load(int* out_led_max_h, int* out_stray_min_h, int* out_led_max_px);
+bool aim_fit_store(int led_max_h, int stray_min_h, int led_max_px);
+bool aim_fit_clear(void);
+
 // The capture layer owns the lead value and how much of the quad was really
 // seen; mode 1 needs both, so it reports them here. conf is the fraction of
 // corners MEASURED this frame (n_real/4), not the resolver's miss-damped

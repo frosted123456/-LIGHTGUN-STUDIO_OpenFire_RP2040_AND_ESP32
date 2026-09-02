@@ -40,7 +40,23 @@ from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
 #      -- parse_blobs only ever accepted 4 and 7 -- so a pical beside one
 #      shows "no blobs" on a gun that is sending four of them, which reads as
 #      a dead sensor rather than as a version skew.
-LINK_API = 8
+#   9  '~camfit', the only defensible source of a non-zero gate: the verdict
+#      lines are parsed HERE into Link.fit. They are also kept OUT of the
+#      key/value store on purpose -- the verdict says "bhmax=11" about a
+#      number the gun has NOT set, and an older tools/ reads that token as
+#      the live setting, snaps the spinbox to it and sends it back on the
+#      next click. A front end beside an older tools/ therefore shows no fit
+#      at all AND mis-reports the gate, which is why this one is a version.
+#  10  the INERT lines, and the third field of the stored fit. A gate that is
+#      SET and cannot act is the one state 'cam?' cannot show -- it reports
+#      bhmax and fmt separately and never puts them together -- and the gun
+#      now says so at the moment it happens, naming the format it is really
+#      in as 'fmt:N' with a COLON, which the key/value sweep cannot see. It is
+#      read in pump() and written into last["fmt"], so every front end's idea
+#      of the format is corrected by the gun rather than by its own last
+#      click. A front end beside an older tools/ goes on showing a gate as
+#      working while the gun is telling it otherwise.
+LINK_API = 10
 
 SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
 # Board-scaled noise gates: the wiicam's 33-deg lens has ~2.2x less screen
@@ -210,6 +226,63 @@ NATIVE_W, NATIVE_H = 128.0, 96.0
 # lopsided, it is the box fields not being in this array at all, and the whole
 # shape analysis would then be built on a unit nobody has checked.
 SHAPE_OFF_MAX = 3.0
+# The format the GUN says it is really in, out of either INERT line. Both name
+# it with a colon rather than an '=', so the key/value sweep in pump() is blind
+# to it. Anchored on "is in" and not on the last 'fmt:' of the line: the fit
+# form ends with "set fmt:2 for it to act", which is advice about where to go
+# and not a reading of where the gun is.
+_INERT_FMT_RE = re.compile(r"is in fmt:(\d+)")
+# When the shape gate counts as "refusing heavily", in blobs refused per camera
+# FRAME over the window the readout measures.
+#
+# What is counted is the UNEXPLAINED part: rejections minus the ones the
+# resolver vouched for. The first version counted raw rejections at one per
+# frame, reasoning that the resolver can name only one stray a frame so one
+# rejection a frame is where honest work ends. The log said otherwise: a 92 s
+# daylight session with bhmax:8 held four straight seconds at EXACTLY 1.00
+# rejected per frame, br4 zero, br3 every frame, bnear zero throughout. That
+# is the sun holding one of the four slots, the gate refusing it every frame,
+# the gun running on three real corners and a reconstructed fourth -- the gate
+# doing its job in the very scene it exists for, and a raw threshold of one
+# per frame fired for the whole stretch.
+#
+# What separates that from a gate eating the bar is already on the wire. Both
+# vouching counters are SHAPE-GATE rejections and nothing else -- the gun
+# narrowed them: bfar is a blob the shape gate dropped that also sat far from
+# every corner (a stray, vouched for), bnear one the shape gate dropped that
+# sat where the missing LED had to be (almost certainly a real corner). They
+# count on every frame, capture on or off. That matters for the subtraction:
+# while bfar counted every far blob it held kept strays too, and one kept
+# stray a frame cancelled the threshold and masked a gate eating a real LED,
+# and a bnear that could come from the size window sent the reader to switch
+# off a height gate that was not the one doing it. Narrowed, bsrej minus the
+# two is exactly "shape rejections the resolver could not account for".
+#
+# That session climbed bsrej by 829 and bfar by 730: 88% vouched for. A gate
+# set for a different bar refuses three or four LEDs a frame, the resolver
+# then has too few points to lock, and nothing gets vouched for at all -- bfar
+# and bnear stay flat while bsrej runs away. So the measure is rejections
+# minus what the resolver accounted for, and one of THOSE per frame is
+# unambiguous: a whole slot, every frame, that nobody can say was stray light.
+#
+# pical warns off the same number under the same name, and that is the point of
+# the name: this was 0.25 per frame here and 2.0 there, an eight-fold
+# disagreement about one measurement, so a gate refusing a third of every blob
+# the camera saw warned in Studio and stayed silent in pical on the same gun in
+# the same room. One number, one measurement, and a divergence now shows up as
+# two different figures in two files that read the same.
+#
+# A RATE and not a total, because bsrej counts since boot: the last warning
+# driven off one of these raw never came off the screen again.
+GATE_HEAVY_PER_FRAME = 1.0
+# How old the last NEW FRAME may be before the gate warnings stop claiming
+# anything. They are computed when a window of frames closes and they describe
+# what is happening now, so on a gun that has stopped answering -- unplugged,
+# camera dead, port handed to another app -- the last verdict has to go quiet
+# rather than sit there being read as current. Without this the warning stayed
+# up for as long as nothing arrived, which is the same latch this panel has
+# already shipped twice: bvalve read raw, and a delta that never expired.
+GATE_WARN_STALE_S = 8.0
 
 
 def blob_shape(b):
@@ -566,6 +639,194 @@ def write_shape_csv(path, hs):
 
 
 # ---------------------------------------------------------------------------
+# the measured gate: what '~camfit' answered
+# ---------------------------------------------------------------------------
+# The gun turns the two distributions it has been accumulating -- how tall its
+# OWN LEDs come out, and how tall the stray light in the room does -- into a
+# ceiling, or says out loud that this rig has none. It is the only defensible
+# source of a non-zero bhmax: every figure that used to be printed beside the
+# control was measured on one bar with two LEDs per corner, and a bar with five
+# LEDs per cluster makes blobs several times larger, so a borrowed ceiling
+# blinds that gun and leaves its owner nothing on screen to explain why it
+# stopped working.
+#
+# The targets are the firmware's own and are stated in its own sentences, so
+# they are read off the wire when they are there and only fall back to these:
+# a build that wants more data than this would otherwise be reported as
+# "600 of 500", which is not a progress figure, it is a bug on screen.
+FIT_LED_WANT, FIT_STRAY_WANT = 500, 20
+
+
+class CamFit:
+    """The '~camfit' reply, held as an answer rather than as lines of log.
+
+    Several lines, and ANY of them can be absent: three of the four outcomes
+    are a single sentence, the stored-provenance line only appears when the
+    gun has one, the 'applied' line only follows '=apply', and a gun on older
+    firmware answers nothing at all. So every field starts as None and stays
+    that way until the gun says otherwise -- a front end asks this object and
+    gets "not measured", never a zero that reads like a measurement of zero.
+
+    `seq` counts ANSWERS, bumped on the header line that always comes first.
+    A caller that has just asked can tell a fresh reply from the one that was
+    already held, which is the only way to tell an old gun's silence from an
+    answer that has not arrived yet."""
+
+    def __init__(self):
+        self.seq = 0
+        self.reset()
+
+    def reset(self):
+        """Forget the answer, keeping seq -- used on the header line and on a
+        reconnect. A fit belongs to the gun, the bar and the room it was
+        measured in, and a reconnect may be onto a different gun entirely."""
+        self.led_n = self.stray_n = None      # blobs counted, each class
+        self.led_max_h = self.stray_min_h = None   # rows; <0 = not measured
+        self.led_want, self.stray_want = FIT_LED_WANT, FIT_STRAY_WANT
+        # (led_max_h, stray_min_h, led_max_px) from an earlier capture on
+        # this gun, and any of the three may be None: the pixel figure is the
+        # newest field and an older gun sends the pair without it.
+        self.stored = None
+        # "" | "need_led" | "need_stray" | "no_gate" | "ok"
+        self.verdict = ""
+        self.bhmax = None       # the number, and ONLY on a real verdict
+        self.tight = False      # one row between the LEDs and the stray light
+        self.applied = None     # True saved, False save failed, None neither
+        # (samples, how tall they reached, where the rest stop) for LED
+        # samples the gun set aside as contamination -- the sun or a window
+        # learned into the LED class while the resolver was locking on it.
+        # Held because it is the difference between a ceiling of 7 that means
+        # something and one that was measured with a 31-tall blob in the
+        # class: the number is the same either way and the trust in it is not.
+        self.ignored = None
+        # The gun changed format for the gate on the way past. It applies in
+        # full mode and persists full mode, so this is a thing that HAPPENED
+        # rather than an instruction, and the panel's own format control has
+        # to follow it.
+        self.switched = False
+
+    def _num(self, rest, after, before):
+        """The integer between two phrases of the gun's own sentence, or None.
+
+        The counts are in the header as well, but the TARGETS are only in
+        these sentences -- and a target this file pinned instead of read
+        would go on saying 500 through a firmware that wanted a thousand."""
+        i = rest.find(after)
+        if i < 0:
+            return None
+        j = rest.find(before, i + len(after))
+        if j < 0:
+            return None
+        try:
+            return int(rest[i + len(after):j].strip())
+        except ValueError:
+            return None
+
+    def feed(self, line):
+        """Take one 'CAM: fit' line. True if it was ours.
+
+        Nothing here raises on a line it does not recognise: a firmware that
+        adds a sentence must leave the held answer alone rather than clearing
+        it, so an unknown line is simply claimed and dropped."""
+        if not line.startswith("CAM: fit"):
+            return False
+        rest = line[8:].strip()
+        if rest.startswith("ledn="):
+            # The header, which both '?' and '=apply' send first: a NEW answer
+            # starts here and everything held from the last one goes. Kept, a
+            # verdict from the previous ask would sit under this ask's counts
+            # and read as this rig's current state.
+            self.reset()
+            self.seq += 1
+            for tok in rest.split():
+                k, sep, v = tok.partition("=")
+                if not sep:
+                    continue
+                try:
+                    n = int(v)
+                except ValueError:
+                    continue
+                if k == "ledn":
+                    self.led_n = n
+                elif k == "ledmaxh":
+                    self.led_max_h = n
+                elif k == "straym":
+                    self.stray_n = n
+                elif k == "strayminh":
+                    self.stray_min_h = n
+            return True
+        if "LED samples ignored" in rest:
+            # 'CAM: fit 32 LED samples ignored -- they reach 31 tall, far
+            # above the 7 the rest stop at, ...'. It begins with a NUMBER, so
+            # it matches none of the prefixes below and fell through both this
+            # parser and the panel: the one line that says the capture had
+            # stray light in its LED class was the one line nothing read.
+            try:
+                n = int(rest.split()[0])
+            except (ValueError, IndexError):
+                return True
+            self.ignored = (n, self._num(rest, "they reach", "tall"),
+                            self._num(rest, "far above the", "the rest"))
+            return True
+        if rest.startswith("STORED"):
+            # Read as a whole line, and by NAME: the pixel figure was added to
+            # the end of this line after the other two, so a gun on either
+            # firmware sends a different number of fields and neither may be
+            # taken by position. A field this gun did not send stays None --
+            # 0 px is a measurement, and "no measurement" is not one.
+            got = {}
+            for tok in rest.split():
+                k, sep, v = tok.partition("=")
+                if not sep:
+                    continue
+                try:
+                    got[k] = int(v)
+                except ValueError:
+                    pass
+            self.stored = (got.get("ledmaxh"), got.get("strayminh"),
+                           got.get("ledmaxpx"))
+            return True
+        if rest.startswith("NEEDS MORE LED DATA"):
+            self.verdict = "need_led"
+            w = self._num(rest, "blobs so far,", "wanted")
+            if w is not None:
+                self.led_want = w
+            return True
+        if rest.startswith("NO STRAY DATA"):
+            self.verdict = "need_stray"
+            w = self._num(rest, "seen,", "wanted")
+            if w is not None:
+                self.stray_want = w
+            return True
+        if rest.startswith("NO SAFE GATE"):
+            # No number is held here, deliberately. This rig cannot be gated
+            # on size, and a front end that kept the last verdict's figure
+            # would offer to apply a ceiling measured before the lamp came on.
+            self.verdict = "no_gate"
+            return True
+        if rest.startswith("bhmax="):
+            try:
+                self.bhmax = int(rest[6:].split()[0].strip("(,"))
+            except (ValueError, IndexError):
+                return True
+            self.verdict = "ok"
+            self.tight = "TIGHT" in rest
+            return True
+        if rest.startswith("applied and saved"):
+            self.applied = True
+        elif rest.startswith("applied but SAVE FAILED"):
+            self.applied = False
+        elif rest.startswith("switched to fmt:2"):
+            # An apply from any other format switches the gun to full mode and
+            # saves full mode with the gate. The line this replaced said the
+            # gate was INERT and left the user to fix it, and both front ends
+            # had grown a sentence telling them to press Save as well -- for a
+            # command called 'apply' that did not survive a reboot.
+            self.switched = True
+        return True
+
+
+# ---------------------------------------------------------------------------
 # naming a capture so the next one cannot land on it
 # ---------------------------------------------------------------------------
 # Files used to be named from the wall clock alone. Two captures inside the
@@ -680,6 +941,10 @@ class Link:
         # for the same reason the blob list is: the bins of one feature are a
         # distribution, and half of one is not a smaller distribution.
         self.hists = HistSet()
+        # The gun's own verdict on what a size gate can do on THIS rig, held
+        # whole for the same reason: its lines are an answer, not a reading,
+        # and the number in one of them is a PROPOSAL rather than a setting.
+        self.fit = CamFit()
         # Writes that failed. A serial write throwing is how a gun that
         # rebooted or re-enumerated announces itself, and swallowing it made a
         # dead link look exactly like a screen whose keys had stopped working.
@@ -712,6 +977,10 @@ class Link:
             # one's is exactly the two-rigs-in-one-spread failure the capture
             # clears itself to avoid.
             self.hists.reset()
+            # And the fit, which is a statement about one bar in one room. A
+            # ceiling measured on the gun that was here a minute ago is the
+            # borrowed number this whole command exists to stop.
+            self.fit.reset()
             self.replies = []
             self.src.start()
             return True
@@ -801,6 +1070,44 @@ class Link:
                 continue
             if line.startswith("CAM: learn "):
                 self.hists.feed(line)
+            # Two lines name the format the GUN is really in, and both name
+            # it with a colon -- so the key/value sweep below is blind to
+            # both. Read here, into last["fmt"], because the gun's word on its
+            # own format beats this app's memory of the last click: a format
+            # changed from a serial terminal or from pical on the same gun
+            # otherwise leaves this front end showing a gate as working while
+            # the gun is telling it, in words, that the gate does nothing.
+            #
+            # 'bhmax N set but INERT ... this gun is in fmt:N' is the gate
+            # being set where it cannot act. 'fit switched to fmt:2' is the
+            # opposite: an apply moved the gun INTO full mode and saved it
+            # there, so the panel that was showing INERT a moment ago has to
+            # stop -- and its format radio has to move with the gun.
+            #
+            # Both are a fresher reading of the same fact and not sticky
+            # flags: the next '~camblob?' answer overwrites them like any
+            # other, which is what stops this latching the way bvalve did.
+            if "INERT" in line:
+                m = _INERT_FMT_RE.search(line)
+                if m:
+                    try:
+                        self.last["fmt"] = int(m.group(1))
+                    except ValueError:
+                        pass
+            elif line.startswith("CAM: fit switched to fmt:2"):
+                self.last["fmt"] = 2
+            # The fit verdict, taken off the wire BEFORE the key/value sweep
+            # below can see it. Its middle line reads 'CAM: fit bhmax=11 (LEDs
+            # reach 7...)' -- a number the gun has NOT set and will not set
+            # until it is asked again with '=apply'. Fed to that sweep it
+            # lands in last["bhmax"], the spinbox snaps to a gate nobody
+            # turned on, and the next click sends it. The line still goes to
+            # replies: it is the plainest English on the wire and the log is
+            # where the long form belongs.
+            if line.startswith("CAM: fit"):
+                self.fit.feed(line)
+                self.replies.append(line)
+                continue
             if line.startswith("CAM:") or line.startswith("AIM:") or "CMD ok" in line:
                 self.replies.append(line)
                 # The per-blob list is kept whole: its fields are positional
@@ -1476,12 +1783,21 @@ def main():
     # back the height it needed for the new gate: front alone asks for 179 px
     # of the 313, front plus Advanced 277, and the render test's 20 px margin
     # holds in both.
-    roww = tk.Frame(frame_wii, bg=C_BG); roww.pack(fill="x", pady=1)
+    #
+    # THE ROW GAPS ARE GONE, and they paid for the fit row. The gate the panel
+    # now steers people to is one this gun measures for itself, which needs two
+    # buttons and a line to answer on -- 21 px -- and the panel had 13 over the
+    # 313. Every pady between these rows is 0 or 1 as a result, and the button
+    # rows lost a pixel of their own. Measured with the Advanced disclosure
+    # open and both readout lines wrapped: 286 px, so the render test's 20 px
+    # margin holds with seven to spare. Nothing on the panel was removed to
+    # find it -- everything on the front is something a test needs in its hand.
+    roww = tk.Frame(frame_wii, bg=C_BG); roww.pack(fill="x")
     lab(roww, "wiicam sensitivity", (F[0], 9), C_DIM).pack(side="left",
                                                            padx=(0, 8))
     for sv, nm in ((0, "Default"), (1, "High"), (2, "Max")):
         tk.Button(roww, text=nm, font=F, bg="#161b22", fg=C_FG, relief="flat",
-                  padx=10, pady=2,
+                  padx=10, pady=1,
                   command=lambda v=sv: (link.send("~cam=sens:%d" % v),
                                         log("sensitivity -> %d" % v))
                   ).pack(side="left", padx=(0, 6))
@@ -1502,7 +1818,7 @@ def main():
     # be done is refuse the impostor, so the resolver rebuilds the missing
     # corner from the three real ones instead of trusting four points one of
     # which is a lie.
-    rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x", pady=1)
+    rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x")
     # Three report formats, not a switch: each one costs a longer read per
     # frame, so the question is how much detail is worth the bus time and not
     # whether sizes are on. Named for what the user gets rather than for the
@@ -1545,15 +1861,24 @@ def main():
                 "240x176 pipeline space, so if the crosshair in the preview "
                 "does not land inside its box, the mode register under "
                 "Advanced is the thing to try.")
+            log("'Save to gun' keeps this format now, and that is what "
+                "makes a saved height gate work: the gate only judges in full "
+                "detail, so a gun that came back in any other format would "
+                "load the ceiling and never apply it. Save the format and the "
+                "gate together.")
             # Said HERE, because this is the only moment the shape controls
-            # stop being inert -- and there is no room beside them for the
-            # numbers behind the recommendation.
-            log("measured over 11,996 confirmed blobs in daylight at "
-                "sensitivity 2: 99.73% of LEDs come in at a box height of 7 "
-                "or less and every stray ran 15 to 56, so a height limit of "
-                "10 caught 84% of the strays and cost ZERO LEDs. That is why "
-                "'biggest blob height' is the gate on this panel and the two "
-                "under Advanced are not.")
+            # stop being inert. What this used to say was the measurement
+            # behind a recommended height -- 11,996 blobs off ONE bar with two
+            # LEDs per corner. A bar with five LEDs per cluster makes blobs
+            # several times taller, so that ceiling would have blinded it with
+            # nothing on screen to say why, and the figure is gone. The gun
+            # measures its own instead.
+            log("'Measure the gate' asks the gun what IT has seen: how tall "
+                "its own LEDs come out and how tall the stray light does. Run "
+                "a calibration with 'Learn LED shape' on, sweep the room so a "
+                "lamp or a window comes into frame, then measure. Nothing "
+                "here suggests a height -- a number measured on somebody "
+                "else's LED bar can blind yours.")
     lab(rowb, "blob detail", (F[0], 9), C_DIM).pack(side="left")
     for fv, nm in ((0, "off"), (1, "sizes"), (2, "full detail")):
         tk.Radiobutton(rowb, text=nm, value=fv, variable=cam_fmt,
@@ -1574,11 +1899,24 @@ def main():
         link.send("~cam=%s:%d" % (k, n))
         link.send("~camblob?")
 
-    # The firmware REFUSES a bhmax of 1..7, a pxmax of 1..11 and an armax of
-    # 1..15 outright rather than clamping, so all three spinboxes step through
-    # a fixed list of legal values instead of a range -- an increment of 1
-    # from 0 would send bhmax:1 and get a refusal the user has to read the log
-    # to find out about.
+    # The firmware refuses a bhmax or a pxmax BELOW WHAT THIS GUN HAS MEASURED
+    # ITS OWN LEDs AT, and the refusal names that figure. The floor is the
+    # rig's, not a constant: a bar with five LEDs per cluster makes blobs
+    # several times larger than one with two, so a fixed floor either refuses
+    # the only workable setting for the first or accepts one that blinds the
+    # second. Both floors are backed by a measurement that SURVIVES a power
+    # cycle -- the gun stores the tallest LED and the largest LED pixel count
+    # it has measured and takes the greater of stored and live -- so a refusal
+    # can arrive on a gun that has captured nothing this session, naming a
+    # figure from a capture taken weeks ago. With no capture at all, live or
+    # stored, there is nothing to defend and any value is accepted, which is
+    # exactly when a stepped 1, 2, 3 does the most damage: bhmax:1 is a gun
+    # that sees nothing and says nothing about it. armax is the one fixed
+    # floor left -- refused below 16 as before -- and it is deprecated.
+    #
+    # So all three step through a fixed list rather than a range: the arrows
+    # can only ever land on a value somebody might mean, and the one number
+    # worth having comes from 'Measure the gate' and not from this ladder.
     #
     # Shown in the units the user thinks in, not the wire's: armax is eighths
     # of a ratio, and "20" on a panel means nothing at all next to "2.5:1".
@@ -1624,11 +1962,16 @@ def main():
         # starts refusing. 'biggest blob height' is the same idea on the one
         # axis the smear leaves alone.
         if n and k == "armax":
-            log("roundness (armax) is NOT recommended. At sensitivity 2 the "
-                "sensor smears a 2x2 blob out to 12x3, so the ratio it "
-                "measures is the gain and not the LED -- and it is the LEDs "
-                "that get refused. Use 'biggest blob height' instead: height "
-                "is the axis the smear does not touch.")
+            log("roundness (armax) is DEPRECATED and NOT recommended. It was "
+                "measured at sensitivity 1, where an LED came out round; at "
+                "sensitivity 2 -- the default now -- the sensor smears a 2x2 "
+                "blob out to 12x3, so the ratio it measures is the gain and "
+                "not the LED, and it is the LEDs that get refused. The gun "
+                "still loads and applies whatever is stored, so a setting "
+                "already in a gun keeps its meaning, but nothing suggests a "
+                "value for it and 'Measure the gate' never sets it. Use "
+                "'biggest blob height': height is the axis the smear does not "
+                "touch.")
 
     def shape_box(parent, key, name, steps, note=None, width=5):
         """One rung-stepping gate control, label and all.
@@ -1657,16 +2000,296 @@ def main():
     # sensor smears horizontally -- the same LEDs went from a 2x2 box to 12x3
     # when the gain went up -- so width stops measuring the source and starts
     # measuring the gain. Height is the axis the smear does not touch.
-    shape_box(rowb, "bhmax", "biggest blob height", BHMAX_STEPS,
-              "10 recommended", width=7)
+    #
+    # No note beside it. The one that used to be here said "10 recommended",
+    # and 10 was measured on a bar with two LEDs per corner: on a bar with
+    # five per cluster the LEDs themselves are taller than that, so the hint
+    # was an instruction to blind the gun. The row under this one carries what
+    # the gun measured on ITS OWN bar instead.
+    shape_box(rowb, "bhmax", "biggest blob height", BHMAX_STEPS, width=7)
+
+    # ---- the only defensible height: the one this gun measured -------------
+    # '~camfit' reads the two distributions the shape capture has been filling
+    # -- how tall this rig's own LEDs come out, and how tall the stray light
+    # in this room does -- and either names a ceiling between them or says
+    # there is no gap to put one in. Asking and APPLYING are two separate
+    # presses on purpose: '?' changes nothing, '=apply' writes the gate and
+    # saves it, and a single button that did both would set a gate off a
+    # half-finished capture the first time somebody pressed it to see what it
+    # said.
+    #
+    # One row, and the label on it is the HEIGHT GATE'S line: when the gate is
+    # misbehaving that is what it says, and the fit comes back underneath it
+    # once the gate is quiet again. The alternative was a warning on the
+    # readout line below, which is already two wrapped lines deep and would
+    # have taken a third -- 14 px of a tab area that stops growing at 313.
+    #
+    # Asked for by hand and never polled. The gun's answer is three sentences
+    # of English and they go to the log like every other reply; asked every
+    # few seconds while a capture ran, they would push the diag verdict and
+    # the save result out of a six-line box before anybody read them.
+    rowfit = tk.Frame(frame_wii, bg=C_BG); rowfit.pack(fill="x")
+    # seq is what tells an answer from silence: an older gun does not have
+    # '~camfit' and says nothing at all, which is indistinguishable from a
+    # reply still in flight until the clock runs out.
+    fit_state = {"seq": -1, "asked": 0.0}
+
+    def fit_ask(apply=False):
+        if not link.src:
+            log("not connected -- press Reconnect first")
+            return
+        fit_state["seq"] = link.fit.seq
+        fit_state["asked"] = time.monotonic()
+        link.send("~camfit=apply" if apply else "~camfit?")
+        if apply:
+            log("~camfit=apply sent -- the gun measures again and writes what "
+                "it finds NOW, so what lands is never the line this panel was "
+                "showing a minute ago. Nothing here chose the number.")
+            # Nothing to add about saving. The apply writes the gate AND the
+            # full mode it needs, switching the gun into it if it had dropped
+            # out, so there is no second press to remember. The sentence that
+            # stood here told the user to press 'Save to gun' as well, which
+            # was a workaround for a command called 'apply' that did not
+            # survive a reboot -- the gun fixed that, and a front end still
+            # asking for the extra press teaches a habit that is now wrong.
+            return
+        # The two conditions that make the answer 'not enough data' are both
+        # things the user can fix in one click each, and both are on this
+        # panel -- so they are said at the moment the question is asked rather
+        # than after the gun has spent a sentence saying no.
+        if cam_fmt.get() != 2:
+            log("the fit needs 'full detail': the box height it measures is "
+                "only reported in that format, so in any other one the gun "
+                "has nothing to have measured and the counts stay at zero.")
+        if not learn_state["on"]:
+            log("the fit only counts blobs while the shape capture is running "
+                "-- press 'Learn LED shape', then aim at the bar from where "
+                "you play and sweep the room so a lamp or a window comes into "
+                "frame. It needs both: the LEDs to find the ceiling, the "
+                "stray light to know there is room under it.")
+
+    btn_fit = tk.Button(rowfit, text="Measure the gate",
+                        command=lambda: fit_ask(False), font=(F[0], 9),
+                        bg="#1f6feb", fg="white", relief="flat", padx=8,
+                        pady=0)
+    btn_fit.pack(side="left")
+    # Disabled until the gun has actually named a number. There is nothing to
+    # apply after 'no safe gate' -- that rig cannot be gated on size at all --
+    # and a live button there would invite a value the gun has just explained
+    # it does not have.
+    btn_fit_apply = tk.Button(rowfit, text="Apply", font=(F[0], 9),
+                              command=lambda: fit_ask(True), bg="#161b22",
+                              fg=C_FG, relief="flat", padx=8, pady=0,
+                              state="disabled")
+    btn_fit_apply.pack(side="left", padx=(6, 8))
+    # ONE line, and every sentence below is measured against it: this label
+    # gets 380 px of a 1400 px screen and 369 on the narrow layout, where the
+    # preview has taken a tab of its own. Several outgrow it -- either warning
+    # once it names more than one limit to switch off (610 px with all three),
+    # and any fit answer carrying the samples the gun set aside (671 with the
+    # stored pair beside them) -- and each wraps to a SECOND line, which takes
+    # the panel to 297 px of the 313 a 768p laptop allows. Two is the budget:
+    # a third would be 311 and there is no room to spend on white space, so
+    # every clause added here gets measured against 738 px, the narrow
+    # layout's two lines.
+    #
+    # A FIXED two lines was tried first -- the same don't-shuffle reason the
+    # preview's verdict has one -- and the panel has 27 px over that 313, so a
+    # standing second line spends half of it on white space for the sake of
+    # one transient state. Natural height instead: a sentence that outgrows
+    # the line wraps and costs its 14 px only while it is up, rather than
+    # being clipped with nothing to say it was.
+    gate_lbl = lab(rowfit, "", (F[0], 8), C_DIM, justify="left", anchor="nw",
+                   wraplength=380)
+    gate_lbl.pack(side="left", fill="x", expand=True)
+
+    def gate_line():
+        """(text, colour) for the gate line: what is WRONG first, then what
+        the gun measured.
+
+        A warning outranks the fit because it is the live thing: a gate that
+        is eating corners now matters more than a ceiling somebody measured a
+        minute ago, and the fit is in the log as well while this line is the
+        only place the warning appears."""
+        f = link.fit
+        # What the GUN holds, against the ladder beside it. A fit lands on
+        # whatever sits between the two measurements -- 9, 11, 13 -- and the
+        # spinbox shows its own rungs and nothing else, so without this the
+        # panel reads "off" over a gun that is gating at 11.
+        held = link.last.get("bhmax") or 0
+        odd = bool(held) and held not in shape_var["bhmax"][2]
+        # Which of the three shape limits are actually SET, and what the user
+        # would have to type to switch each of them off. The shape gate is
+        # bhmax OR pxmax OR armax: a warning that says "bhmax:0 turns it off"
+        # to somebody whose gate is pxmax is advice that changes nothing, and
+        # they have no way to find out it was the wrong advice.
+        on = [k for k in ("bhmax", "pxmax", "armax") if link.last.get(k)]
+        gate_on = bool(on)
+        off_hint = ("%s turn%s it off"
+                    % (" and ".join("%s:0" % k for k in on),
+                       "" if len(on) > 1 else "s"))
+        # SET BUT INERT: a limit the gun is carrying and cannot apply, because
+        # the box it judges is only reported in full mode. It is the one state
+        # 'cam?' cannot show -- the limits and fmt come back on the same line
+        # and nothing there puts them together -- and it is what "I set the
+        # gate and nothing happened" turns out to be. The gun says so at the
+        # moment it happens, for bhmax and for pxmax, and that word reaches
+        # last["fmt"] through pump(); but the STATE outlives the moment, so it
+        # is derived here as well. 'ext' is the fallback for a gun too old to
+        # report fmt at all -- it can never reach full mode, so its gate can
+        # never act either.
+        fmt = link.last.get("fmt", link.last.get("ext"))
+        full = fmt == 2
+        inert = gate_on and fmt is not None and not full
+        # A window's verdict speaks for the present or not at all. It is
+        # computed when a window of frames closes, so on a gun that has
+        # stopped answering -- unplugged, camera dead, port handed to another
+        # app -- nothing recomputes it and the last warning would sit here
+        # being read as current. That is the latch this panel has already
+        # shipped twice.
+        seen = blob_state.get("frames_t")
+        g = ({} if seen is None or time.monotonic() - seen > GATE_WARN_STALE_S
+             else (blob_state.get("gate") or {}))
+        near, srej = g.get("bnear", 0), g.get("bsrej", 0)
+        frames = g.get("frames", 0)
+
+        def num(v):
+            """A figure the gun did not send reads '?', never blank and never
+            'None'. A blank where a number belongs is the one thing an older
+            firmware must never produce here."""
+            return "?" if v is None else v
+
+        # The false-negative meter first: it is the only number on this panel
+        # that says a gate is WRONG rather than that it is working, and it
+        # moves long before the cursor starts sticking. Both of these are
+        # deltas over the window the percentages under them were taken over --
+        # never the since-boot totals, which is how "SIZE WINDOW TOO TIGHT"
+        # once stayed on the panel for a whole power cycle.
+        #
+        # bnear now counts SHAPE-gate rejections only, so when it speaks the
+        # shape gate is the culprit and the only question left is which of the
+        # three limits did it. It is named. The line used to say the height
+        # gate was innocent whenever it was inert, which was true while bnear
+        # could also come from the size window and is wrong now.
+        if near and gate_on:
+            return ("GATE MAY BE TAKING REAL LEDs (%d) -- %s"
+                    % (near, off_hint)), C_BAD
+        if inert:
+            if len(on) == 1:
+                return ("%s %s is SET BUT INERT -- it needs blob detail "
+                        "'full detail'"
+                        % (on[0], link.last.get(on[0]))), C_BAD
+            return ("%s are SET BUT INERT -- they need blob detail 'full "
+                    "detail'" % "+".join(on)), C_BAD
+        # Gated on the gate being ON and ACTING, like pical's. Outside full
+        # mode the gun reports no box, the shape gate stands down and bsrej
+        # cannot move -- so a rate computed there is a rate about nothing, and
+        # with every limit off there is nothing the advice could name.
+        if (gate_on and full and srej
+                and srej >= frames * GATE_HEAVY_PER_FRAME):
+            # srej here is already the UNEXPLAINED count -- refusals the
+            # resolver did not vouch for as stray light -- see blob_tick.
+            return ("SHAPE GATE REFUSING HEAVILY (%d unexplained) -- %s"
+                    % (srej, off_hint)), C_WARN
+        if f.seq == fit_state["seq"] and fit_state["asked"]:
+            # Nothing new since we asked. Either it is still coming, or this
+            # gun has never heard of the command and never will answer.
+            if time.monotonic() - fit_state["asked"] < 2.0:
+                return "gate fit: asking the gun...", C_DIM
+            return ("gate fit: no answer -- this gun's firmware has no "
+                    "camfit"), C_DIM
+        # Contamination rides on whatever the fit is saying rather than
+        # replacing it. The gun sets these samples aside BEFORE it derives
+        # anything, so the ceiling beside them is the clean one -- and a reader
+        # who is shown "32 set aside at 31 tall" learns their rig had the sun
+        # in its LED class, which a clean 7 on its own never tells them. Its
+        # own line begins with a digit, which is how it fell through both the
+        # parser and this panel: the one sentence that says the capture was
+        # contaminated was the one sentence nothing read.
+        ign = ""
+        if f.ignored:
+            ign = ("   %d set aside at %s tall, body stops at %s"
+                   % (f.ignored[0], num(f.ignored[1]), num(f.ignored[2])))
+        if f.verdict == "need_led":
+            # The stored pair is what the gun measures its REFUSALS against,
+            # so before a capture finishes it is the only explanation on offer
+            # for "why will it not take my number?". A stray edge of 0 means
+            # no fit has ever applied on this gun -- camsave records the LED
+            # edge alone, since a hand-set ceiling has no stray behind it --
+            # and it reads exactly like a gun too old to send the field,
+            # because to the reader they are the same thing: nothing measured
+            # it. Never "stray at 0", which is a measurement of a dark room.
+            st = ""
+            if f.stored:
+                sl, ss, _px = f.stored
+                st = ("; stored %s tall, stray %s"
+                      % (num(sl), ss if ss and ss > 0 else "not recorded"))
+            return ("gate fit: %s of %d LED blobs, %s of %d stray%s%s"
+                    % (num(f.led_n), f.led_want, num(f.stray_n),
+                       f.stray_want, st, ign)), C_DIM
+        if f.verdict == "need_stray":
+            return ("gate fit: LEDs reach %s, %s of %d stray -- sweep past a "
+                    "lamp%s" % (num(f.led_max_h), num(f.stray_n),
+                                f.stray_want, ign)), C_DIM
+        if f.verdict == "no_gate":
+            # No number, on purpose, and none is offered anywhere else either.
+            # This rig's LEDs are as tall as its stray light, so a size gate
+            # cannot tell them apart and the honest answer is that there is
+            # nothing to set. The sentence saying what CAN be done is in the
+            # log, in the gun's own words. The contamination clause matters
+            # most here: samples set aside are the commonest reason a rig
+            # looks unseparable when it is not.
+            return ("gate fit: NO SAFE GATE -- LEDs reach %s, stray starts "
+                    "at %s%s" % (num(f.led_max_h), num(f.stray_min_h),
+                                 ign)), C_WARN
+        if f.verdict == "ok" and f.bhmax is not None:
+            if f.applied is True:
+                return ("gate fit: bhmax %d applied and saved%s%s"
+                        % (f.bhmax, "  no step for it in the box"
+                           if odd else "", ign)), C_OK
+            if f.applied is False:
+                return ("gate fit: bhmax %d set but NOT SAVED -- gone at "
+                        "power-off" % f.bhmax), C_BAD
+            return ("gate fit: bhmax %d (LEDs %s, stray %s)%s -- Apply saves "
+                    "it%s" % (f.bhmax, num(f.led_max_h), num(f.stray_min_h),
+                              " TIGHT" if f.tight else "", ign)), C_OK
+        if f.seq:
+            # A header and no outcome this parsing knows: a firmware that has
+            # grown a case since. The counts it did send are still worth
+            # having, and the log has the sentence verbatim.
+            return ("gate fit: %s LED blobs, %s stray -- see the log"
+                    % (num(f.led_n), num(f.stray_n))), C_DIM
+        if odd:
+            # Said before anyone has asked for a fit, because it is the panel
+            # contradicting itself: the gun is gating and the box says 'off'.
+            return ("gate fit: the gun holds bhmax %d, no step for it in the "
+                    "box" % held), C_WARN
+        return "gate fit: press Measure -- it reads this gun's own LEDs", C_DIM
+
+    def fit_tick():
+        try:
+            txt, col = gate_line()
+            if gate_lbl.cget("text") != txt:
+                gate_lbl.config(text=txt, fg=col)
+            else:
+                gate_lbl.config(fg=col)
+            # Only ever enabled on a verdict that named a number.
+            want = "normal" if (link.fit.verdict == "ok"
+                                and link.fit.bhmax is not None) else "disabled"
+            if str(btn_fit_apply.cget("state")) != want:
+                btn_fit_apply.config(state=want)
+        except Exception as e:
+            log("gate line hiccup: %s" % e)
+        finally:
+            root.after(500, fit_tick)
 
     blob_lbl = lab(frame_wii, "blob readout: set blob detail to 'sizes' to "
                    "fill this line",
                    (F[0], 8), C_DIM, justify="left", anchor="w", wraplength=560)
-    blob_lbl.pack(fill="x", pady=(1, 0))
+    blob_lbl.pack(fill="x")
     blob_lbl2 = lab(frame_wii, "", (F[0], 8), C_DIM, justify="left", anchor="w",
                     wraplength=560)
-    blob_lbl2.pack(fill="x", pady=(0, 2))
+    blob_lbl2.pack(fill="x", pady=(0, 1))
     # Wrap to the width this panel ACTUALLY has, measured, not guessed. These
     # lines carry live numbers of unpredictable length, and a Tk label that
     # overruns its frame is clipped silently -- the reader simply never sees
@@ -1677,16 +2300,24 @@ def main():
         for lb in (blob_lbl, blob_lbl2):
             if lb.cget("wraplength") != w:
                 lb.config(wraplength=w)
+        # The gate line gets what the two buttons on its row leave, measured
+        # off the buttons rather than taken from a constant: they are as wide
+        # as their own labels, and a constant would be wrong the day one of
+        # those labels changed -- silently, by clipping the end of a warning.
+        gw = max(200, w - btn_fit.winfo_reqwidth()
+                 - btn_fit_apply.winfo_reqwidth() - 20)
+        if gate_lbl.cget("wraplength") != gw:
+            gate_lbl.config(wraplength=gw)
     frame_wii.bind("<Configure>", wrap_blob)
 
-    barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=(2, 0))
+    barw = tk.Frame(frame_wii, bg=C_BG); barw.pack(fill="x", pady=(1, 0))
     tk.Button(barw, text="Save to gun", command=lambda: (link.send("~camsave"),
                                      log("~camsave sent -- the gun answers "
                                          "with a CAM: saved / SAVE FAILED line "
                                          "listing what it wrote")),
-              font=FB, bg="#238636", fg="white", relief="flat", padx=14, pady=3).pack(side="left")
+              font=FB, bg="#238636", fg="white", relief="flat", padx=14, pady=2).pack(side="left")
     tk.Button(barw, text="Read from gun", command=lambda: link.send("~cam?"),
-              font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=3).pack(side="left", padx=8)
+              font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=2).pack(side="left", padx=8)
 
     # ---- shape learning ----------------------------------------------------
     # What a confirmed LED actually looks like on this rig, measured instead of
@@ -1780,13 +2411,13 @@ def main():
 
     tk.Button(barw, text="Shape CSV", command=shape_save, font=F,
               bg="#161b22", fg=C_FG, relief="flat", padx=12,
-              pady=3).pack(side="right")
+              pady=2).pack(side="right")
     # A fixed width in characters, so the label swapping between "Learn LED
     # shape" and "Stop learning" cannot change how wide this row is: a row that
     # grows past the panel runs off the right-hand edge with nothing to say so.
     btn_learn = tk.Button(barw, text=learn_label(), command=learn_toggle,
                           font=F, width=15, bg="#161b22", fg=C_FG,
-                          relief="flat", padx=6, pady=3)
+                          relief="flat", padx=6, pady=2)
     btn_learn.pack(side="right", padx=(0, 8))
 
     # ---- everything set once, or not at all --------------------------------
@@ -1813,7 +2444,7 @@ def main():
         else:
             frame_adv.pack_forget()
 
-    rowadv = tk.Frame(frame_wii, bg=C_BG); rowadv.pack(fill="x", pady=(2, 0))
+    rowadv = tk.Frame(frame_wii, bg=C_BG); rowadv.pack(fill="x", pady=(1, 0))
     btn_adv = tk.Button(rowadv, text=adv_label(), command=adv_toggle,
                         font=(F[0], 9), bg="#161b22", fg=C_DIM, relief="flat",
                         anchor="w", padx=8, pady=1)
@@ -1861,14 +2492,24 @@ def main():
     # The two shape limits the height gate replaced. Kept because a gun in the
     # field may still be set on them and the panel must be able to say so and
     # turn them off -- not because either is a good idea now.
+    #
+    # A word each rather than one heading over both: they are not superseded in
+    # the same way. pxmax measures the right thing on the wrong scale -- a bar
+    # with five LEDs per cluster fills several times the pixels of one with two
+    # -- while armax measures a shape the sensor stopped producing when the
+    # default sensitivity moved to 2. Measured, one heading plus both verdicts
+    # is 660 px of a 602 px panel, and the row runs off the edge in silence.
     rowsh = tk.Frame(frame_adv, bg=C_BG); rowsh.pack(fill="x")
-    lab(rowsh, "superseded by blob height:", (F[0], 8), C_DIM).pack(side="left")
-    shape_box(rowsh, "pxmax", "pixel count", PXMAX_STEPS)
-    # The one short clause there is room for. WHY it is wrong -- at
+    shape_box(rowsh, "pxmax", "pixel count", PXMAX_STEPS, "superseded")
+    # The one short clause there is room for, and DEPRECATED is the half of it
+    # that matters: the gun still loads and applies a stored armax so a setting
+    # already in the field keeps its meaning, but nothing suggests a value for
+    # it and 'Measure the gate' never sets one. WHY it is wrong -- at
     # sensitivity 2 the sensor smears a 2x2 blob out to 12x3, so the ratio
     # measures the gain and not the LED -- goes to the log the moment anybody
     # switches it on, which is the only moment it is worth reading.
-    shape_box(rowsh, "armax", "roundness", ARMAX_STEPS, "not recommended")
+    shape_box(rowsh, "armax", "roundness", ARMAX_STEPS,
+              "DEPRECATED, not recommended")
 
     # Which byte selects full mode is the one thing about it nobody can look
     # up: the driver's own working constants for the other two formats are the
@@ -2455,11 +3096,22 @@ def main():
     # The blob readout, polled only while the Camera tab is on a wiicam: it is
     # a live measurement of what the sensor is handing us, and the whole point
     # is to see it CHANGE as the gun swings past the window.
-    # near_said: the long explanation of the false-negative meter goes to the
-    # log the FIRST time it moves and not on every poll -- the log box is six
-    # lines tall, and a warning that repeats twice a second is a warning that
-    # pushes the diag verdict and the save result off the end of it.
-    blob_state = {"ref": {}, "line": "", "good": True, "near_said": False}
+    # near_said / srej_said: the long explanation behind each gate warning goes
+    # to the log the FIRST time it moves and not on every poll -- the log box
+    # is six lines tall, and a warning that repeats twice a second is a warning
+    # that pushes the diag verdict and the save result off the end of it.
+    # gate: the two shape-gate counts over the last closed WINDOW of frames,
+    # for the gate line beside the fit buttons to word. Numbers and not a
+    # sentence, because whether "bhmax:0 turns it off" is even true depends on
+    # whether the gate can act -- and held here rather than written straight to
+    # the label, because it is only recomputed when a window closes while the
+    # label is redrawn on its own clock.
+    # frames_n / frames_t: the gun's frame counter and when it last moved, so
+    # a warning computed from a window of frames stops claiming the present
+    # once the frames stop arriving.
+    blob_state = {"ref": {}, "line": "", "good": True, "near_said": False,
+                  "srej_said": False, "gate": {}, "frames_n": None,
+                  "frames_t": None}
     blob_rate = FrameRate()
 
     def blob_tick():
@@ -2485,6 +3137,15 @@ def main():
         if "wiicam" in b and link.src and nb.select() in cam_pages:
             link.send("~camblob?")
             blob_rate.feed(link.last.get("bframes"), link.last.get("bms"))
+            # When the gun last sent a NEW frame, which is what the gate
+            # warnings are allowed to speak for. Stamped on the frame counter
+            # MOVING rather than on a reply arriving: a gun whose camera has
+            # died still answers '~camblob?' with the same numbers for ever,
+            # and a window computed from them is a window about nothing.
+            fr = link.last.get("bframes")
+            if fr is not None and fr != blob_state.get("frames_n"):
+                blob_state["frames_n"] = fr
+                blob_state["frames_t"] = time.monotonic()
             focused = None
             try:
                 focused = root.focus_get()
@@ -2594,7 +3255,8 @@ def main():
                     # WINDOW TOO TIGHT" on the panel for good, long after the
                     # user had widened the window it was complaining about.
                     d_rej = {}
-                    for k in ("brej", "brrej", "bvalve", "bsrej", "bnear"):
+                    for k in ("brej", "brrej", "bvalve", "bsrej", "bnear",
+                              "bfar"):
                         cur = link.last.get(k, 0)
                         prev = blob_state["ref"].get(k, cur)
                         d_rej[k] = max(0, cur - prev)
@@ -2612,10 +3274,12 @@ def main():
                     # 420)" aside -- which was only ever a note about a number
                     # this front end does not even poll at. pical's readout is
                     # not wrapped this tight and still carries it.
-                    # Measured at the panel's 573 px: this line with one
-                    # warning up is 983 px of a 1100 px two-line budget, and
-                    # with both up it takes the third line and still leaves
-                    # 17 px under the cap.
+                    # Measured at the panel's 573 px: this line with the
+                    # give-back warning up is 983 px of a 1100 px two-line
+                    # budget. The two SHAPE-gate warnings used to ride here as
+                    # well and took it to a third line; they are on the gate
+                    # line beside the fit buttons now, where the sentence that
+                    # says how to switch the gate off fits beside them.
                     blob_state["line"] = (
                         "last %d frames: %d%% saw all four LEDs, %d%% three, "
                         "%d%% two or fewer   %s   dropped %d size, %d odd, "
@@ -2626,34 +3290,68 @@ def main():
                            if hz else "measuring camera rate...",
                            d_rej["brej"], d_rej["brrej"], d_rej["bsrej"])
                         + ("   SIZE WINDOW TOO TIGHT" if d_rej["bvalve"]
-                           else "")
-                        # Not a drop count, and it must not read as one: bnear
-                        # counts blobs a gate threw away that sat exactly
-                        # where the missing corner should have been. Every
-                        # other number on this line is the gate working; this
-                        # one is the gate being WRONG, and it moves long
-                        # before the cursor starts sticking. Six words on the
-                        # panel, because forty more would cost the third
-                        # wrapped line; the sentence that explains it goes to
-                        # the log once, which is where this panel already puts
-                        # the reasoning that will not fit beside a control.
-                        + ("   GATE MAY BE TAKING REAL LEDs (%d)"
-                           % d_rej["bnear"] if d_rej["bnear"] else ""))
+                           else ""))
+                    # The two shape-gate numbers, over the window the
+                    # percentages above were taken over, handed to the gate
+                    # line as NUMBERS rather than as sentences. How they read
+                    # is not something this loop knows: it depends on which of
+                    # the three shape limits is set -- "bhmax:0 turns it off"
+                    # is no use to somebody gating on pxmax -- and on whether
+                    # the gate can act at all. All the wording lives in
+                    # gate_line(), with the width budget it has to fit.
+                    #
+                    # Neither is a flag on the wire: they are since-boot
+                    # totals, and the last thing to read one raw left "SIZE
+                    # WINDOW TOO TIGHT" on the panel for the rest of the power
+                    # cycle after a single give-back.
+                    # Unexplained = refused minus vouched-for. See the note
+                    # on GATE_HEAVY_PER_FRAME for the session that showed the
+                    # raw count fires on a gate doing exactly its job.
+                    unexplained = max(0, d_rej["bsrej"] - d_rej["bfar"]
+                                      - d_rej["bnear"])
+                    blob_state["gate"] = {"bnear": d_rej["bnear"],
+                                          "bsrej": unexplained,
+                                          "frames": tot}
                     if d_rej["bnear"] and not blob_state["near_said"]:
                         blob_state["near_said"] = True
                         log("GATE MAY BE TAKING REAL LEDs: %d blob(s) a gate "
                             "dropped sat exactly where the missing corner had "
                             "to be, so they were almost certainly LEDs. This "
                             "is the false-negative meter -- it moves long "
-                            "before the cursor starts sticking. Widen "
-                            "whichever gate you tightened last: the size "
-                            "window, the odd-one-out steps, or the two shape "
-                            "limits beside them." % d_rej["bnear"])
+                            "before the cursor starts sticking. Set 'biggest "
+                            "blob height' to off (bhmax:0) to take the shape "
+                            "gate out of the picture, then widen whichever "
+                            "gate you tightened last: the size window, the "
+                            "odd-one-out steps, or the two limits under "
+                            "Advanced -- and if the gate line says the height "
+                            "gate is INERT, it was one of those and not this "
+                            "one. Press 'Measure the gate' for a ceiling "
+                            "measured on THIS rig instead of a chosen one."
+                            % d_rej["bnear"])
+                    if (unexplained >= tot * GATE_HEAVY_PER_FRAME
+                            and not d_rej["bnear"]
+                            and not blob_state["srej_said"]):
+                        blob_state["srej_said"] = True
+                        log("the shape gate refused %d blobs in %d frames "
+                            "that the resolver could not account for as "
+                            "stray light (%d more it could). A gate that is "
+                            "carrying the room shows up as refusals the "
+                            "resolver vouches for; one set for a different "
+                            "LED bar refuses the bar itself, the resolver "
+                            "cannot lock, and nothing gets vouched for. The "
+                            "symptom is a cursor that sticks or jumps. Set "
+                            "'biggest blob height' to off (bhmax:0) to prove "
+                            "it either way, then press 'Measure the gate'."
+                            % (unexplained, tot, d_rej["bfar"]))
                 if blob_state["line"]:
                     blob_lbl2.config(
                         text=blob_state["line"],
                         fg=C_OK if blob_state.get("good") else C_WARN)
     root.after(1400, blob_tick)
+    # Started after the readout, because the gate line shows whichever of the
+    # two warnings that loop raises before it shows any fit -- and reads
+    # blob_state to find out.
+    root.after(1600, fit_tick)
 
     board_state = {"cur": None}
 
@@ -2798,6 +3496,8 @@ def main():
             cv.create_oval(x-1, y-1, x+1, y+1, outline="", fill="#1f6feb")
 
     link_state = {"dead": False}
+    # Said once per session: see the note in the reply pump below.
+    learn_cleared = {"said": False}
 
     def tick():
         # The reader thread dies silently on an unplug; without this check the
@@ -2813,7 +3513,25 @@ def main():
             link_state["dead"] = False
         link.pump()
         while link.replies:
-            log(link.replies.pop(0))
+            line = link.replies.pop(0)
+            log(line)
+            # 'CAM: learn cleared -- <reason>' is the gun throwing a capture
+            # away because something that changes what the sensor REPORTS
+            # changed under it: the sensitivity, or one of the sensor's own
+            # size thresholds. The reply names the setting and stops there,
+            # which leaves the consequence to be guessed -- so it is said
+            # once, in words. Once, because it fires on every step of a
+            # spinbox somebody is holding down, and eight of these would
+            # push the fit verdict and the save result out of a six-line box.
+            if (line.startswith("CAM: learn cleared -- ")
+                    and not learn_cleared["said"]):
+                learn_cleared["said"] = True
+                log("the shape capture was CLEARED by that change: the "
+                    "sensor now reports different sizes, and a capture "
+                    "spanning both is a measurement of neither. It is still "
+                    "running, from empty -- so 'Measure the gate' will say "
+                    "NEEDS MORE LED DATA until the bar and the room have "
+                    "been swept again.")
         refresh_hid()      # the gun may have released itself via the escape hatch
         for k in CAM_KEYS:
             if k in link.last and sliders[k].get() != link.last[k]:

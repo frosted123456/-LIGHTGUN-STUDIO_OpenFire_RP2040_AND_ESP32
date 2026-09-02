@@ -113,7 +113,7 @@ static float    s_cache_sx = 0.0f, s_cache_sy = 0.0f;
 // three formats now; widening the field and leaving a reader on the old shift
 // is exactly the desync this word exists to prevent, so every reader goes
 // through the accessors below.
-static volatile int s_ext_state = 0;        // (epoch << 2) | fmt
+static volatile int s_ext_state = 0;        // (epoch << 3) | (fullreg05 << 2) | fmt
 static uint8_t  s_bmin = 0, s_bmax = 15;    // accepted blob size window
 // Relative gate tolerance, in SIZE STEPS away from the consensus; 0 = off.
 // Steps rather than a percentage because the reported size is a 4-bit number:
@@ -134,14 +134,20 @@ static uint8_t  s_rtol = 0;
 // of gate that cannot invent a false negative out of a guess: to lose a real
 // LED it would have to be unlike all 52,624 of them.
 //
-//   pxmax  the blob's pixel count. Measured 4..12; 4 is a hard floor nothing
-//          ever goes below. 0 = off.
+//   pxmax  the blob's pixel count. 0 = off, and 0 is what ships: the numbers
+//          this was first set from were measured on ONE bar, and a bar with
+//          five LEDs per cluster produces blobs several times larger than one
+//          with two. A ceiling that fits the first blinds the second, and the
+//          owner of the second has no way to know that is what happened. Any
+//          non-zero value has to come from THIS rig, which is what camfit is.
 //   armax  longest side / shortest side, in EIGHTHS (8 = 1:1, 16 = 2:1).
-//          Measured 63% exactly square and 99.9% at 2:1 or rounder, right
-//          across the distance range -- an LED is a point source, so its blob
-//          is round whatever the bar's geometry and whatever angle it is held
-//          at. This is the one feature that should survive changing the bar.
-//          0 = off.
+//          DEPRECATED, 0 = off. Measured at sensitivity 1 it looked like the
+//          one feature that survives changing the bar -- an LED is a point
+//          source, so 63% of blobs came out exactly square. Sensitivity 2 is
+//          the default now, and its horizontal smear puts the median LED near
+//          4:1. The feature did not survive the change it was chosen for.
+//          Still loaded and still applied so a stored setting keeps its
+//          meaning; never suggested and never set by camfit.
 //
 // Both need full mode; without a box there is nothing to judge and the gate
 // stands down rather than guessing.
@@ -161,6 +167,60 @@ static uint8_t  s_armax = 0;
 // point source" is still measurable -- which is the discriminator we actually
 // want, on the only axis that still carries it.
 static uint8_t  s_bhmax = 0;
+
+// The rig's own measured envelope: the LARGER of what this capture has seen
+// and what an earlier one recorded in flash. Both are real measurements of
+// this rig; the stored one is just older.
+//
+// MAX of the two, not "live first". Preferring the live edge was a bug with a
+// nasty shape: a thin capture -- a dim room, a few blobs at long range -- gives
+// a SMALL maximum, which LOWERS the floor, which lets through a ceiling that
+// blinds the gun at play distance. And it does it while a real, larger, 500-blob
+// measurement sits in flash unused. Note the asymmetry that made it easy to
+// miss: camfit refuses to DERIVE from fewer than 500 blobs, but the refusal
+// floor believed a single one.
+//
+// Taking the max is the conservative direction on both counts. An older
+// measurement of this rig is still a measurement; if the bar really did get
+// smaller, camreset clears the stored pair and the next capture sets it fresh.
+//
+// Returns -1 for "this rig has never been measured", which is the only case
+// where a number is taken on trust.
+static int rig_led_max_h(void)
+{
+    wl_envelope_t e;
+    wl_envelope(&e);
+    int best = e.led_max_h;
+    int led = -1, stray = -1, px = -1;
+    if (aim_fit_load(&led, &stray, &px) && led > best) best = led;
+    return best;
+}
+// The floor under 'pxmax', with one honest caveat. pxmax gates on the report's
+// pixel-count byte; this bound is measured from the bounding-box AREA, because
+// the learning sink has no histogram of the raw byte. Area is an upper bound on
+// pixel count -- a blob cannot fill more pixels than its own box -- so using it
+// errs by refusing a slightly wider band than strictly necessary, which is the
+// safe direction.
+//
+// The clamp is the part that is NOT safe, and it is returned as a distinct
+// answer rather than as a number. WL_AREA saturates at bin 31 while pxmax
+// accepts 0..63, so on a rig whose LED blobs exceed 31 px -- a 12x3 smear does
+// -- the measurement pins at 31 and every value above it looks unmeasured. A
+// pxmax of 32 would then be accepted while cutting real LEDs: the same shape as
+// the live-first defect above, and the reason this returns -2 for "measured,
+// but the measurement ran off the end of its scale" instead of quietly handing
+// back the clamp as if it were the maximum.
+#define RIG_PX_UNBOUNDED (-2)
+static int rig_led_max_px(void)
+{
+    wl_envelope_t e;
+    wl_envelope(&e);
+    int best = e.led_max_px;
+    int led = -1, stray = -1, px = -1;
+    if (aim_fit_load(&led, &stray, &px) && px > best) best = px;
+    if (best >= WL_BINS - 1) return RIG_PX_UNBOUNDED;
+    return best;
+}
 static uint32_t s_bsrej = 0;   // blobs the shape gate wanted to reject
 
 // ---- the sensor's OWN size thresholds -------------------------------------
@@ -322,12 +382,17 @@ static uint32_t s_brrej   = 0;   // blobs dropped for not matching the others
 static uint32_t s_bvalve  = 0;   // blobs the floor had to give back: the window
                                  // is set so tight it would blind the gun
 static uint32_t s_bdrop   = 0;   // frames the resolver could not turn into a quad
-// The two halves of "was that rejection right?", judged on position alone.
-// bfar is a blob the gate dropped that sat nowhere near any corner -- a stray,
-// correctly refused. bnear is one that sat exactly where the missing LED
-// should have been, which means the gate almost certainly took a real corner.
-// bnear climbing is the earliest warning that a size window is too tight, and
-// it arrives long before the symptom does.
+// The two halves of "was that SHAPE-gate rejection right?", judged on position
+// alone, and counted on every frame whether or not a capture is running.
+// bfar is a blob the shape gate dropped that sat nowhere near any corner -- a
+// stray, correctly refused. bnear is one that sat exactly where the missing
+// LED should have been, which means the shape gate almost certainly took a
+// real corner. Shape gate only, on purpose: the tools subtract both from
+// bsrej (which counts shape rejections alone) to get "rejections nobody could
+// vouch for", and their advice on a bnear is "bhmax:0 turns it off" -- both
+// are only true if these count the same gate bsrej does. bnear climbing is
+// the earliest warning that the ceiling is too tight, and it arrives long
+// before the symptom does. The size window's own too-tight signal is bvalve.
 static uint32_t s_bfar    = 0;
 static uint32_t s_bnear   = 0;
 static uint32_t s_breal[5] = {0, 0, 0, 0, 0};   // frames by corners actually SEEN
@@ -667,6 +732,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     const int glo = (s_bmin <= s_bmax) ? (int)s_bmin : (int)s_bmax;
     const int ghi = (s_bmin <= s_bmax) ? (int)s_bmax : (int)s_bmin;
     int keep[4];
+    int srej[4] = {0, 0, 0, 0};     // rejected by the SHAPE gate specifically
     int nk = 0;
     for (int i = 0; i < an; ++i) {
         keep[i] = 1;
@@ -704,7 +770,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
                 const int hi = (w < h) ? h : w;
                 if ((8 * hi) / lo > (int)s_armax) drop = 1;
             }
-            if (drop) { keep[i] = 0; --nk; ++s_bsrej; }
+            if (drop) { keep[i] = 0; srej[i] = 1; --nk; ++s_bsrej; }
         }
     }
 
@@ -798,7 +864,19 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // positive class filled and the negative class was structurally empty,
     // which would have quietly reduced this whole exercise to "here is what an
     // LED looks like" with no way to ask the question that matters.
-    if (wl_enabled()) {
+    //
+    // The CLASSIFICATION runs on every frame; only the RECORDING into the
+    // histograms is gated on the capture being armed. They were one block
+    // once, and that made bfar and bnear count only while a capture ran --
+    // which ships them at zero: the capture is off by default, nothing arms
+    // it at boot, and the tools switch it off on the way out of the sweep. So
+    // during ordinary play the tools' "unexplained rejections" warning, which
+    // subtracts bfar and bnear from bsrej, degenerated to the raw count it was
+    // written to replace, and the false-negative meter -- the one number that
+    // says a gate is WRONG rather than working -- was structurally dead in
+    // exactly the sessions where a wrong gate does its damage.
+    {
+        const int learning = wl_enabled();
         const int fmt = s_ext_state & 3;
         const int flags = (fmt == WIICAM_FMT_FULL) ? WL_HAS_BOX : 0;
         int nkept = 0, jrej = -1;
@@ -810,7 +888,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         // this frame's own brightness rather than a number that only held at
         // the distance it was learned from.
         int imed = 0;
-        if (flags && nkept) {
+        if (learning && flags && nkept) {
             int v[4], m = 0;
             for (int i = 0; i < an; ++i) if (keep[i]) v[m++] = (int)s_bi[i];
             for (int i = 1; i < m; ++i) {          // insertion sort, m <= 4
@@ -821,19 +899,50 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             }
             imed = (m & 1) ? v[m / 2] : (v[m / 2 - 1] + v[m / 2]) / 2;
         }
-        if (r.n_real == 4) {
-            // Four corners really seen: every blob in this frame is an LED.
-            for (int i = 0; i < an; ++i)
-                wl_note(0, asz[i], (int)s_bw[i], (int)s_bh[i],
-                        (int)s_bi[i], imed, flags);
-            wl_note_frame();
-        } else if (r.locked && r.count == 4 && r.n_real == 3
-                   && jrej >= 0 && nkept == an - 1) {
-            // Three real corners and a reconstructed fourth, with exactly one
-            // blob rejected. The reconstruction says where the missing LED
-            // must be, so the rejected blob can be judged on POSITION alone:
-            // far from every corner and it was not an LED, whatever its size.
-            // That is a negative label the size gate had no part in.
+        if (r.locked && r.n_real == 4) {
+            // Four corners really seen, ON A MODEL THE RESOLVER TRUSTS.
+            //
+            // 'locked' is not decoration here, and leaving it off was a real
+            // bug: n_real == 4 alone is also true on the cold-start raw
+            // passthrough, which publishes ANY four blobs with no rectangle
+            // check and no scale check at all, and true again for the frames
+            // immediately after an angular seed, which sorts four blobs by
+            // angle and asks nothing else of them. Lock takes lock_frames of
+            // consistent geometry to come true; that wait IS the verification
+            // this class claims in the header ("a plausible rectangle at a
+            // plausible scale"), and without it the window and the lamp get
+            // learned as LEDs on the first frames after every quad_reset --
+            // which the tools trigger routinely with res:, mirx: and miry:,
+            // so the hole reopens long after boot.
+            //
+            // The damage is not just a loose ceiling. rig_led_max_h() reads
+            // this same edge, so junk in the positive class RAISES the refusal
+            // floor: a lamp learned as an LED is then what refuses the cut
+            // that would have caught it, and the user is locked out of the one
+            // setting they need with a message citing a measurement that never
+            // happened. The negative branch below always had this condition.
+            if (learning) {
+                for (int i = 0; i < an; ++i)
+                    wl_note(0, asz[i], (int)s_bw[i], (int)s_bh[i],
+                            (int)s_bi[i], imed, flags);
+                wl_note_frame();
+            }
+        } else if (r.locked && r.count == 4 && r.n_real == 3) {
+            // Three real corners and a reconstructed fourth. The
+            // reconstruction says where the missing LED must be, so any blob
+            // in this frame can be judged on POSITION alone: far from every
+            // corner and it was not an LED, whatever its size.
+            //
+            // The test is the RESOLVER's association, not the gate's verdict.
+            // Requiring a gate rejection here was a design error that would
+            // have shipped the feature dead: every gate defaults to 0, so
+            // nothing is ever rejected, so the negative class stayed
+            // structurally empty and 'camfit' could never reach a verdict on a
+            // gun straight out of the box -- on which it is the only thing
+            // that would have set a gate in the first place. The window case
+            // is not a rejection at all: the sensor has four slots, a bright
+            // window DISPLACES an LED, and the stray arrives as an ordinary
+            // kept blob that the resolver then declines to associate.
             //
             // Twice the resolver's own association radius, not once. Being
             // wrong here poisons the negative distribution with real LEDs and
@@ -841,25 +950,47 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             // something a stray is deliberately higher than the bar the
             // resolver uses for calling something a corner.
             const float gate2 = 2.0f * quad_default_config().gate;
-            float dmin = 1e9f;
-            for (int k = 0; k < 4; ++k) {
-                const float dx = ax[jrej] - r.p[k].x;
-                const float dy = ay[jrej] - r.p[k].y;
-                const float d = dx * dx + dy * dy;
-                if (d < dmin) dmin = d;
+            int nfar = 0, jfar = -1;
+            for (int i = 0; i < an; ++i) {
+                float dmin = 1e9f;
+                for (int k = 0; k < 4; ++k) {
+                    const float dx = ax[i] - r.p[k].x;
+                    const float dy = ay[i] - r.p[k].y;
+                    const float d = dx * dx + dy * dy;
+                    if (d < dmin) dmin = d;
+                }
+                if (dmin > gate2 * gate2) { ++nfar; jfar = i; }
             }
-            if (dmin > gate2 * gate2) {
-                wl_note(1, asz[jrej], (int)s_bw[jrej], (int)s_bh[jrej],
-                        (int)s_bi[jrej], imed, flags);
-                ++s_bfar;
-            } else {
-                // It was sitting where the missing LED should be. The gate
-                // almost certainly threw away a real corner -- so this is not
-                // evidence about strays, it is evidence about the gate, and it
-                // is counted where the user can see it. This is the
-                // false-negative meter: a gate that is too tight shows up here
-                // long before it shows up as a cursor that will not track.
-                ++s_bnear;
+            // Exactly one, and no more. One corner is missing, so at most one
+            // blob in this frame can honestly be the thing standing in its
+            // place. Two or more far blobs means the resolver's own
+            // association is in doubt, and a label drawn from a geometry we do
+            // not trust is worse than no label.
+            if (nfar == 1 && learning)
+                wl_note(1, asz[jfar], (int)s_bw[jfar], (int)s_bh[jfar],
+                        (int)s_bi[jfar], imed, flags);
+            // The two counters the tools subtract from bsrej, and they count
+            // SHAPE-GATE rejections only -- not every far blob, and not every
+            // rejection by any gate. bfar used to count every far blob once
+            // the label went positional, which put kept strays in it; bnear
+            // counted a blob dropped by the size window or the odd-one-out
+            // gate too. Subtracting either from bsrej, which counts shape
+            // rejections alone, mixed three populations: one kept stray a
+            // frame cancelled the threshold and masked a shape gate eating a
+            // real LED, and a bnear from rtol sent the user to switch off a
+            // height gate that was not the one doing it. With both narrowed
+            // to what the shape gate threw away, bsrej - bfar - bnear is
+            // exactly "shape rejections the resolver could not account for",
+            // and "bhmax:0 turns it off" is true whenever bnear speaks.
+            //
+            // bfar: the shape gate dropped it AND it sat far from every
+            // corner -- a stray, vouched for. bnear: the shape gate dropped it
+            // AND it sat where the missing LED had to be -- almost certainly
+            // a real corner thrown away. A gate that is too tight shows up in
+            // bnear long before it shows up as a cursor that will not track.
+            if (jrej >= 0 && nkept == an - 1 && srej[jrej]) {
+                if (jrej == jfar && nfar == 1) ++s_bfar;
+                else if (jrej != jfar)         ++s_bnear;
             }
         }
     }
@@ -877,8 +1008,17 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // Mode 1 folds the lead into the FIR inside aim_runtime_solve, which is
     // only reached with a calibration loaded. Uncalibrated, the lead must stay
     // here or it disappears with nothing replacing it.
+    // 'locked' here for the same reason as in the learning hook above, and to
+    // stop the two front ends disagreeing: the OV2640 path has always guarded
+    // this identical computation with q.locked && q.n_real >= 2. Before a lock,
+    // r.vx/vy is a real per-frame delta of an UNVERIFIED four-point model, and
+    // scaling it by lead_ms/dt pushes every published corner along it. The
+    // n_real >= 2 half is covered already -- the resolver zeroes vx/vy below
+    // two associated points -- so only the lock was missing. Cost of the guard
+    // is no lead for the pre-lock frames after each quad_reset, which is the
+    // conservative direction: less extrapolation, never more.
     if ((aim_tmode_get() == 0 || !aim_runtime_active())
-        && s_lead_ms > 0.0f && dt > 1e-4f) {
+        && s_lead_ms > 0.0f && dt > 1e-4f && r.locked) {
         const float frames = (s_lead_ms * 1e-3f) / dt;
         lx = r.vx * frames; ly = r.vy * frames;
         const float m = sqrtf(lx*lx + ly*ly);
@@ -941,18 +1081,60 @@ bool wiicam_cam_command(const char* line)
         // judges nothing at all. The two SENSOR thresholds stay out on
         // purpose: they are the only settings that can leave a gun dark, and
         // a power cycle has to remain a way out.
-        // The FORMAT is clamped to extended on the way to flash. Full mode is
-        // still unproven on this sensor -- we do not even know for certain
-        // which byte selects it -- and a gun that boots into a format the
-        // sensor does not honour reads a length that does not match the
-        // report, which decodes to plausible nonsense and aims wildly. On a
-        // Pi with no console that is unrecoverable without a terminal. Same
-        // rule as hwmax/hwmin: anything that can leave the gun unusable has to
-        // be one power cycle from gone. Lift this once full mode is confirmed.
+        // The FORMAT is saved AS IT STANDS, full mode included. This used to
+        // be clamped to extended, with a note saying to lift the clamp once
+        // full mode was confirmed -- and the clamp then outlived its reason and
+        // quietly gutted the feature built on top of it. The shape gate runs in
+        // full mode only, so a clamped format meant every saved bhmax loaded
+        // into a gun that could never execute it: the gate died on each power
+        // cycle while the tools reported it as active. A gate that silently
+        // does nothing is strictly worse than no gate, because the user stops
+        // looking for the real problem.
+        //
+        // Full mode is confirmed now: 0x55 selects it on this sensor, and two
+        // daylight captures came back with 36,420 confirmed LED boxes. The
+        // original hazard -- booting into a format the sensor does not honour,
+        // reading a length that does not match the report, and aiming wildly
+        // with no console to recover from -- is covered by machinery that
+        // already exists: GetPosition counts failed format writes and calls
+        // wiicam_aim_fmt_fallback(WIICAM_FMT_EXT) after five, so a sensor that
+        // will not do full mode drops back within a few frames on its own.
+        // fullreg is deliberately NOT saved, so a boot always starts from the
+        // 0x55 default rather than from a byte someone was experimenting with.
         const int save_fmt = (int)(s_ext_state & 3);
-        ok = aim_gate_store(save_fmt > WIICAM_FMT_EXT ? WIICAM_FMT_EXT : save_fmt,
-                            (int)s_bmin, (int)s_bmax, (int)s_rtol) && ok;
+        ok = aim_gate_store(save_fmt, (int)s_bmin, (int)s_bmax, (int)s_rtol)
+             && ok;
         ok = aim_gate2_store((int)s_pxmax, (int)s_armax, (int)s_bhmax) && ok;
+        // The LED edge of the provenance rides with it -- GATED and MAXED, or
+        // it undoes the floor through the back door. An earlier version wrote
+        // the live envelope whenever it had one: arm the capture in a dim
+        // corner, collect forty small blobs, press any Save button, and a
+        // stored led_max_h of 7 became 3. The refusal floor reads max(live,
+        // stored), so replacing 'stored' with the thin capture is the same
+        // failure that rule exists to prevent, one command later. Now the
+        // write needs the same 500 blobs camfit needs before it will derive
+        // anything, and only ever RAISES what is already in flash. The stray
+        // edge is left alone: it is camfit=apply's to record, since it is
+        // what a ceiling was derived FROM, and a hand-set ceiling has no
+        // stray behind it to record.
+        //
+        // And its verdict is kept OUT of 'ok'. fit0 sits in its own key so a
+        // bad write there can never cost the gate; folding it into the reply
+        // handed the tools a "SAVE FAILED" for a gate that had saved fine,
+        // and pical then told the user the format would not survive a power
+        // cycle when it had.
+        {
+            wl_envelope_t e;
+            wl_envelope(&e);
+            int sled = -1, sstray = -1, spx = -1;
+            const bool have = aim_fit_load(&sled, &sstray, &spx);
+            if (e.led_n >= 500 && e.led_max_h >= 0) {
+                const int nl = (have && sled > e.led_max_h) ? sled : e.led_max_h;
+                const int np = (have && spx > e.led_max_px) ? spx : e.led_max_px;
+                if (!have || nl > sled || np > spx)
+                    (void)aim_fit_store(nl, have ? sstray : 0, np);
+            }
+        }
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
                           s_lcx, s_lcy };
@@ -962,11 +1144,11 @@ bool wiicam_cam_command(const char* line)
         // beta rides in the reply so a tool can VERIFY what was written rather
         // than assume it; cam? reports the live value, this reports the stored one.
         reply(ok && lens_ok
-              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d fmt=%d bmin=%d bmax=%d rtol=%d bhmax=%d pxmax=%d armax=%d (sens lives in the OpenFIRE profile; full mode and the two SENSOR thresholds hwmax/hwmin are NOT saved, so a power cycle always clears them)\n"
+              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d fmt=%d bmin=%d bmax=%d rtol=%d bhmax=%d pxmax=%d armax=%d (sens lives in the OpenFIRE profile; the two SENSOR thresholds hwmax/hwmin are NOT saved, so a power cycle always clears them; fullreg is not saved either and comes back as 0x55)\n"
               : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), aim_beta_get(),
               (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
-              save_fmt > WIICAM_FMT_EXT ? WIICAM_FMT_EXT : save_fmt,
+              save_fmt,
               (int)s_bmin, (int)s_bmax, (int)s_rtol,
               (int)s_bhmax, (int)s_pxmax, (int)s_armax);
         return true;
@@ -1055,6 +1237,110 @@ bool wiicam_cam_command(const char* line)
         reply("%s\n", b);
         return true;
     }
+    if (!strncmp(line, "camfit", 6)) {
+        // Turn the two measured distributions into a ceiling, or say honestly
+        // that this rig has none. Everything here is derived from what THIS
+        // gun has seen; no number in it came from another rig.
+        wl_envelope_t e;
+        wl_envelope(&e);
+        // Exactly "=apply", not "=apply" plus anything. Every '~cam' command
+        // here matches on a prefix, which is harmless for a query but not for
+        // the one form that writes flash: 'camfit=applyfoo' would have set and
+        // saved a gate the user never asked for, from a typo.
+        const bool apply = !strcmp(line + 6, "=apply");
+        reply("CAM: fit ledn=%lu ledmaxh=%d straym=%lu strayminh=%d\n",
+              e.led_n, e.led_max_h, e.stray_n, e.stray_min_h);
+        // Contamination is said out loud rather than silently discounted. The
+        // samples set aside are almost certainly a window or the sun learned
+        // during a cold-start lock (see wl_envelope), and a user who sees
+        // "32 ignored at 31" understands their rig better than one who sees
+        // a clean 7 and never learns the sun was in the LED class at all.
+        if (e.led_outliers_h)
+            reply("CAM: fit %lu LED samples ignored -- they reach %d tall, far "
+                  "above the %d the rest stop at, and are almost certainly "
+                  "stray light learned while the resolver locked on it\n",
+                  e.led_outliers_h, e.led_abs_max_h, e.led_max_h);
+        if (e.led_n < 500 || e.led_max_h < 0) {
+            // The stored pair, if there is one. This is the whole reason it is
+            // written: after a power cycle the histograms are empty, and
+            // without this "why is bhmax 8?" has no answer at all -- the gun
+            // carries a number and no record of where it came from.
+            int sled = -1, sstray = -1, spx = -1;
+            if (aim_fit_load(&sled, &sstray, &spx))
+                reply("CAM: fit STORED ledmaxh=%d strayminh=%d ledmaxpx=%d -- "
+                      "from an earlier capture on this gun; recapture if the "
+                      "bar, the lens or the room has changed\n",
+                      sled, sstray, spx);
+            reply("CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+                  "capture on; %lu blobs so far, 500 wanted\n", e.led_n);
+            return true;
+        }
+        if (e.stray_n < 20 || e.stray_min_h < 0) {
+            reply("CAM: fit NO STRAY DATA -- sweep the room with the screen in "
+                  "view so a lamp or window enters frame; %lu seen, 20 wanted. "
+                  "Your LEDs measured %d tall.\n", e.stray_n, e.led_max_h);
+            return true;
+        }
+        const int gap = e.stray_min_h - e.led_max_h;
+        if (gap <= 0) {
+            // The one answer a gate cannot give itself. Said plainly, because
+            // the alternative is a number that half-works on a rig where
+            // nothing can work, and months of tuning a knob that was never
+            // going to help.
+            reply("CAM: fit NO SAFE GATE -- your LEDs reach %d tall and the "
+                  "stray light starts at %d, so a size gate cannot tell them "
+                  "apart. Move the bar, block the light, or use brighter "
+                  "LEDs.\n", e.led_max_h, e.stray_min_h);
+            return true;
+        }
+        // The gate keeps h <= bhmax and drops only h > bhmax, so the ceiling
+        // is the tallest height STILL ALLOWED. With a gap of 1 there is no
+        // room between the two, and the only value that separates them is the
+        // LED maximum itself: it keeps every LED this rig has measured and
+        // rejects the stray one step above. Setting led_max_h + 1 -- which is
+        // what this did -- lands exactly ON the stray height and therefore
+        // rejects nothing at all, a "TIGHT" gate that is really a no-op.
+        const int ceil_ = (gap > 1) ? (e.led_max_h + gap / 2) : e.led_max_h;
+        reply("CAM: fit bhmax=%d (LEDs reach %d, stray starts at %d%s)\n",
+              ceil_, e.led_max_h, e.stray_min_h,
+              gap == 1 ? " -- TIGHT, only one step between them" : "");
+        if (apply) {
+            s_bhmax = (uint8_t)ceil_;
+            // Apply means APPLY. The shape gate runs in full mode only, and a
+            // verdict can only ever have come from full-mode data (the box
+            // features need it), so full mode is what this ceiling was
+            // measured in and what it needs to act. Switch to it now if the
+            // gun has since dropped out of it, and persist FULL -- not
+            // whatever format happens to be live. The first cut stored the
+            // live format: apply from fmt:1 and the gun saved "bhmax=8,
+            // fmt=1", inert on this boot and every boot after, while the
+            // reply told the user to "set fmt:2" and let them believe the
+            // fix would stick. Both tools had also grown a workaround telling
+            // the user to press Save as well; a command called 'apply' that
+            // does not survive a reboot is the bug, not something to
+            // document. bmin/bmax/rtol ride along unchanged because gate0
+            // holds all four in one word.
+            if ((s_ext_state & 3) != WIICAM_FMT_FULL) {
+                ext_set(WIICAM_FMT_FULL);
+                reply("CAM: fit switched to fmt:2 -- the shape gate needs it "
+                      "and the ceiling was measured in it\n");
+            }
+            const bool ok = aim_gate2_store((int)s_pxmax, (int)s_armax,
+                                            (int)s_bhmax)
+                         && aim_gate_store(WIICAM_FMT_FULL, (int)s_bmin,
+                                           (int)s_bmax, (int)s_rtol)
+                         && aim_fit_store(e.led_max_h, e.stray_min_h,
+                                          e.led_max_px);
+            reply(ok ? "CAM: fit applied and saved\n"
+                     : "CAM: fit applied but SAVE FAILED -- it will be gone on "
+                       "the next power cycle\n");
+
+        } else {
+            reply("CAM: fit not applied -- send camfit=apply to set and save "
+                  "it\n");
+        }
+        return true;
+    }
     if (!strncmp(line, "camlearn", 8)) {
         const char* p = line + 8;
         if (!strncmp(p, "=reset", 6)) {
@@ -1118,7 +1404,17 @@ bool wiicam_cam_command(const char* line)
         // gate that stops the gun aiming would come back on the next boot and
         // the one command a user reaches for when nothing works would fix the
         // session and lose the argument.
-        const bool gone = aim_gate_clear() && aim_gate2_clear();
+        // Every key is attempted whatever the others did. The first cut used
+        // && and stopped at the first failure -- so if gate0 would not erase,
+        // gate1, which holds bhmax, was never even tried, on the one command a
+        // user reaches for when the gun has gone dark.
+        bool gone = aim_gate_clear();
+        gone = aim_gate2_clear() && gone;
+        gone = aim_fit_clear()   && gone;
+        // The live histograms go too, or the floor outlives the reset: with
+        // fit0 erased but the capture untouched, rig_led_max_h() still read
+        // the old bar's LEDs and refused a ceiling measured for the new one.
+        wl_reset();
         reply(gone ? "CAM: lens + lead cleared, blob gates off and unsaved, "
                      "sensor thresholds restored\n"
                    : "CAM: lens + lead cleared, blob gates off, sensor "
@@ -1187,7 +1483,27 @@ bool wiicam_cam_command(const char* line)
         else if (!strcmp(key, "tmode"))  { aim_tmode_set(val); }
         else if (!strcmp(key, "firk"))   { aim_fir_set(val, aim_fir_pct()); }
         else if (!strcmp(key, "firpct")) { aim_fir_set(aim_fir_k(), val); }
-        else if (!strcmp(key, "sens")) { if (s_sens_set && val >= 0 && val <= 2) s_sens_set(val); }
+        else if (!strcmp(key, "sens")) {
+            if (s_sens_set && val >= 0 && val <= 2) {
+                // A capture that spans a sensitivity change is two rigs
+                // averaged into one: the same LEDs go from a 2x2 box to 12x3
+                // between sens 1 and 2, and a histogram holding both reads as
+                // "cannot be separated" when neither gain was measured. The
+                // sink's own comment says to stop the capture first; nobody
+                // does, and the tools' sensitivity row sits on the very screen
+                // the capture runs from. So an ACTUAL change clears it and
+                // says so. Only an actual change -- the tools re-send a value
+                // on every keypress, and a same-value repeat must cost nothing.
+                const int was = s_sens_get ? s_sens_get() : -1;
+                s_sens_set(val);
+                if (was >= 0 && was != val && wl_enabled()) {
+                    wl_reset();
+                    reply("CAM: learn cleared -- sensitivity changed from %d "
+                          "to %d, and a capture spanning both is not a "
+                          "measurement of either\n", was, val);
+                }
+            }
+        }
         // fmt is the canonical key (0 basic, 1 extended, 2 full); ext is the
         // name the tools used when there were only two formats and still
         // works, clamped the same way. Only bump the epoch on a real change:
@@ -1235,31 +1551,80 @@ bool wiicam_cam_command(const char* line)
         }
         // Size steps, so the whole useful range is 0..15 like the size itself.
         else if (!strcmp(key, "rtol")) { s_rtol = (uint8_t)(val < 0 ? 0 : (val > 15 ? 15 : val)); }
-        // The shape gate. Refused below the measured LED envelope rather than
-        // clamped to it: a pxmax under 12 or an armax under 16 would reject
-        // blobs we have watched 52,624 real LEDs produce, and a gate that can
-        // do that is not a gate, it is an outage waiting for the right angle.
+        // The shape gate. Refused below THIS RIG's own measured envelope
+        // rather than clamped to it: a ceiling under what the gun has actually
+        // watched its own LEDs produce is not a gate, it is an outage waiting
+        // for the right angle. No number here comes from another rig -- a bar
+        // with five LEDs per cluster makes blobs several times larger than one
+        // with two, and a floor borrowed from the second refuses the only
+        // workable setting for the first.
         else if (!strcmp(key, "pxmax")) {
+            // Rig-derived, for the same reason as bhmax below. The floor here
+            // used to be a flat 12, measured off a two-LED-per-corner bar --
+            // and a five-per-cluster bar makes blobs several times larger, so
+            // that floor refused the only workable setting for it. A pixel
+            // count is not scale-free the way an aspect ratio pretends to be.
             const int v = val < 0 ? 0 : (val > 63 ? 63 : val);
-            if (v && v < 12)
-                reply("CAM: pxmax below 12 would reject measured LEDs -- not set\n");
-            else s_pxmax = (uint8_t)v;
+            const int fl = rig_led_max_px();
+            if (v && fl == RIG_PX_UNBOUNDED)
+                reply("CAM: pxmax not set -- this rig's LED blobs are larger "
+                      "than the pixel measurement can express, so no safe "
+                      "ceiling can be derived for it. Use bhmax, which camfit "
+                      "measures properly\n");
+            else if (v && fl >= 0 && v < fl)
+                reply("CAM: pxmax %d is below the largest LED this rig has been "
+                      "measured at (%d px) -- not set\n", v, fl);
+            else {
+                s_pxmax = (uint8_t)v;
+                if (v && (s_ext_state & 3) != WIICAM_FMT_FULL)
+                    reply("CAM: pxmax %d set but INERT -- the shape gate needs "
+                          "fmt:2 and this gun is in fmt:%d\n",
+                          v, (int)(s_ext_state & 3));
+            }
         }
         else if (!strcmp(key, "bhmax")) {
-            // Refused below 8, one step above the tallest LED ever measured
-            // (7 over 318 sampled blobs, and 99.73% of 11,996). Below that the
-            // gate starts eating corners, and a gate that can do that is not a
-            // gate.
+            // The floor is THIS RIG's tallest measured LED, not a number from
+            // someone else's. It used to be a hard 8, taken from a bar with two
+            // LEDs per corner -- and a bar with five per cluster produces blobs
+            // several times taller, so that floor would have refused the only
+            // sane setting for it while cheerfully accepting one that blinds
+            // it. Whatever the last capture actually saw is the only defensible
+            // bound, and with no capture there is nothing to defend, so the
+            // value is taken and the tools carry the warning.
             const int v = val < 0 ? 0 : (val > 63 ? 63 : val);
-            if (v && v < 8)
-                reply("CAM: bhmax below 8 would reject measured LEDs -- not set\n");
-            else s_bhmax = (uint8_t)v;
+            const int fl = rig_led_max_h();
+            if (v && fl >= 0 && v < fl)
+                reply("CAM: bhmax %d is below the tallest LED this rig has been "
+                      "measured at (%d) -- not set\n", v, fl);
+            else {
+                s_bhmax = (uint8_t)v;
+                // Set but not acting is the one state a user cannot see from
+                // 'cam?', so it is said at the moment it is created rather
+                // than left for them to wonder about.
+                if (v && (s_ext_state & 3) != WIICAM_FMT_FULL)
+                    reply("CAM: bhmax %d set but INERT -- the shape gate needs "
+                          "fmt:2 and this gun is in fmt:%d\n",
+                          v, (int)(s_ext_state & 3));
+            }
         }
         else if (!strcmp(key, "armax")) {
+            // DEPRECATED. It was measured at sensitivity 1, where LED blobs
+            // came out round; sensitivity 2 is the default now and its
+            // horizontal smear puts the median LED near 4:1, so the shape this
+            // gate was built to recognise is not the shape the sensor produces
+            // any more. It still loads and still applies, because a setting
+            // already in a gun's flash must not change meaning under it, but
+            // nothing suggests a value for it and camfit never sets it.
             const int v = val < 0 ? 0 : (val > 63 ? 63 : val);
             if (v && v < 16)
-                reply("CAM: armax below 16 (2:1) would reject measured LEDs -- not set\n");
-            else s_armax = (uint8_t)v;
+                reply("CAM: armax %d rejects blobs rounder than 2:1, which is "
+                      "most measured LEDs -- not set\n", v);
+            else {
+                s_armax = (uint8_t)v;
+                if (v) reply("CAM: armax is deprecated -- it was measured at "
+                             "sensitivity 1 and the default is now 2, where "
+                             "LED blobs are wide, not round. Use camfit\n");
+            }
         }
         // The sensor's own thresholds. -1 leaves the register alone; anything
         // else is written to it, on the pump core, at the next hw tick.
@@ -1268,12 +1633,26 @@ bool wiicam_cam_command(const char* line)
             // not a tuning value, it is a dark gun, and it is what a typo
             // lands on -- so it is refused by name rather than obeyed.
             if (val == 0) reply("CAM: hwmax:0 refused -- it blinds the sensor\n");
-            else { s_hwmax = (int16_t)(val < 0 ? WIICAM_HW_LEAVE
-                                       : (val > 255 ? 255 : val));
-                   s_hw_dirty = true; } }
-        else if (!strcmp(key, "hwmin")) { s_hwmin = (int16_t)(val < 0 ? WIICAM_HW_LEAVE
-                                                     : (val > 255 ? 255 : val));
-                                          s_hw_dirty = true; }
+            else {
+                const int16_t nv = (int16_t)(val < 0 ? WIICAM_HW_LEAVE
+                                             : (val > 255 ? 255 : val));
+                // Same rule as sens: the sensor's own size threshold changes
+                // what it reports, so a capture across the change is two rigs.
+                if (nv != s_hwmax && wl_enabled()) {
+                    wl_reset();
+                    reply("CAM: learn cleared -- hwmax changed\n");
+                }
+                s_hwmax = nv; s_hw_dirty = true;
+            } }
+        else if (!strcmp(key, "hwmin")) {
+            const int16_t nv = (int16_t)(val < 0 ? WIICAM_HW_LEAVE
+                                         : (val > 255 ? 255 : val));
+            if (nv != s_hwmin && wl_enabled()) {
+                wl_reset();
+                reply("CAM: learn cleared -- hwmin changed\n");
+            }
+            s_hwmin = nv; s_hw_dirty = true;
+        }
         else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); quad_reset(0); }
         else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); quad_reset(0); }
     }

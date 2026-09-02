@@ -8,7 +8,7 @@
 Aim at each target and pull the trigger (space or click also work), step back when
 asked. Requires pyserial, numpy, tkinter.
 """
-import argparse, json, os, queue, sys, threading, time
+import argparse, json, os, queue, re, sys, threading, time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -210,6 +210,63 @@ def sigma_from_hold(frames):
         q = (rc[:,0]*fc[:,1] - rc[:,1]*fc[:,0]).sum()/d
         res.append(fc - np.stack([p*rc[:,0]-q*rc[:,1], q*rc[:,0]+p*rc[:,1]], 1))
     return float(np.concatenate(res).std())/np.sqrt(0.5)
+
+
+# ===========================================================================
+# naming a capture so the next one cannot land on it
+# ===========================================================================
+# save() below used to name both its files from the wall clock alone, so two
+# captures inside the same second silently replaced each other -- and captures
+# happen exactly that fast, since taking one is press, look, press again. The
+# same fix is already in place for every other recording this project writes:
+# tools/gun_studio.py's seq_path() and pical/pical.py's next_recording() /
+# recording_path() both scan the output directory for the highest number
+# already used and count up from there.
+#
+# This is a copy of gun_studio.seq_path(), not an import of it: gun_studio
+# imports FROM this module (see its "from aim_calib import" line), so an
+# import running the other way would be circular. If the naming scheme ever
+# changes, change it in both places by hand.
+_SEQ_DIGITS = 3
+# Anchored, and bounded to six digits before the dash, so the OLD name this
+# scheme replaces -- 'shots-20260901-153042.txt' -- can never be misread as a
+# sequence number: a date is eight digits, and eight does not fit in six at
+# any offset, so a file saved before this change is simply invisible to the
+# scan instead of making the next capture number twenty million.
+_SEQ_RE = r"^%s-(\d{1,6})-"
+
+
+def _seq_path(outdir, prefix, ext=".csv", seq=None):
+    """(path, number) for the next capture in `outdir`. Never an existing file.
+
+    `seq` pins the number instead of scanning for it. A calibration writes TWO
+    files -- the shot log and the raw quads behind it -- and they are one
+    capture, not two: save() below scans once, for "shots", and passes the
+    number it got back in here for "rawquads", because a shot log numbered 7
+    whose quads are numbered 8 would be worse than no numbering at all.
+    """
+    n = 0
+    if seq is None:
+        try:
+            for f in os.listdir(outdir):
+                m = re.match(_SEQ_RE % re.escape(prefix), f)
+                if m:
+                    n = max(n, int(m.group(1)))
+        except OSError:
+            pass                # no directory yet, so this is number 1
+    else:
+        n = int(seq) - 1
+    stamp = time.strftime("%H%M%S")
+    # Still checked against the directory even when `seq` is pinned: nothing
+    # here may hand back a path that already exists, because overwriting a
+    # capture that cannot be taken again is the one failure this exists to
+    # prevent.
+    while True:
+        n += 1
+        p = os.path.join(outdir, "%s-%0*d-%s%s"
+                         % (prefix, _SEQ_DIGITS, n, stamp, ext))
+        if not os.path.exists(p):
+            return p, n
 
 
 class CaptureSession:
@@ -528,15 +585,17 @@ class CaptureSession:
     def save(self, outdir):
         outdir = os.path.abspath(outdir)
         os.makedirs(outdir, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        shp = os.path.join(outdir, "shots-%s.txt" % stamp)
+        # One seq for both files: they are one capture, not two, and _seq_path
+        # is what makes that number the same on the second call instead of
+        # re-scanning and possibly landing one higher.
+        shp, seq = _seq_path(outdir, "shots", ".txt")
         with open(shp, "w") as f:
             f.write("%g %g\n" % (FRAME_W, FRAME_H))
             if self.geom_note: f.write("# %s\n" % self.geom_note)
             for s in self.shots:
                 f.write("%.4f %.4f " % (s['tx'], s['ty']) +
                         " ".join("%.3f" % v for v in np.asarray(s['q']).reshape(-1)) + "\n")
-        rawp = os.path.join(outdir, "rawquads-%s.csv" % stamp)
+        rawp, seq = _seq_path(outdir, "rawquads", ".csv", seq=seq)
         with open(rawp, "w") as f:
             f.write("x0,y0,x1,y1,x2,y2,x3,y3\n")
             for q in self.raw:

@@ -47,7 +47,7 @@ from gun_studio import (BlobLog, CAM_KEYS, CAM_RANGE, FrameRate, LENS_KEYS,
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
 # every feature whose parsing lives in tools/ stops working -- silently, in a
 # way that looks exactly like a broken screen. So it is checked, out loud.
-LINK_API_NEEDED = 8
+LINK_API_NEEDED = 10
 LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
@@ -113,8 +113,9 @@ def next_recording(out_dir):
     n = 0
     try:
         for f in os.listdir(out_dir):
-            # Only our own numbered names. Everything else this directory
-            # holds is stamped '<name>-20260901-013038.<ext>', and read as a
+            # Only our own numbered names. A stick that has been used before
+            # still holds files stamped '<name>-20260901-013038.<ext>' from
+            # the versions that named recordings from the clock, and read as a
             # sequence number that date would make the next recording number
             # 20,260,902. The digit count is BOUNDED for exactly that reason:
             # at five it cannot reach the eight a date needs, so a datestamped
@@ -139,6 +140,11 @@ def recording_path(prefix, ext=".csv"):
     and a directory that may have failed to list, "highest + 1" is a good
     guess rather than a proof -- and overwriting a capture taken at the TV is
     the one failure this cannot have.
+
+    For the recordings THIS file writes: the blob logs, the shape CSVs and the
+    lens sweeps. A calibration's own two files are numbered by
+    CaptureSession.save() in the same scheme, and must not be numbered again
+    here -- see finish_calib.
     """
     if not os.path.isdir(OUT_DIR):
         os.makedirs(OUT_DIR)
@@ -206,6 +212,345 @@ def box_position_gap(blobs):
     return worst
 
 
+# ---------------------------------------------------------------------------
+# the gun's own verdict on the shape gate
+# ---------------------------------------------------------------------------
+# What '~camfit' wants before it will name a ceiling, mirrored here so a
+# progress bar can be drawn while the data is still coming in rather than only
+# after the gun refuses. Whatever the gun's own reply says wins over these:
+# they are only the starting point for a bar that has to be drawn before the
+# first answer arrives, and a firmware that moves its floor must not leave the
+# bar measuring against a number nothing on the gun believes any more.
+LED_WANT = 500
+STRAY_WANT = 20
+
+# When the shape gate counts as "refusing heavily": UNEXPLAINED rejections per
+# camera frame, where unexplained means the resolver did not confirm the blob
+# as stray light. Measured, not chosen -- see Camera.gate_lines for the session
+# that set it. Shared with Studio's own warning, which used to fire at 0.25 of
+# raw rejections while this one waited for 2.0, an eight-fold disagreement
+# about the same number.
+GATE_HEAVY_PER_FRAME = 1.0
+
+# The fewest camera frames a gate warning will be drawn from. A rate measured
+# over twenty frames is a tenth of a second of camera and swings wildly, and
+# this readout has about seven rows: a line that flickers in and out of them
+# costs a measurement somebody was reading. Shared by both gate warnings so
+# they cannot come and go on different evidence, and the same floor Studio
+# takes its own window over.
+GATE_WINDOW_FRAMES = 30
+
+# How long a borrow waits for the gun to say whether the shape capture is
+# already running before it arms one anyway. A real answer is thirteen lines
+# and up to 2.6 KB, so this is a wait for a reply to cross the wire rather
+# than for a round trip -- and a gun with no capture at all never answers,
+# which is why it has to end.
+CAM_ARM_S = 1.5
+
+
+class FitReport:
+    """The last '~camfit' answer, held whole.
+
+    The gun always sends the counters first -- 'CAM: fit ledn=... straym=...'
+    -- and then exactly one outcome line. Assembled here rather than read off
+    link.last because the two halves mean nothing apart: the counters say how
+    far the measurement has got, the outcome says what it came to, and a
+    screen that showed one without the other would either report progress
+    towards a verdict that already exists or a verdict with nothing behind it.
+
+    Everything degrades to "we do not know". A gun on older firmware never
+    answers '~camfit' at all, so `verdict` stays None for ever -- and every
+    caller here treats None as "this gun cannot measure it", never as "no safe
+    gate" and never as a number.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self, new_gun=True):
+        """Forget it all. Used on a reconnect: a verdict is a measurement of
+        one gun in one room, and the gun that comes back may be another.
+
+        `new_gun=False` keeps one thing: whether the gun HAS the command.
+        Clearing the histograms -- which is what starting a capture does --
+        throws away the measurement but changes nothing about the firmware
+        underneath, and forgetting that there would set every screen asking
+        an old gun all over again. That is the log-flooding the flag exists
+        to stop, and it would come back on the one screen most likely to
+        clear the histograms."""
+        keep = True if new_gun else self.supported
+        self.ledn = self.stray_n = 0
+        self.led_h = self.stray_h = None
+        self.led_want, self.stray_want = LED_WANT, STRAY_WANT
+        self.verdict = None      # 'need_led' / 'need_stray' / 'no_gate' / 'gate'
+        self.bhmax = None
+        self.tight = False
+        self.stored = None       # (LED rows, stray rows) from an earlier capture
+        self.stored_px = None    # ...and the pixel envelope beside them
+        self.ignored = None      # (count, height reached, height of the rest)
+                                 # for LED samples the gun set aside as stray
+        self.applied = None      # 'saved' / 'unsaved' once the gun has set it
+        self.switched = False    # apply put the gun into full mode itself
+        self.inert = False       # an OLDER firmware saying the gate cannot act
+        self.seq = 0             # whole answers seen, so a caller that has
+                                 # just asked can tell a fresh one from the
+                                 # one that was already on screen
+        self.t = 0.0             # monotonic, for the same reason
+        # Whether this gun has the command at all. True until it says
+        # otherwise, because a gun that has simply not been asked yet is not
+        # the same thing as one that cannot answer.
+        self.supported = keep
+
+    # The counters always arrive as a k=v run; the outcomes are sentences with
+    # numbers in them. Pulled out by name and by position respectively, and
+    # never by a blanket k=v sweep of every 'CAM: fit' line: the STORED line
+    # carries ledmaxh= and strayminh= of its own, from an OLD capture, and a
+    # sweep would quietly overwrite the live measurement with them.
+    _NUM = re.compile(r"-?\d+")
+
+    def _ints(self, s):
+        return [int(v) for v in self._NUM.findall(s)]
+
+    def feed(self, line):
+        """Take one 'CAM: fit' line. True if it was ours."""
+        if "unknown command" in line and "camfit" in line:
+            # Firmware older than the fit answers every ask with a refusal.
+            # Recorded so the screens stop asking: at one poll every couple of
+            # seconds that is a thousand lines an hour into a 200-line log
+            # ring, and the log is exactly where a user is sent to read the
+            # diag verdict and the result of a save.
+            self.supported = False
+            return True
+        if not line.startswith("CAM: fit"):
+            return False
+        self.supported = True
+        rest = line[8:].strip()
+        if rest.startswith("ledn="):
+            # A fresh reading starts here, so the previous outcome goes with
+            # it. Left standing, a gun that had dropped back to NEEDS MORE
+            # LED DATA -- which is what a power cycle does -- would go on
+            # showing the ceiling from before it, and that ceiling is the one
+            # thing on this screen nobody may guess at.
+            self.verdict, self.bhmax, self.applied = None, None, None
+            self.tight = self.inert = self.switched = False
+            # The provenance and the contamination note go with it. Both are
+            # sent BELOW this line when the gun has them, so a reading that
+            # does not carry them is a gun that no longer has them -- which
+            # '~camreset' now produces by wiping the stored pair. Kept, they
+            # would go on showing an erased measurement as this gun's own.
+            self.stored = self.stored_px = self.ignored = None
+            got = {}
+            for tok in rest.split():
+                k, sep, v = tok.partition("=")
+                if sep and k in ("ledn", "ledmaxh", "straym", "strayminh"):
+                    try:
+                        got[k] = int(v)
+                    except ValueError:
+                        pass
+            self.ledn = got.get("ledn", 0)
+            self.stray_n = got.get("straym", 0)
+            # -1 is the firmware's "nothing measured", not a height of minus
+            # one row. Kept as None so no caller can print it as a number.
+            self.led_h = got.get("ledmaxh") if got.get("ledmaxh", -1) >= 0 else None
+            self.stray_h = (got.get("strayminh")
+                            if got.get("strayminh", -1) >= 0 else None)
+            return True
+        if "LED samples ignored" in rest:
+            # Samples the gun set aside before working out the ceiling. It
+            # starts with a DIGIT after 'CAM: fit ', so it matched no branch
+            # here and reached the log only -- and the log is not where
+            # anybody reads it. The whole reason the firmware says it out loud
+            # is that a user who sees "32 ignored at 31 rows" understands
+            # their rig, where one who sees a clean 7 never learns the sun
+            # spent the capture in the LED class.
+            n = self._ints(rest)
+            if len(n) >= 3:
+                self.ignored = (n[0], n[1], n[2])
+            return True
+        if rest.startswith("switched to fmt:"):
+            # 'apply' now puts the gun into full mode itself and persists
+            # THAT, rather than whatever format happened to be live. Worth
+            # carrying: it is a change to the gun the user did not ask for by
+            # name, and the screen that asked for the apply should say so.
+            self.switched = True
+            return True
+        if rest.startswith("STORED"):
+            # By NAME, not by position. This line gained a third measurement
+            # -- the pixel envelope -- after it was first parsed here, and a
+            # positional reader would have kept working by luck and then
+            # silently mis-read the next field added to it. The height pair is
+            # what this screen shows, because height is the gate it can set;
+            # the pixel figure is carried so a later screen has it rather than
+            # having to ask the gun again.
+            got = {}
+            for tok in rest.split():
+                k, sep, v = tok.partition("=")
+                if sep and k in ("ledmaxh", "strayminh", "ledmaxpx"):
+                    try:
+                        got[k] = int(v)
+                    except ValueError:
+                        pass
+            if "ledmaxh" in got and "strayminh" in got:
+                self.stored = (got["ledmaxh"], got["strayminh"])
+                self.stored_px = got.get("ledmaxpx")
+            return True
+        if rest.startswith("INERT"):
+            # The gun accepted the ceiling and then said it cannot act on it:
+            # the shape gate compares box heights and this gun is not
+            # reporting boxes. NOT an outcome -- it arrives after one, in the
+            # same answer -- so nothing is published and the verdict it
+            # qualifies is left standing.
+            self.inert = True
+            return True
+        if rest.startswith("NEEDS MORE LED DATA"):
+            n = self._ints(rest)
+            if len(n) >= 2:
+                self.ledn, self.led_want = n[0], n[1]
+            self.verdict = "need_led"
+        elif rest.startswith("NO STRAY DATA"):
+            n = self._ints(rest)
+            if len(n) >= 2:
+                self.stray_n, self.stray_want = n[0], n[1]
+            if len(n) >= 3:
+                self.led_h = n[2]
+            self.verdict = "need_stray"
+        elif rest.startswith("NO SAFE GATE"):
+            n = self._ints(rest)
+            if len(n) >= 2:
+                self.led_h, self.stray_h = n[0], n[1]
+            self.verdict = "no_gate"
+        elif rest.startswith("bhmax="):
+            n = self._ints(rest)
+            if n:
+                self.bhmax = n[0]
+            if len(n) >= 3:
+                self.led_h, self.stray_h = n[1], n[2]
+            self.tight = "TIGHT" in rest
+            self.verdict = "gate"
+        elif rest.startswith("applied"):
+            # The save is reported separately from the setting, because they
+            # fail separately: a gate that took but did not reach flash is
+            # gone on the next power cycle and nothing else would say so.
+            self.applied = "unsaved" if "SAVE FAILED" in rest else "saved"
+            return True
+        else:
+            # 'not applied -- send camfit=apply', and anything a later
+            # firmware adds. Not an outcome, so nothing is published: the
+            # screen keeps the verdict it already has rather than being
+            # blanked by a line it did not understand.
+            return True
+        self.seq += 1
+        self.t = time.monotonic()
+        return True
+
+    def stored_words(self):
+        """The gun's own record of an earlier capture, in words, or None.
+
+        A stray height of 0 means NO camfit has ever applied on this gun:
+        '~camsave' records the LED edge on its own and leaves the stray side
+        at zero. Printed as "stray at 0" that reads as a measured room with no
+        light in it, which is the opposite of what it says -- and 0 is the one
+        value that cannot be a measured height, since the gate rejects only
+        what is TALLER than the ceiling.
+        """
+        if not self.stored:
+            return None
+        led, stray = self.stored
+        return ("LEDs %d rows, room light %s"
+                % (led, "not recorded" if not stray else "%d rows" % stray))
+
+    def ignored_words(self):
+        """The samples the gun set aside, in words, or None."""
+        if not self.ignored:
+            return None
+        n, high, rest = self.ignored
+        return ("%d LED samples reached %d rows against the %d the rest stop "
+                "at" % (n, high, rest))
+
+    def enough(self):
+        """Has the gun got as far as an answer about the gate itself?"""
+        return self.verdict in ("no_gate", "gate")
+
+    def progress(self):
+        """(LED fraction, stray fraction) of what the gun says it wants."""
+        return (min(1.0, self.ledn / float(max(1, self.led_want))),
+                min(1.0, self.stray_n / float(max(1, self.stray_want))))
+
+
+class Meter:
+    """A since-boot counter read as a RATE, over a window of recent replies.
+
+    Every counter on the '~camblob?' line counts from power-on. Read raw, a
+    warning built on one can never clear: a single event at any point in the
+    session pins it on screen for the rest of the power cycle, which is how a
+    'SIZE WINDOW TOO TIGHT' line came to sit permanently over a window the
+    user had already widened.
+
+    A one-reply delta clears, and that is what the drop counts use -- but it
+    is too short to answer "is this gate refusing HEAVILY?", which is a
+    question about a sustained share rather than about one second. So samples
+    are kept for a few seconds and the climb is measured across them.
+
+    Samples are keyed on the gun's own frame count, not on being called. This
+    is read from draw() at about 60 fps while a reply lands roughly once a
+    second: appending per call would fill the window with sixty copies of the
+    same reading and the "window" would be a sixtieth of a second long.
+    """
+
+    def __init__(self, window_s=8.0):
+        self.window = window_s
+        self._s = []              # (monotonic, gun frames, {key: value})
+
+    def _prune(self, now):
+        # By TIME, and with no floor on how few samples may be left. A gun
+        # that has stopped answering must let its warnings expire: keeping the
+        # last two samples alive for ever would hold the final climb on screen
+        # long after there was anything behind it.
+        while self._s and now - self._s[0][0] > self.window:
+            self._s.pop(0)
+
+    def feed(self, frames, values):
+        """One gun reply's worth of counters, if it really is a new one."""
+        if not isinstance(frames, (int, float)):
+            return
+        now = time.monotonic()
+        self._prune(now)
+        if self._s and frames == self._s[-1][1]:
+            return
+        if self._s and frames < self._s[-1][1]:
+            # A gun that rebooted restarts every counter at zero, and a
+            # negative climb read as a rate is a warning that can never come
+            # back. Start again rather than reporting nonsense.
+            self._s = []
+        self._s.append((now, frames, dict(values)))
+
+    def span(self):
+        """(frames, seconds) the window currently covers -- 0 when it holds
+        fewer than two samples and nothing can be measured yet."""
+        self._prune(time.monotonic())
+        if len(self._s) < 2:
+            return 0, 0.0
+        return self._s[-1][1] - self._s[0][1], self._s[-1][0] - self._s[0][0]
+
+    def climb(self, key):
+        """How far `key` has moved across the window. Never negative."""
+        self._prune(time.monotonic())
+        if len(self._s) < 2:
+            return 0
+        a, b = self._s[0][2].get(key), self._s[-1][2].get(key)
+        if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+            return 0
+        return max(0, b - a)
+
+    def per_frame(self, key):
+        """That climb per camera frame, which is the only fair denominator:
+        the sensor hands over at most four blobs a frame, so 'two rejected per
+        frame' is a share anyone can judge where 'nine hundred rejected' is
+        just a number that grows."""
+        frames, _s = self.span()
+        return self.climb(key) / float(frames) if frames > 0 else 0.0
+
+
 def heat(t):
     """A density as a colour: cold blue for a box that is mostly empty,
     bright amber for one that is solid.
@@ -243,24 +588,36 @@ TIP_Y = 0.90
 READOUT_STEP = 1.25
 
 
-def readout_cols(sc):
-    """How many characters of the small readout face fit across the screen.
+def cols_for(font, px):
+    """How many characters of `font` fit across `px` pixels.
 
-    Measured off the font rather than assumed. The camera readout used to wrap
-    at a flat 96 columns whatever the screen was, which on the Pi's 1024x768
-    filled 686 px and left 338 px unused -- and every column it did not use
-    cost a wrapped row of a readout that is already fighting for room. 0.90 of
-    the width, because the lines are CENTRED and the widest of them is not
-    known until it is built.
+    Measured off the face rather than assumed, and it has to be: the faces are
+    sized from the screen's HEIGHT while the room a block of text has is a
+    fraction of its WIDTH, so the same sentence that sits comfortably on the
+    Pi's 4:3 panel runs off the side of a short 16:9 one. Text here is drawn
+    CENTRED with no wrapping of its own, so an over-long line does not clip --
+    it loses a word off each end, and nothing on screen says it happened.
     """
     sample = "abcdefghijklmnopqrstuvwxyz 0123456789 ,.:-"
     try:
-        avg = sc.f_xs.size(sample)[0] / float(len(sample))
+        avg = font.size(sample)[0] / float(len(sample))
         if avg > 0:
-            return max(60, int(sc.w * 0.90 / avg))
+            return max(20, int(px / avg))
     except Exception:
         pass
-    return 96                 # the width this wrapped at before it measured
+    return 40
+
+
+def readout_cols(sc):
+    """How many characters of the small readout face fit across the screen.
+
+    The camera readout used to wrap at a flat 96 columns whatever the screen
+    was, which on the Pi's 1024x768 filled 686 px and left 338 px unused --
+    and every column it did not use cost a wrapped row of a readout that is
+    already fighting for room. 0.90 of the width, because the lines are
+    CENTRED and the widest of them is not known until it is built.
+    """
+    return max(60, cols_for(sc.f_xs, sc.w * 0.90))
 
 
 # ---------------------------------------------------------------------------
@@ -664,11 +1021,18 @@ class Camera(RowScreen):
         self._log = None           # CSV on the stick, when logging
         self._log_seq = 0          # ...and the number in its name
         self._learn_t = 0.0        # last '~camlearn?' poll, monotonic
+        self._fit_t = 0.0          # ...and the last '~camfit?' one
+        self._ask_t = 0.0          # the last question of ANY kind, so two of
+                                   # them can never be asked in one breath
+        self._meter = Meter()      # bsrej as a rate, over seconds of replies
+        self._parsed_raw = None    # the blob line these came from...
+        self._parsed = []          # ...parsed once, not once per reader
         self._blob_last = ""       # keeps the last percentage on screen while
                                    # the next window fills, so it stops flashing
         self.advanced = False      # which of the two row pages is built
         self.shape_rect = None     # what the sensor panel last covered, so
                                    # hostcheck can measure it against the rows
+        self.view_rect = None      # ...and the camera view stacked above it
         self.build()
         self._built_wii = self.wiicam()
 
@@ -738,28 +1102,41 @@ class Camera(RowScreen):
             # sensitivity: turn the gain up and the sensor smears a blob
             # sideways -- the same LEDs went from a 2x2 box to 12x3 -- so
             # width, area, pixel count and roundness all start measuring the
-            # gain instead. Height does not move, and an LED's box has never
-            # been taller than 7 rows over 11,996 sampled blobs.
+            # gain instead. Height does not move.
+            #
+            # NO NUMBER IS SUGGESTED HERE, and none may be. The figure this
+            # row used to recommend was measured on ONE bar with two LEDs per
+            # corner; a bar with five LEDs in each cluster makes a blob
+            # several times taller, so that ceiling drops every real LED on
+            # such a gun -- and the owner sees a cursor that will not lock,
+            # with nothing anywhere pointing at a row they set weeks ago. The
+            # only defensible source for a non-zero value is '~camfit' on the
+            # rig it is going to run on, which is what the room-light sweep
+            # exists to feed. The hint points there instead.
             #
             # In ROWS, not pixels, and never "12 px": pxmax on the next page
             # is a count of lit pixels and would read identically. Same units
             # and same ladder as Studio's own row, so the two front ends
             # cannot describe the same gate two different ways.
             #
-            # The ladder starts at the firmware's own floor and never leaves
-            # it: the gun REFUSES a bhmax of 1..7 outright rather than
-            # clamping, so a plain step of 1 would spend its first seven
-            # presses sending values the gun throws away -- which from the
-            # sofa is a row whose arrows visibly do nothing.
+            # The ladder is a list of plausible values, not a list of values
+            # worth choosing, and not a list of values the gun is guaranteed
+            # to take either. Its floor is no longer a fixed number: the gun
+            # refuses any ceiling BELOW the tallest LED this rig has been
+            # measured at, and with nothing measured it accepts anything. So a
+            # rung can be refused on a gun whose LEDs are taller than it --
+            # which is exactly the five-LED-cluster case -- and the refusal is
+            # surfaced as a toast rather than left as a row whose arrows
+            # visibly do nothing. The first non-zero rungs are the numbers
+            # this ladder was built from when the floor WAS fixed; they are
+            # kept only so the step from "off" is not a cliff.
             self.rows.append(Row(
                 "Biggest blob (height)", "spin",
                 get=lambda: link.last.get("bhmax"),
                 set=lambda v: link.send("~cam=bhmax:%d" % v),
                 vals=(0, 8, 10, 12, 16, 24),
                 fmt=lambda v: "off" if not v else "%d rows" % v,
-                hint="drops a blob taller than this -- the gate to use. LEDs "
-                     "measure 7 rows, so 10 is recommended. Needs Blob "
-                     "detail 2"))
+                hint=self.bhmax_hint))
             # Measuring what an LED actually looks like on this rig, from the
             # couch. The gun does the accumulating; both of these exist
             # because the Pi has no console and the LED bar is at the TV, so
@@ -846,13 +1223,22 @@ class Camera(RowScreen):
         # one is the second. They are kept because guns in the field are set
         # up with them, not because they are what to reach for now.
         #
-        # Both ladders are the MEASURED LED envelope with a step of margin,
-        # and both start at the firmware's own floor. That matters here more
-        # than anywhere: the gun REFUSES a pxmax of 1..11 and an armax of
-        # 1..15 rather than clamping them, so a plain lo/hi step of 1 would
-        # spend its first eleven presses sending values the gun throws away --
-        # on a screen with no console, that is a row whose arrows visibly do
-        # nothing and no way at all to find out why.
+        # Both ladders are lists of values the GUN WILL ACCEPT, and nothing
+        # more. They used to be an LED envelope with a step of margin, and
+        # that envelope came off ONE bar with two LEDs per corner: a cluster
+        # of five makes a blob several times bigger in every one of these
+        # units, so those rungs blind such a gun and its owner has no way at
+        # all to find out why. Every rung is legal, none is a suggestion, and
+        # the ceiling that is worth having comes from '~camfit' on the rig it
+        # will run on -- nothing here can know it. Their floors are no longer
+        # fixed numbers either: the gun refuses a ceiling below what THIS rig
+        # has measured its own LEDs at, and accepts anything at all when it
+        # has measured nothing. So the ladders cannot promise every rung will
+        # be taken; a rung under this gun's own envelope is refused by name,
+        # which pical turns into a toast rather than leaving it as a row whose
+        # arrows visibly do nothing. The first non-zero rungs are the numbers
+        # they were built from back when the floors were fixed, kept only so
+        # the step from "off" is not a cliff.
         #
         # Labelled and shown in what they physically reject, not in the wire's
         # units: 'armax 20' is unreadable, '2.5:1' is a shape.
@@ -869,25 +1255,35 @@ class Camera(RowScreen):
         # blob sideways -- 2x2 became 12x3 on the same LEDs -- so this gate
         # measures the gain and throws away real LEDs, which reaches the user
         # as a cursor that sticks and never as a row they set weeks ago.
+        #
+        # DEPRECATED as well as not recommended, and the two are different
+        # things: it still loads and still applies, so a gun somebody set up
+        # with it keeps behaving exactly as it did, but nothing offers a value
+        # for it any more and '~camfit' will never set it. The height gate is
+        # the one the measurement can actually reach.
         self.rows.append(Row(
             "Roundness limit", "spin",
             get=lambda: link.last.get("armax"),
             set=lambda v: link.send("~cam=armax:%d" % v),
             vals=(0, 16, 20, 24, 32),
             fmt=lambda v: "off" if not v else "%g:1" % (v / 8.0),
-            hint="drops a blob longer than this beside its width; NOT "
-                 "recommended, wrong at sensitivity 2. Needs Blob detail 2"))
+            hint="DEPRECATED and NOT recommended -- drops real LEDs at "
+                 "sensitivity 2. Needs Blob detail 2"))
         # The sensor's own thresholds. These gate INSIDE the camera, before
         # it hands out its four slots, so they are the only ones that stop
         # a stray source from costing a corner rather than being noticed
         # after it already has.
+        #
+        # No figure here either. The range this row used to quote was read off
+        # somebody else's hardware, and "our LEDs can never be large" is a
+        # claim about one bar: on a five-LED cluster they certainly can.
         self.rows.append(Row(
             "Sensor max size (0x06)", "spin",
             get=lambda: link.last.get("hwmax"),
             set=lambda v: link.send("~cam=hwmax:%d" % v),
             vals=(-1, 60, 80, 100, 120, 140, 160, 180, 200, 224, 255),
-            hint="the camera's OWN ceiling; -1 leaves it alone. Nintendo "
-                 "used 100-200. Safe knob: our LEDs can never be large"))
+            hint="the camera's OWN ceiling, inside the sensor; -1 leaves it "
+                 "alone, which is how it ships"))
         self.rows.append(Row(
             "Sensor min size (0x1B)", "spin",
             get=lambda: link.last.get("hwmin"),
@@ -1036,6 +1432,188 @@ class Camera(RowScreen):
         return ("measures what a confirmed LED looks like here; set Blob "
                 "detail to 2 first")
 
+    def bhmax_hint(self):
+        """What this gate is, and where its number has to come from.
+
+        Never a suggested figure. The one that used to sit here was measured
+        on a single bar with two LEDs per corner, and a cluster of five makes
+        a blob several times taller: borrowed onto that gun the ceiling drops
+        every real LED, and what the owner sees is a cursor that will not
+        lock, with nothing on any screen connecting it to this row. So the
+        only number this hint will ever show is one THIS gun measured, and
+        until it has, it points at the sweep that measures it.
+
+        Short on purpose: hints are drawn centred, on one line, with no
+        wrapping anywhere, so a long one loses a word off each end -- and the
+        word it loses is at the end, which is where the instruction is.
+        """
+        fit = self.app.fit
+        if fit.verdict == "no_gate":
+            return ("NO SAFE GATE here: your LEDs and the room light are the "
+                    "same height. Leave it off and fix the light")
+        if fit.verdict == "gate" and fit.bhmax is not None:
+            return ("drops a blob taller than this. This gun measured %d rows. "
+                    "Needs Blob detail 2" % fit.bhmax)
+        return ("drops a blob taller than this; 0 is off. Needs Blob detail 2, "
+                "and the room sweep to measure it")
+
+    def gate_keys(self):
+        """Which of the shape gate's three inputs -- bhmax, pxmax, armax --
+        the gun is actually holding non-zero right now.
+
+        The gate is bhmax || pxmax || armax: a ceiling on ANY ONE of the
+        three is enough to make it act, so 'is it on' and 'what turns it
+        off' both have to look at all three rather than assume the row this
+        page shows first. A rig set up from the second page with pxmax or
+        the DEPRECATED armax, with Biggest blob (height) never touched,
+        runs the gate with bhmax sitting at 0 the whole time -- which is
+        exactly the rig every message below used to get wrong.
+        """
+        last = self.app.link.last
+        return [k for k in ("bhmax", "pxmax", "armax") if last.get(k)]
+
+    def gate_off_clause(self, keys):
+        """`keys` worded as the settings that zero them: 'bhmax:0', or
+        'bhmax:0 and pxmax:0' when more than one is holding the gate up.
+        Callers only reach this once `keys` is known to be non-empty."""
+        return " and ".join("%s:0" % k for k in keys)
+
+    def gate_lines(self):
+        """The shape gate in plain words: the verdict, and any doubt about it.
+
+        Four things belong here and nowhere else on this screen. A gate
+        that is set but cannot act, which is invisible from every other row
+        on the screen. What the gun set aside as contamination while it was
+        measuring, because that is what turns a bare ceiling into one
+        somebody can actually trust. The gun's own verdict, because NO SAFE
+        GATE is an answer no amount of tuning can improve on and a user who
+        has not been told that will spend an evening looking for the
+        number. And how much the gate is throwing away, because a gate
+        quietly refusing a large share of what the sensor finds is the
+        state that ends in "the cursor stopped working". The false-negative
+        meter -- the only counter that says a gate is WRONG rather than
+        merely busy -- is fed from the same window as the last of these,
+        but is drawn ABOVE it, in blob_lines(): it describes the last few
+        seconds, and a standing state below it would push it off the screen
+        the moment it appeared.
+
+        Every one of them says how to switch the gate off, and by NAME: the
+        gate is bhmax || pxmax || armax, so 'bhmax:0' silences it only when
+        bhmax is the row actually holding it up. Named from the gun's own
+        reply rather than assumed, because a rig gated through pxmax or the
+        DEPRECATED armax alone has bhmax sitting at 0 already -- telling
+        that owner to zero a row that already is would read as an answer
+        while changing nothing.
+        """
+        out = []
+        fit = self.app.fit
+        # Read once, off the gun's own reply, for the whole of this call --
+        # link.last cannot move mid-draw.
+        keys = self.gate_keys()
+        gate_on = bool(keys)
+        full = self.full_mode()
+        if gate_on and not full:
+            # A ceiling that cannot act. The shape gate compares box HEIGHTS,
+            # and outside full report mode the gun does not report a box at
+            # all -- so the gate stands down and the number in the row above
+            # judges nothing. This is the exact shape of the bug that made the
+            # whole feature a no-op for a release: the saved format was
+            # clamped below full mode, so every saved ceiling loaded into a
+            # gun that could never execute it. Nothing else on this screen
+            # shows it: the row reads "10 rows", the gun agrees, and the gate
+            # is doing nothing whatsoever.
+            out.append("SHAPE GATE IS SET BUT INERT -- it compares box "
+                       "heights and Blob detail is not 2, so it is judging "
+                       "nothing. Set Blob detail to 2 and Save, or %s to "
+                       "turn the gate off" % self.gate_off_clause(keys))
+        told = fit.ignored_words()
+        if told:
+            # What the gun threw out of its own LED measurement. This reaches
+            # the readout rather than only the log because it is the one line
+            # that explains a ceiling: an envelope of 7 rows with 32 samples
+            # set aside at 31 is a rig with the sun in the LED class, and the
+            # user who knows that can fix it. Never phrased as an error -- the
+            # gun handled it correctly, and the ceiling it names is measured
+            # from the rest.
+            out.append("LED CAPTURE PARTLY CONTAMINATED: %s -- almost "
+                       "certainly stray light learned as an LED. It is left "
+                       "out of the ceiling; block that light and capture "
+                       "again for a cleaner one" % told)
+        if fit.verdict == "no_gate":
+            # First and unconditional. This is the gun saying the thing this
+            # whole screen is for cannot be done on this rig, and it must not
+            # be crowded out by a counter.
+            #
+            # The advice names whatever the gun is CURRENTLY holding non-zero
+            # rather than bhmax by default: a no_gate verdict says nothing
+            # about which of the three rows a user reached for, and a rig
+            # gated through pxmax alone already has bhmax at 0 -- so 'keep it
+            # off with bhmax:0' would be true and useless in the same breath.
+            # Nothing set at all is said plainly too, rather than naming a
+            # row that was never the one holding the gate up.
+            if keys:
+                meanwhile = ("keep it off with %s meanwhile"
+                            % self.gate_off_clause(keys))
+            else:
+                meanwhile = "it is off already"
+            out.append("NO SAFE GATE ON THIS RIG -- your LEDs reach %s rows "
+                       "and the room light starts at %s, so a size gate "
+                       "cannot tell them apart. Move the bar, block the light "
+                       "or use brighter LEDs; %s"
+                       % (fit.led_h if fit.led_h is not None else "?",
+                          fit.stray_h if fit.stray_h is not None else "?",
+                          meanwhile))
+        # The rate, over seconds rather than since boot -- and what is
+        # counted is the part the resolver could NOT explain.
+        #
+        # The first version of this warned on raw rejections at one per frame,
+        # with the argument that the resolver can only ever name one stray a
+        # frame, so one rejection a frame is where honest work ends. The real
+        # log said otherwise. A 92 s daylight session with bhmax:8 held four
+        # straight seconds at EXACTLY 1.00 rejected per frame -- br4 zero,
+        # br3 every frame, bnear zero throughout. That is the sun holding one
+        # of the four slots, the gate refusing it on every frame, the gun
+        # running on three real corners and one reconstructed: the gate doing
+        # precisely its job, in the very scene it exists for. A warning at
+        # "one per frame" fires for the whole of that stretch.
+        #
+        # What distinguishes that from a gate eating the bar is already on
+        # the wire. bfar counts blobs the SHAPE GATE dropped that the resolver
+        # then placed far from every expected corner -- confirmed strays --
+        # and bnear the ones it placed exactly where a missing LED should have
+        # been. Both count SHAPE-gate rejections only, and both now count on
+        # EVERY frame rather than only while a capture is armed: the recording
+        # into the histograms is gated on the capture, the classification is
+        # not. That matters more than it sounds. While they were gated, they
+        # shipped at zero -- nothing arms the capture at boot and both tools
+        # switch it off on the way out of the sweep -- so during ordinary play
+        # this subtraction degenerated to the raw count it was written to
+        # replace, and fired the very warning it exists to prevent.
+        #
+        # In that session bsrej climbed 829 and bfar 730: 88% of the refusals
+        # were vouched for. A gate set for a different bar refuses three or
+        # four LEDs a frame, the resolver then has too few points to lock, and
+        # NOTHING gets vouched for -- bfar and bnear both stay flat while
+        # bsrej runs away. So the number that separates the two is rejections
+        # minus what the resolver accounted for, and one of THOSE per frame is
+        # unambiguous: a whole slot, every frame, that no one can say was
+        # stray light.
+        frames, _secs = self._meter.span()
+        srej = self._meter.climb("bsrej")
+        vouched = self._meter.climb("bfar") + self._meter.climb("bnear")
+        unexplained = max(0, srej - vouched)
+        per = unexplained / float(frames) if frames > 0 else 0.0
+        if (gate_on and full and frames >= GATE_WINDOW_FRAMES
+                and per >= GATE_HEAVY_PER_FRAME):
+            out.append("SHAPE GATE IS REFUSING HEAVILY: %d blobs thrown away "
+                       "over the last %d frames that the resolver could not "
+                       "account for as stray light, %.1f of the 4 a frame "
+                       "carries. It may be set for a different LED bar; "
+                       "%s turns it off"
+                       % (unexplained, frames, per,
+                          self.gate_off_clause(keys)))
+        return out
+
     def shape_save(self):
         """Write the histograms to the stick, beside the blob logs.
 
@@ -1151,7 +1729,8 @@ class Camera(RowScreen):
         # the readout and the logging until wall time caught up.
         every = 0.25 if self._log is not None else 1.0
         now_m = time.monotonic()
-        if self.wiicam() and now_m - self._blob_t > every:
+        if (self.wiicam() and now_m - self._blob_t > every
+                and self.ask(now_m, self.BLOB_REPLY_S)):
             self._blob_t = now_m
             self.app.link.send("~camblob?")
             self._rate.feed(self.app.link.last.get("bframes"),
@@ -1164,19 +1743,72 @@ class Camera(RowScreen):
                 except Exception as e:
                     self.app.toast_now("log write failed: %s" % e)
                     self.close_log()
-        # The shape capture's counters, polled on their own clock and much
-        # slower than the blob line. That answer is thirteen lines and up to
-        # 2.5 KB, which is a fifth of a second of a 115200 wire: asked for at
-        # the blob poll's rate it would cost the aim stream real frames, on
-        # the one screen a user sits on while judging whether the light is
-        # costing them frames. Two seconds is enough for a progress line that
-        # visibly moves; six when nothing is running is enough to notice a
+        # The gate's verdict. One short line plus one sentence, so it can be
+        # asked for often enough to be live without taking anything from the
+        # preview -- and it is what turns 'Biggest blob (height)' from a
+        # number nobody can source into a measurement of this gun. Not asked
+        # at all of a gun that has already said it does not know the command.
+        if (self.wiicam() and self.app.fit.supported
+                and now_m - self._fit_t > 2.5
+                and self.ask(now_m, self.FIT_REPLY_S)):
+            self._fit_t = now_m
+            self.app.link.send("~camfit?")
+        # The shape capture's counters, polled on their own clock and far
+        # slower than anything else here. That answer is thirteen lines and up
+        # to 2.6 KB, which is nearly a quarter of a second of a 115200 wire --
+        # a quarter of a second in which not one camera frame can reach the
+        # preview. At the two seconds this used to run at, that was an eighth
+        # of the link and a visible hitch every other second on the one screen
+        # a user sits on while judging whether the light is costing them
+        # frames. Five is still a progress line that moves, and it costs a
+        # twentieth; eight when nothing is running is enough to notice a
         # capture started from Studio, or one a '~camreset' has stopped.
-        every_l = 2.0 if self.learn_on() else 6.0
-        if self.wiicam() and now_m - self._learn_t > every_l:
+        every_l = 5.0 if self.learn_on() else 8.0
+        if (self.wiicam() and now_m - self._learn_t > every_l
+                and self.ask(now_m, self.LEARN_REPLY_S)):
             self._learn_t = now_m
             self.app.link.send("~camlearn?")
         RowScreen.handle(self, acts, mouse)
+
+    # How long each answer occupies the wire, in seconds, at 115200 8N1 --
+    # measured from the firmware's own buffer sizes, not guessed: the blob
+    # pair is about 470 bytes, the fit verdict about 300, and the thirteen
+    # histogram lines up to 2.6 KB.
+    #
+    # These are not a rate limit, they are how long the gun will be BUSY. Only
+    # one thing comes down this wire, so an answer being sent is a camera
+    # frame that is not: with periods of 1 s and 2 s the blob poll and the
+    # histogram poll lined up exactly, every other second, and the gun replied
+    # with one ~2.9 KB burst -- a quarter of a second in which the preview
+    # received nothing at all. Holding the next question until the last answer
+    # can have finished costs nothing, because a poll that loses the race goes
+    # out on the next frame 16 ms later and its own clock is only advanced
+    # when the question actually leaves.
+    BLOB_REPLY_S = 0.05
+    FIT_REPLY_S = 0.03
+    LEARN_REPLY_S = 0.25
+
+    def ask(self, now_m, answer_s):
+        """May a question go out now? Claims the wire until then if it may."""
+        if now_m < self._ask_t:
+            return False
+        self._ask_t = now_m + answer_s
+        return True
+
+    def parsed_blobs(self):
+        """The last '~camblob?' blob list, parsed once per reply.
+
+        Three things on this screen read the same line -- the readout, the
+        camera view's caption and the sensor panel -- and draw() runs at about
+        60 fps while the line itself changes about once a second. Parsing it
+        per reader per frame was the same string split nearly two hundred
+        times a second for one answer's worth of numbers.
+        """
+        raw = getattr(self.app.link, "blobs", "")
+        if raw != self._parsed_raw:
+            self._parsed_raw = raw
+            self._parsed = parse_blobs(raw)
+        return self._parsed
 
     def _delta(self, key):
         """How much a since-boot counter moved since the last gun REPLY.
@@ -1219,6 +1851,15 @@ class Camera(RowScreen):
         """
         link = self.app.link
         out = []
+        # The window the "refusing heavily" warning is measured over. Fed from
+        # here rather than from handle() because handle() runs BEFORE the
+        # reply it asked for has arrived; Meter itself throws away everything
+        # that is not a genuinely new frame count, so being called from a
+        # 60 fps draw is harmless.
+        self._meter.feed(link.last.get("bframes"),
+                         {"bsrej": link.last.get("bsrej"),
+                          "bfar": link.last.get("bfar"),
+                          "bnear": link.last.get("bnear")})
         raw = getattr(link, "blobs", "")
         if raw:
             parts = raw.replace("CAM: blobs", "").strip()
@@ -1226,7 +1867,7 @@ class Camera(RowScreen):
                 out.append("blob sizes: set Blob detail to 1 to read them")
                 parts = parts.replace("(sizes need fmt:1)", "").strip()
             shown = []
-            parsed = parse_blobs(parts)
+            parsed = self.parsed_blobs()
             for b in parsed:
                 txt = "%d,%d size %d" % (b[0], b[1], b[2])
                 # The box and the brightness only exist in full mode. Printed
@@ -1273,10 +1914,44 @@ class Camera(RowScreen):
         # does. Worded as a doubt about the gate, never as another drop count:
         # read as "N dropped" it would look like the gate earning its keep,
         # which is the exact opposite of what it means.
-        dnear = self._delta("bnear")
-        if dnear:
-            out.append("GATE MAY BE TAKING REAL LEDs: %d dropped where a "
-                       "corner should be -- widen it" % dnear)
+        #
+        # It names the way OUT as well as the doubt. "Widen it" is advice
+        # somebody has to know which row to act on; bhmax:0 is the one move
+        # that always works and it can be read straight off the screen.
+        #
+        # Over the same WINDOW as the heavy-gate line, not over the last reply
+        # alone. A one-reply delta clears after about a second while Studio's
+        # is a rate over at least thirty frames, so the two front ends on the
+        # same gun disagreed about whether the gate was taking LEDs at any
+        # given moment -- and the one that said nothing was the one on the
+        # screen with no console beside it. Any climb inside the window
+        # raises it, which is Studio's rule too: this counter does not need a
+        # threshold, because one blob rejected where a corner had to be is
+        # already one too many.
+        nframes, _ns = self._meter.span()
+        dnear = self._meter.climb("bnear")
+        if dnear and nframes >= GATE_WINDOW_FRAMES:
+            # bnear counts SHAPE-gate rejections only, so the way out is
+            # whichever shape knob is actually up -- named, not assumed to be
+            # bhmax. A gun gated on pxmax alone would otherwise be told to
+            # zero a knob that is already zero.
+            keys = self.gate_keys()
+            off = (self.gate_off_clause(keys) if keys
+                   else "bhmax:0 (though no shape limit reads as set)")
+            out.append("GATE MAY BE TAKING REAL LEDs: %d dropped over the "
+                       "last %d frames where a corner should be -- widen it, "
+                       "or %s to turn the shape gate off"
+                       % (dnear, nframes, off))
+        # The gun's own verdict on the gate, and how hard the gate is working.
+        # Above the frame percentages because both are conclusions: "no size
+        # gate can work here" is not something a percentage will ever say, and
+        # it is the answer to the question the percentages raise. BELOW the
+        # two warnings above, though, because those describe something
+        # happening in the last second and are gone again by the next reply,
+        # while these describe a standing state that will still be here on the
+        # next draw -- a transient pushed off the bottom by a standing one is
+        # a transient nobody ever sees.
+        out.extend(self.gate_lines())
         keys = ("br4", "br3", "br2", "br1", "br0")
         now = [link.last.get(k) for k in keys]
         tot = None
@@ -1363,9 +2038,8 @@ class Camera(RowScreen):
         Returns the rectangle it covered, label and numbers included, so
         hostcheck can measure it against the rows and the readout.
         """
-        link = self.app.link
         if blobs is None:
-            blobs = parse_blobs(getattr(link, "blobs", ""))
+            blobs = self.parsed_blobs()
         xi, yi, wi, hi = int(x), int(y), int(w), int(h)
         panel = pygame.Rect(xi, yi, wi, hi)
         pygame.draw.rect(sc.s, (16, 20, 26), panel)
@@ -1381,13 +2055,23 @@ class Camera(RowScreen):
             pygame.draw.line(sc.s, (30, 36, 44), (xi, yi + gy * ky),
                              (xi + wi, yi + gy * ky))
         pygame.draw.rect(sc.s, (48, 54, 61), panel, 1)
-        # The two legends split between the label and the line under the
-        # numbers, because either of them alone runs wider than the 307 px
-        # this column has at 1024x768 and a caption that overhangs its own
-        # panel is worse than no caption.
-        sc.text(x + w / 2, y - sc.h * 0.026,
-                "SENSOR %dx%d -- fill = how full" % (SENSOR_W, SENSOR_H),
-                sc.f_xs, C_DIM)
+        # The legend is split across the caption and the line under the
+        # numbers, because a caption that overhangs its own panel is worse
+        # than no caption -- and the panel is now half as wide as it was, so
+        # even "SENSOR 128x96 -- fill = how full" no longer fits. What is left
+        # is the one thing the caption has to say: which array this is drawn
+        # in, because that is what tells it apart from the camera view stacked
+        # above it, and the two are different sizes for a real reason.
+        cap = "SENSOR %dx%d" % (SENSOR_W, SENSOR_H)
+        if sc.f_xs.size(cap)[0] > w:
+            # Measured against the panel it belongs to, every time. On a short
+            # screen the stacked column is height-limited down to under a
+            # hundred pixels across, and the array size -- which is the part
+            # a reader can look up elsewhere -- is what goes. What must stay
+            # is the word that tells this panel apart from the camera view
+            # above it, because the two are drawn in different arrays.
+            cap = "SENSOR"
+        sc.text(x + w / 2, y - sc.h * 0.026, cap, sc.f_xs, C_DIM)
 
         told = []                     # the numbers, one line per blob
         boxed = False
@@ -1455,7 +2139,11 @@ class Camera(RowScreen):
             bottom = ty + sc.f_xs.get_height() / 2.0
             ty += dy
         if blobs:
-            sc.text(x + w / 2, ty, "+ = position; green kept, red dropped",
+            # Shortened with the caption, and for the same reason. What had to
+            # survive is the colour key: the outline is the only thing on the
+            # panel that says whether a gate kept the blob or threw it away,
+            # and that is the whole question the gates are tuned to answer.
+            sc.text(x + w / 2, ty, "fill = how full; green kept, red dropped",
                     sc.f_xs, C_DIM)
             bottom = ty + sc.f_xs.get_height() / 2.0
         top = y - sc.h * 0.026 - sc.f_xs.get_height() / 2.0
@@ -1492,30 +2180,58 @@ class Camera(RowScreen):
         y1 = min(sc.h * 0.715,
                  sc.h * 0.185 + max(0, len(self.rows) - 1) * sc.h * 0.050)
         y = self.draw_rows(sc, sc.h * 0.185, y1)
-        # The sensor's own view, in place of the CAMERA VIEW every other
-        # screen shows. That one draws the resolved quad, which only exists
-        # once four LEDs are already being found -- the state camera tuning
-        # ENDS in. What tuning needs is the blobs as the sensor handed them
-        # over, the gate-dropped ones included, and that is this panel.
+        # BOTH views, stacked. The sensor panel used to replace the CAMERA
+        # VIEW here, and that was a false choice: they answer different
+        # questions and tuning needs both at once. The camera view draws the
+        # RESOLVED quad -- four corners the pipeline has already accepted --
+        # so it says whether the gun is finding a target at all and how it is
+        # moving; the sensor panel draws every blob the sensor handed over,
+        # the gate-dropped ones included, in the array the gates measure. With
+        # only the second one on screen, a gate that had started throwing away
+        # a real corner looked exactly like a gate that was working, because
+        # the thing it broke was not being drawn.
         #
-        # Sized from the room it HAS, not from the screen width alone. The
+        # Sized from the room they HAVE, not from the screen width alone. The
         # readout below is centred and runs nearly the full width, so it has
-        # to start under the panel: at 1024x768 the 0.30 w this column has
-        # always used is the binding limit and nothing moves, but on a 16:9
-        # mode the same fraction is 384 px across and 288 tall, and that
-        # pushed the readout down far enough to cut two rows off the bottom of
-        # it. 0.654 h is where the panel and its numbers must stop for the
-        # readout to keep nine rows; the floor stops a short screen from
-        # shrinking the panel into something nobody can read.
-        py = sc.h * 0.22
+        # to start under the whole column: at 1024x768 the width cap used to
+        # be the binding limit, but two panels one above the other are always
+        # limited by the HEIGHT, and a 16:9 mode makes that worse -- the same
+        # width fraction is taller there and pushed the readout down far
+        # enough to cut rows off the bottom of it.
+        #
+        # 0.68 h is where the column and its numbers must stop for the readout
+        # to keep the rows it needs; the floor stops a short screen from
+        # shrinking the panels into something nobody can read. Measured at
+        # 1024x768: the two boxes come out 117 and 119 px tall against the 230
+        # a single panel had, which is the half each of them was promised, and
+        # the readout keeps eight rows where it had nine.
+        py = sc.h * 0.205
+        # What the column has to carry besides the two boxes: a caption above
+        # each of them, and the sensor panel's per-blob numbers underneath.
+        cap = sc.h * 0.026 + sc.f_xs.get_height()
         below = 5 * int(sc.f_xs.get_height() * 1.15) + sc.h * 0.012
-        room = sc.h * 0.654 - py - below
-        w = min(sc.w * 0.30, max(sc.w * 0.16, room * SENSOR_W / SENSOR_H))
+        room = sc.h * 0.68 - py - cap - below
+        # Halved, and then turned into a width through the TALLER of the two
+        # aspect ratios, so neither box can exceed its share: the sensor's
+        # 128x96 is 4:3 and the pipeline's 240x176 is wider, so the sensor
+        # panel is the one that binds.
+        each = max(sc.h * 0.06, room / 2.0)
+        w = min(sc.w * 0.30, max(sc.w * 0.13, each * SENSOR_W / SENSOR_H))
+        vh = w * FRAME_H / FRAME_W
+        ph = w * SENSOR_H / SENSOR_W
         # Centred in what is left beside the rows, which draw_rows ends at
-        # 0.62 w whenever a preview is up. At the width cap that is 0.66 w --
-        # exactly where the camera view it replaces has always been drawn.
-        self.shape_rect = self.draw_shape(sc, (sc.w * 0.62 + sc.w) / 2 - w / 2,
-                                          py, w, w * SENSOR_H / SENSOR_W)
+        # 0.62 w whenever a preview is up.
+        px = (sc.w * 0.62 + sc.w) / 2 - w / 2
+        # Measured against the panel, like the sensor panel's own caption: on
+        # a short screen this column is height-limited to under a hundred
+        # pixels across and the full label overhangs it. Everything the
+        # shorter one drops is decoration; the word that says which of the two
+        # stacked panels this is stays.
+        lab = "CAMERA VIEW"
+        if sc.f_xs.size(lab)[0] > w:
+            lab = "CAMERA"
+        self.view_rect = self.app.draw_preview(sc, px, py, w, vh, label=lab)
+        self.shape_rect = self.draw_shape(sc, px, py + vh + cap, w, ph)
         # Wrapped to the width the screen ACTUALLY has. A fixed 96 columns
         # filled 686 px of a 1024 px screen and left 338 px of it empty, which
         # cost the full-mode blob line a third wrapped row it did not need --
@@ -1532,13 +2248,14 @@ class Camera(RowScreen):
         # hint are drawn at, so the three cannot drift apart.
         #
         # The readout is CENTRED and runs nearly the full width, so it has to
-        # clear the sensor panel as well as the rows -- the panel column is
+        # clear the whole panel column as well as the rows -- the column is
         # taller than the shorter of the two row lists, and taking the rows
         # alone drew the first line of the readout straight through the
         # panel's own numbers.
         bot = max((r.rect.bottom for r in self.rows if r.rect), default=y)
-        if self.shape_rect is not None:
-            bot = max(bot, self.shape_rect.bottom)
+        for panel in (self.view_rect, self.shape_rect):
+            if panel is not None:
+                bot = max(bot, panel.bottom)
         top = bot + sc.h * 0.016
         gh = sc.f_xs.get_height()
         step = max(1, int(gh * READOUT_STEP))
@@ -1699,13 +2416,16 @@ class Lens(RowScreen):
 
     def save_sweep(self, snap):
         """Keep every sweep, pass or fail, in the format calib_lens reads.
-        A refusal with no data behind it cannot be diagnosed later."""
+        A refusal with no data behind it cannot be diagnosed later.
+
+        Numbered like every other recording. Named from the clock alone, two
+        sweeps taken on two different evenings landed on the same file on a Pi
+        that has no clock -- and a sweep that was REFUSED is exactly the one
+        somebody wants to look at afterwards."""
         if not len(snap):
             return ""
         try:
-            os.makedirs(OUT_DIR, exist_ok=True)
-            path = os.path.join(OUT_DIR,
-                                time.strftime("lenssweep-%Y%m%d-%H%M%S.log"))
+            path, _seq = recording_path("lenssweep", ".log")
             with open(path, "w") as fh:
                 for i, q in enumerate(snap):
                     fh.write("Q,%d,4," % (i * 7) +
@@ -1990,6 +2710,325 @@ class Calib:
             "the sight offset from the screen mapping.",
         ], sc.f_s, C_DIM)
         self.app.draw_hud(sc, "%d shots" % len(s.shots))
+
+
+# ---------------------------------------------------------------------------
+# 4b -- the room-light sweep, which nobody has to do
+# ---------------------------------------------------------------------------
+class RoomSweep:
+    """Show the gun the room, so it can tell a lamp from an LED.
+
+    The wiicam finds blobs in HARDWARE and reports exactly four slots. A
+    bright window does not add a fifth point, it TAKES one, and a corner goes
+    missing -- so the only defence is a gate that can throw the window away
+    before the resolver has to choose. The only honest way to set that gate is
+    to measure both things on the rig it will run on: how big this bar's LEDs
+    actually are, and how small the smallest thing in this room that is not
+    one of them actually is. The first half fills itself whenever four corners
+    are locked. The second half only fills when something that is NOT an LED
+    is in the picture at the same time as they are, which is the one thing
+    normal play never does -- hence a step that asks for it on purpose.
+
+    It is OPTIONAL, and it is offered after the calibration rather than during
+    it for that reason: by the time this screen appears the calibration has
+    already been fitted, installed and written to the stick, so Esc costs
+    nothing at all. Nothing here changes a setting on the gun unless the user
+    chooses to apply the verdict.
+
+    The gun's own settings are put back on the way out. Full report mode and
+    the learning capture are both needed for the measurement and both are
+    things a user may have had off for their own reasons.
+    """
+
+    # The verdict is two or three short lines -- around 300 bytes -- so it can
+    # be asked for once a second without taking anything from the preview
+    # beside it, which is the same wire. The 2.6 KB histogram dump is NOT
+    # asked for here at all: everything this screen shows is on the fit line.
+    POLL_S = 1.0
+    # How long the gun gets to answer '~camfit=apply' before the screen stops
+    # waiting. A gun on firmware without camfit never answers, and a spinner
+    # that turns for ever is indistinguishable from one that has hung.
+    APPLY_WAIT_S = 3.0
+
+    def __init__(self, app):
+        self.app = app
+        self.t0 = time.monotonic()
+        # Started from now, not from zero: the first question goes out below,
+        # and a poll clock left at zero would send a second one on the very
+        # first frame -- two 300-byte answers back to back for one reading.
+        self._poll = self.t0
+        self._apply_t = 0.0        # when apply was asked for; 0 = not asked
+        self._saved = False        # ...and whether the format save has run
+        self.applied = False       # a ceiling is live on the gun because of
+                                   # this screen, so full mode must STAY
+        self.done = ""             # the outcome, latched, once there is one
+        link = app.link
+        # Through the app, not from here. The calibration this step is offered
+        # at the end of has already borrowed the same two settings, and taking
+        # them again would re-send '~camlearn=on:1' -- an off->on edge to the
+        # firmware, which CLEARS the histograms. That would wipe the five
+        # minutes of confirmed LED frames the calibration just banked, at the
+        # exact moment this screen set out to use them.
+        app.cam_borrow()
+        link.send("~camfit?")
+
+    # The cursor is the gun's own aim and the screen stays in view throughout,
+    # so it keeps meaning something here. Left visible on purpose: it is how
+    # the user knows the gun is still locked onto the bar while they sweep.
+    hide_cursor = False
+
+    def restore(self):
+        """Give the gun back what this step borrowed -- except full mode, if a
+        ceiling was applied.
+
+        Called from the way out AND from the app's own shutdown, because a
+        crash or a window close on this screen would otherwise leave a user
+        with a report format and a capture they never asked for and no sign
+        anywhere of where they came from.
+
+        The exception is not tidiness, it is correctness. The shape gate only
+        ACTS in full report mode. This screen is normally entered from a gun
+        in fmt:1, so handing the format back after applying a ceiling left the
+        number saved in flash and the gate stone dead -- while the screen said
+        "the gun will hold it through a power cycle", which was true of the
+        number and false of everything the user cared about.
+        """
+        self.app.cam_restore(keep_full=self.applied)
+
+    def leave(self):
+        # to_menu() calls restore() for us, through the same hook the app's
+        # own shutdown uses -- so there is ONE way out of this screen and no
+        # path that can forget to hand the gun back.
+        self.app.to_menu()
+
+    def apply(self):
+        """Set and save the ceiling the gun just worked out -- never anything
+        else. There is no path here that writes a number this app chose."""
+        fit = self.app.fit
+        if fit.verdict == "no_gate":
+            self.app.toast_now("there is nothing to apply: no height gate can "
+                               "separate them on this rig")
+            return
+        if fit.verdict != "gate" or fit.bhmax is None:
+            self.app.toast_now("not measured yet -- keep sweeping, or press "
+                               "Esc to skip this step")
+            return
+        self.app.link.send("~camfit=apply")
+        self._apply_t = time.monotonic()
+        self._saved = False
+
+    def handle(self, acts, mouse):
+        now = time.monotonic()
+        fit = self.app.fit
+        if self._apply_t:
+            # Waiting on the gun's own answer, so the screen reports what the
+            # GUN did rather than what this app asked for: setting the gate
+            # and getting it into flash fail separately, and a gate that took
+            # but was not saved is gone on the next power cycle.
+            if fit.applied in ("saved", "unsaved"):
+                self.applied = True
+                self._apply_t = 0.0
+                self.done = self.finish_apply(fit)
+            elif now - self._apply_t > self.APPLY_WAIT_S:
+                self.done = ("The gun did not answer. Nothing has been "
+                             "changed; this firmware may be too old to "
+                             "measure it.")
+                self._apply_t = 0.0
+        elif (not self.done and fit.supported
+                and now - self._poll > self.POLL_S):
+            self._poll = now
+            self.app.link.send("~camfit?")
+        for a in acts:
+            if a == "back":
+                self.leave()
+                return
+            if a in ("select", "click"):
+                if self.done:
+                    self.leave()
+                    return
+                self.apply()
+
+    def finish_apply(self, fit):
+        """Check the ceiling really persisted, and say what actually happened.
+
+        '~camfit=apply' now does the whole job itself: it switches the gun
+        into full mode if it has dropped out of it and persists FULL rather
+        than whatever format happened to be live, so the gate that comes back
+        from a power cycle can actually run. This used to have to send
+        '~camsave' as well, because apply stored the gate and left the format
+        behind -- a command called 'apply' that did not survive a reboot,
+        which was the bug rather than something to work around.
+
+        The save stays, as a CHECK rather than as the mechanism. The gun's
+        camsave reply carries fmt and bhmax, so it is the one way to read back
+        what reached flash instead of trusting that it did -- and on a gun
+        still running the firmware where apply left the format alone, it is
+        also what makes the ceiling act. Everything this returns is read off
+        what the gun said.
+        """
+        rows = fit.bhmax or 0
+        if fit.applied == "unsaved":
+            return ("Set to %d rows, but the gun could NOT save it -- it will "
+                    "be gone on the next power cycle." % rows)
+        ok = self.app.save_cam(fmt=2, bhmax=rows)
+        self._saved = bool(ok)
+        if not ok:
+            return ("Set to %d rows, but full detail could NOT be saved -- "
+                    "the gate needs it, so it will not act after a power "
+                    "cycle." % rows)
+        if fit.inert:
+            # An older firmware saying it took the ceiling and cannot act on
+            # it. It cannot happen on a build whose apply switches the format
+            # itself, and it should not happen from here on any build -- this
+            # screen puts the gun in full mode before it ever asks -- so if it
+            # does, something refused the format and the user has to be told
+            # rather than reassured.
+            return ("Set to %d rows and saved, but the gun says the gate is "
+                    "INERT: it needs Blob detail 2 and this gun is not in it."
+                    % rows)
+        if fit.switched:
+            # Said because it is a change to the gun nobody asked for by
+            # name. It is the right change -- the ceiling was measured in full
+            # mode and only acts in full mode -- but a report format that
+            # moved on its own is exactly the kind of thing a user finds later
+            # and cannot explain.
+            return ("Set to %d rows and saved. The gun switched itself to "
+                    "full detail, which the gate needs to act, and kept it."
+                    % rows)
+        return ("Set to %d rows and saved, with full detail kept so the gate "
+                "can actually act. It will hold through a power cycle." % rows)
+
+    def bars(self, sc, y):
+        """The two halves of the measurement, against what the gun asked for.
+
+        Both are drawn even when one of them is full, because "which half is
+        missing" is the whole question: an LED bar sat in front of a blank
+        wall fills the first one in a minute and never fills the second at
+        all, and without the second bar that reads as a broken step rather
+        than as a room with nothing bright in it."""
+        fit = self.app.fit
+        led_f, stray_f = fit.progress()
+        rows = (("your LEDs", fit.ledn, fit.led_want, led_f),
+                ("room light", fit.stray_n, fit.stray_want, stray_f))
+        for label, n, want, frac in rows:
+            col = C_OK if frac >= 1.0 else C_WARN
+            sc.text(sc.w * 0.05, y, label, sc.f_m, C_DIM, centre=False)
+            sc.text(sc.w * 0.26, y, "%d / %d" % (n, want), sc.f_m, col,
+                    centre=False)
+            sc.bar(sc.w * 0.05, y + sc.h * 0.028, sc.w * 0.44, sc.h * 0.016,
+                   frac, col)
+            y += sc.h * 0.085
+        return y
+
+    def verdict_lines(self):
+        """What the gun has concluded, in the reader's words.
+
+        A firmware with no '~camfit' at all lands on the last branch, which
+        says so instead of showing a blank panel -- and never shows a number,
+        because on that gun there is no measurement behind one."""
+        fit = self.app.fit
+        if fit.verdict == "no_gate":
+            return ([
+                "NO GATE CAN WORK HERE.",
+                "Something in your room is the same size as your LEDs.",
+                "Move the bar, block that light, or use brighter LEDs.",
+            ], C_BAD)
+        if fit.verdict == "gate" and fit.bhmax is not None:
+            out = ["MEASURED: anything taller than %d rows is not one of "
+                   "your LEDs." % fit.bhmax]
+            if fit.tight:
+                out.append("A TIGHT fit: one step apart. Worth sweeping "
+                           "again.")
+            out.append("Enter sets it on the gun and saves it.")
+            return out, C_OK
+        if fit.verdict == "need_stray":
+            return (["Keep sweeping: nothing but your LEDs has come into "
+                     "the picture yet."], C_WARN)
+        # Not a branch of its own: contamination can sit under any verdict,
+        # and it is drawn beside whichever one applies (see draw).
+        if fit.verdict == "need_led":
+            out = ["Keep the screen in view: not enough of your own LEDs "
+                   "measured yet."]
+            told = fit.stored_words()
+            if told:
+                # The one number on this screen that may be shown before a
+                # verdict, because it is not borrowed: the gun wrote it down
+                # the last time IT was measured, and it is the only answer
+                # there will ever be to "why is the gate set to what it is?"
+                # after a power cycle has emptied the histograms.
+                out.append("Measured before on this gun: %s." % told)
+            return out, C_WARN
+        if not fit.supported or time.monotonic() - self.t0 > 4.0:
+            # Either the gun refused the command outright, or four seconds --
+            # four polls -- have gone by with no answer of any kind. A gun
+            # that has answered none of them is not slow, it is a gun that has
+            # never heard of the question, and this screen can do nothing for
+            # it but say so.
+            return (["This gun's firmware cannot measure the room.",
+                     "Skip this step; nothing here applies to it."], C_DIM)
+        return (["asking the gun..."], C_DIM)
+
+    def draw(self, sc):
+        app = self.app
+        # Wrapped to the room each block actually HAS. The header runs the
+        # full width; everything below it shares the screen with the preview
+        # on the right, so it gets a little over half. Measured, not assumed:
+        # a fixed column that fits 1024x768 loses a word off each end of every
+        # centred line on a 640-wide one, silently.
+        wide = cols_for(sc.f_s, sc.w * 0.90)
+        narrow = cols_for(sc.f_s, sc.w * 0.54)
+        sc.text(sc.w / 2, sc.h * 0.065, "ROOM LIGHT", sc.f_l, C_FG)
+        # WHY, before HOW, and in the reader's terms. Somebody who does not
+        # know what this is for will skip it, and they would be right to.
+        head = []
+        for ln in ("This teaches the gun the difference between your LEDs and "
+                   "the lights in your room, so a lamp can never take a corner "
+                   "from it.",
+                   "Sweep slowly around the room for about 15 seconds, "
+                   "KEEPING THE SCREEN IN VIEW, so lamps, windows and "
+                   "reflections come into the picture beside your LED bar."):
+            head.extend(wrap(ln, wide))
+        sc.lines(sc.w / 2, sc.h * 0.125, head, sc.f_s, C_DIM, step=1.35)
+        if self.done:
+            sc.lines(sc.w / 2, sc.h * 0.58, wrap(self.done, wide), sc.f_m,
+                     C_FG, step=1.35)
+            sc.text(sc.w / 2, sc.h * 0.90, "press Enter or Esc to finish",
+                    sc.f_s, C_DIM)
+        else:
+            y = self.bars(sc, sc.h * 0.36)
+            lines, col = self.verdict_lines()
+            told = app.fit.ignored_words()
+            if told:
+                # Under the verdict rather than instead of it: the ceiling is
+                # still the answer, and this is why it is the number it is.
+                # A user who has this said to them can go and block the light;
+                # one who does not gets a clean-looking 7 with the sun sitting
+                # inside it.
+                lines = lines + ["Some of it was stray light: %s. Those are "
+                                 "left out." % told]
+            wrapped = []
+            for ln in lines:
+                wrapped.extend(wrap(ln, narrow))
+            # As many rows as there is room for above the way out, counted
+            # from the same numbers both are drawn at. The verdict is the
+            # longest thing this screen ever says and the way out is the one
+            # thing that must never be pushed off it.
+            step = max(1, int(sc.f_s.get_height() * 1.35))
+            room = max(1, int((sc.h * 0.88 - sc.f_s.get_height() - y) // step))
+            # Centred in the left column, which stops at the preview: these
+            # lines are drawn CENTRED, so their x is the middle of the room
+            # they have and not its left edge.
+            sc.lines(sc.w * 0.30, y, wrapped[:room], sc.f_s, col, step=1.35)
+            # The way out, always on screen and always the same key. This step
+            # is optional and nobody may be trapped in it: the sentence says
+            # both what Esc does and that the calibration is already finished,
+            # because "skip" on its own reads like abandoning something.
+            sc.text(sc.w / 2, sc.h * 0.92,
+                    "Esc SKIPS this -- your calibration is already finished "
+                    "and saved", sc.f_s, C_WARN)
+        w = sc.w * 0.30
+        app.draw_preview(sc, sc.w * 0.62, sc.h * 0.30, w, w * FRAME_H / FRAME_W)
+        app.draw_hud(sc, "")
 
 
 # ---------------------------------------------------------------------------
@@ -2323,6 +3362,15 @@ class Result:
         self.note = note
         self.sel = 0
         self.rows = [("Done", "menu"), ("Do it again", "again")]
+        # The room-light sweep is offered HERE, from the screen that says the
+        # calibration is finished, and it is never the first row. That is the
+        # whole of its skippability: 'Done' is already selected, it is the
+        # obvious thing to press, and pressing it leaves a gun that is
+        # calibrated and saved. Only after a fit that actually worked, and
+        # only on the sensor that has anything to measure -- offering it after
+        # a refusal would read as part of the recovery.
+        if calib and "wiicam" in app.link.last.get("board", ""):
+            self.rows.append(("Learn the room light (optional)", "sweep"))
         self.hot = []
 
     def handle(self, acts, mouse):
@@ -2344,6 +3392,8 @@ class Result:
     def act(self, what):
         if what == "again":
             self.app.begin_calib()
+        elif what == "sweep":
+            self.app.begin_room_sweep()
         else:
             self.app.to_menu()
 
@@ -2516,6 +3566,13 @@ class Menu(RowScreen):
                 hint="only needed on a wide or fisheye lens"),
             Row("4   Aim calibration", act=app.begin_calib,
                 hint="five dots at two or three distances"),
+            # Offered here as well as on the way out of a calibration, because
+            # the way out of a calibration is exactly where it is most likely
+            # to be skipped -- and a step that can only ever be reached by
+            # redoing the whole calibration would never be done at all.
+            Row("4b  Room light sweep (optional)", act=app.begin_room_sweep,
+                hint="about 15 s: teaches the gun to tell your LEDs from the "
+                     "lamps and windows in the room"),
             Row("5   Fine tune", act=app.begin_finetune,
                 hint="iron sights onto the cursor, then smoothing, then lead"),
             Row("6   Verify", act=app.begin_verify,
@@ -2566,6 +3623,24 @@ class App:
         self.running = True
         self.toast = ""
         self.toast_t = 0.0
+        # The gun's own verdict on the shape gate. Kept on the app rather than
+        # on a screen because two of them need it -- the camera page draws the
+        # warnings, the room sweep drives the whole step off it -- and the
+        # lines it is built from arrive on the shared reply stream, which only
+        # this loop drains.
+        self.fit = FitReport()
+        # Full report mode and the learning capture, borrowed by a step that
+        # needs them and given back afterwards. On the app rather than on a
+        # screen because the borrow SPANS screens: a calibration takes it, the
+        # result screen holds it, and the room sweep offered from there has to
+        # inherit it rather than take it again -- taking it again would clear
+        # the very data the calibration just gathered.
+        self._cam_borrow = None
+        self._cam_arm = None      # a borrow that has asked and not yet armed
+        # The gun's own clock as the last session saw it, kept across a
+        # reconnect so a gun that RESTARTED can be told from a port that
+        # merely re-enumerated. None once the question has been answered.
+        self._gun_t0 = None
         self._fx_saved = None
         self._fx_plan = "none"        # which silence this gun supports
         self._fx_quiet_want = False   # we are asking for silence right now
@@ -2637,6 +3712,184 @@ class App:
         self.toast_t = time.time()
         self.log(msg)
 
+    def reboot_tick(self):
+        """Notice a gun that came back as a DIFFERENT boot, and start over.
+
+        A reconnect is not by itself a reboot: a USB port that re-enumerated
+        hands back the same gun, still running, with its capture and its
+        report format exactly as they were. A gun that RESTARTED comes up with
+        the capture off, the format at whatever flash holds, and its
+        histograms empty -- and nothing on the sweep screen notices. It goes
+        on polling because the gun still answers '~camfit?'; every answer says
+        ledn=0 and NEEDS MORE LED DATA; the screen goes on saying "keep
+        sweeping" at a gun that is not measuring anything, at 0 of 500, for
+        as long as the user is willing to wave it about.
+
+        Worse quietly: the borrow taken before the reboot describes a gun that
+        no longer exists. Handing that format back writes a report mode into a
+        gun that never had it, and switching "its" capture off switches off
+        one this app never started.
+
+        Told apart by the gun's own clock, which restarts near zero on a
+        reboot and simply carries on otherwise. Decided once, when a frame has
+        actually arrived to decide from -- guessing early would be the same
+        mistake as not looking.
+        """
+        if self._gun_t0 is None:
+            return
+        gt = self.link.gun_t
+        if gt <= 0.0:
+            return                    # no frame since the reconnect yet
+        # A second of slack, because the clock is read off a frame that may
+        # have been in flight across the reconnect.
+        rebooted = gt < self._gun_t0 - 1.0
+        self._gun_t0 = None
+        if not rebooted:
+            return
+        held = self._cam_borrow is not None or self._cam_arm is not None
+        # Dropped, never restored: nothing is SENT to put the old state back,
+        # because the gun that would receive it is not the gun the state was
+        # recorded from.
+        self._cam_borrow = self._cam_arm = None
+        self.fit.reset()
+        self.link.hists.reset()
+        if held:
+            # A screen is still asking for the measurement, so start it again
+            # rather than leaving it pointed at a gun that has stopped
+            # collecting. The bars go back to 0 of 500 either way; the
+            # difference is whether they ever move again.
+            self.cam_borrow()
+            self.toast_now("the gun RESTARTED -- everything it had measured "
+                           "is gone, and this is starting over from empty")
+        else:
+            self.toast_now("the gun RESTARTED -- anything it had measured is "
+                           "gone")
+
+    def cam_borrow(self):
+        """Take what the LED measurement needs -- after asking what is there.
+
+        Full report mode and the learning capture. The gun's confirmed frames
+        are free data: every frame in which the resolver locks all four
+        corners is a measurement of what THIS bar's LEDs look like, and a
+        calibration is minutes of nothing but such frames. That was being
+        thrown away, and both tools instead told the user to switch the
+        capture on by hand on another screen -- so in practice the LED side of
+        '~camfit' was only ever filled by somebody who already knew what the
+        feature was.
+
+        Two steps, and the order is the whole point. The one thing that has to
+        be known is whether the capture was ALREADY running, and it can only
+        be learnt BEFORE arming: once '~camlearn=on:1' has gone out the gun
+        answers on=1 whatever it was doing before, and there is no way left to
+        tell whether the capture stopped on the way out was pical's own or the
+        user's. link.hists.running() cannot answer it either -- only the
+        camera screen ever polls '~camlearn?', so from the menu that flag is
+        minutes old or has never been set at all. So this ASKS, and cam_tick
+        completes the borrow when the gun answers.
+
+        Nothing here blocks. The answer is thirteen lines and up to 2.6 KB,
+        which is a fifth of a second of wire; waiting for it inside a key
+        press would freeze the screen, and a frozen screen is how a Pi looks
+        when it has crashed.
+
+        Idempotent, and that is correctness rather than tidiness: a
+        calibration borrows, and then the room sweep offered at the end of it
+        borrows again. A second borrow must not re-remember -- it would record
+        the borrowed state as the user's own and never give the real one back.
+        """
+        link = self.link
+        if not link.src or self._cam_arm is not None:
+            return
+        if self._cam_borrow is not None:
+            # Already held. Re-assert the format if something has moved it
+            # since, but never the capture: on:1 is safe to repeat (the
+            # firmware clears on the off->on edge only) and re-sending it
+            # would buy nothing but wire.
+            if link.last.get("fmt", link.last.get("ext")) != 2:
+                link.send("~cam=fmt:2")
+            return
+        self._cam_arm = (link.hists.seq, time.monotonic())
+        link.send("~camlearn?")
+
+    def cam_tick(self, now_m):
+        """Finish a borrow once the gun has said what it was holding.
+
+        Or once it plainly is not going to: a gun on firmware without the
+        capture never answers, and a step that waited for ever would collect
+        nothing and say nothing about why. Then the borrow goes ahead with
+        "was it running" UNKNOWN, and unknown means the capture is left
+        running on the way out -- a capture nobody stopped is visible on the
+        camera screen and costs nothing, where stopping one that was somebody
+        else's measurement is invisible.
+        """
+        if self._cam_arm is None:
+            return
+        seq0, asked = self._cam_arm
+        link = self.link
+        fresh = link.hists.seq != seq0 and link.hists.ready()
+        if not fresh and (now_m - asked) < CAM_ARM_S:
+            return
+        running = link.hists.running() if fresh else None
+        self._cam_arm = None
+        self._cam_borrow = (link.last.get("fmt", link.last.get("ext")), running)
+        if running is False:
+            # Arming an idle capture CLEARS it, so whatever was measured
+            # before is gone and any verdict drawn from it is now a fiction.
+            # Same gun, though, so what it can answer is not forgotten.
+            self.fit.reset(new_gun=False)
+            _f, led, _r = link.hists.counts()
+            if led:
+                # Only when there was something to lose. The shape CSV is the
+                # only copy of a capture and nothing else warns; said here
+                # rather than on each screen that borrows, so no screen added
+                # later can forget to say it.
+                self.toast_now("the shape capture restarted from empty -- the "
+                               "%d LED blobs measured before this are gone"
+                               % led)
+        if link.last.get("fmt", link.last.get("ext")) != 2:
+            link.send("~cam=fmt:2")
+        # Sent whatever the answer was, including when there was none: the
+        # firmware clears on the off->on edge ONLY, so repeating it at an
+        # already-running capture is a no-op rather than a wipe, and a gun too
+        # old to have the capture drops the key in silence.
+        link.send("~camlearn=on:1")
+
+    def cam_restore(self, keep_full=False):
+        """Give back what cam_borrow took. Safe to call twice.
+
+        `keep_full` is for the one case where giving it back would undo the
+        thing the user just asked for: a ceiling applied by the room sweep
+        only ACTS in full report mode, so restoring a gun that came in on
+        fmt:1 left the number in flash and the gate stone dead -- while the
+        screen said it would hold through a power cycle, which was true of the
+        number and false of everything the user cared about.
+        """
+        if self._cam_arm is not None and self._cam_borrow is None:
+            # Asked, never armed. Nothing was changed, so there is nothing to
+            # put back -- and the pending question must not survive into
+            # whatever screen comes next.
+            self._cam_arm = None
+            return
+        if self._cam_borrow is None:
+            return
+        fmt, running = self._cam_borrow
+        self._cam_borrow = None
+        # Only a capture we can PROVE we started. A capture that was already
+        # running is the user's, and one whose state the gun never reported
+        # might be: disabling it does not destroy what it has measured, but it
+        # does end a measurement somebody may be in the middle of.
+        if running is False:
+            self.link.send("~camlearn=on:0")
+        if keep_full:
+            return
+        # None means the gun never said what report mode it was in, and a
+        # guess written into it is a silent edit. Leave it as it is.
+        if fmt is not None and fmt != 2:
+            # 'ext:', never 'fmt:': both firmware generations take ext, while
+            # the older one drops fmt in silence and would be left in
+            # whatever mode this app put it in.
+            self.link.send("~cam=ext:%d" % fmt)
+
     def save_cam(self, **want):
         """Write the live camera settings to the gun and SAY WHAT HAPPENED.
 
@@ -2658,6 +3911,11 @@ class App:
         self.draw()
         pygame.display.flip()
         self.link.close()
+        # A verdict is a measurement of one gun in one room, and the gun that
+        # answers next may be another one entirely -- or the same one after a
+        # power cycle, which empties its histograms. Link.connect clears its
+        # own state for exactly this reason; this is the same rule.
+        self.fit.reset()
         if self.link.connect():
             self.t_open = time.time()
             self.link.send("~ping")
@@ -2677,6 +3935,19 @@ class App:
         closer = getattr(self.view, "close_log", None)
         if closer:
             closer()
+        # ...and one that borrowed a setting from the gun gives it back. The
+        # room sweep needs full report mode and the learning capture, and both
+        # are things a user may deliberately have had off; left switched on
+        # they are a silent edit with nothing anywhere to say where it came
+        # from. Same rule, and same shape, as the recoil restore.
+        back = getattr(self.view, "restore", None)
+        if back:
+            back()
+        # And the app-level borrow, for the steps that span more than one
+        # screen. A no-op when the view above has already handed it back --
+        # which is how the room sweep gets to keep full mode when the user
+        # applied a ceiling, without this line taking it away again.
+        self.cam_restore()
         self.session = None
         self.link.sink = None
         self.link.trig_sink = None
@@ -2828,6 +4099,14 @@ class App:
         # Only once a gun is truly here: quieting before the guard captured a
         # stale saved-state that later clobbered freshly tuned recoil knobs.
         self.fx_quiet(True)
+        # And the free half of the shape measurement. A calibration is minutes
+        # of frames in which the resolver has locked all four corners, and
+        # every blob in such a frame is a confirmed LED -- which is exactly
+        # what '~camfit' needs 500 of before it will name a ceiling. It used
+        # to be discarded and the user told to switch the capture on by hand
+        # on another screen, so in practice the LED side was only ever filled
+        # by somebody who already knew what the feature was.
+        self.cam_borrow()
         self.session = CaptureSession(plan=make_plan(self.stances, 0))
         # Fullscreen: a window fraction IS a screen fraction.
         self.session.to_screen = lambda fx, fy: (fx, fy)
@@ -2835,6 +4114,18 @@ class App:
         self.link.sink = lambda q, gt: self.session.feed(q, gt)
         self.link.trig_sink = self.on_trigger
         self.view = Calib(self, self.session)
+
+    def begin_room_sweep(self):
+        """Open the room-light step, or say plainly why there is nothing to
+        open. Refusing quietly here would look exactly like a dead row."""
+        if not self.link.src:
+            self.toast_now("connect the gun first")
+            return
+        if "wiicam" not in self.link.last.get("board", ""):
+            self.toast_now("this step measures the wiicam sensor -- this gun "
+                           "has nothing here to measure")
+            return
+        self.view = RoomSweep(self)
 
     def begin_finetune(self):
         c = self.read_gun_calib()
@@ -2912,6 +4203,12 @@ class App:
         c, why = s.fit()
         saved = None
         try:
+            # The session numbers its own two files now, both under ONE number
+            # because they are two halves of one capture. This used to move
+            # them onto pical's numbering afterwards, from a time when
+            # CaptureSession named them from the clock alone -- and once the
+            # session started numbering them, that renaming burned a sequence
+            # number on every calibration and the count advanced 2, 4, 6.
             saved = s.save(OUT_DIR)[0]
         except Exception as e:
             self.toast_now("could not write the log: %s" % e)
@@ -2952,7 +4249,13 @@ class App:
             parts.append(extra)
         sc.text(sc.w * 0.02, sc.h * 0.975, "   ".join(parts), sc.f_xs, C_DIM,
                 centre=False)
-        sc.text(sc.w * 0.98, sc.h * 0.975, "Esc", sc.f_xs, C_DIM, centre=False)
+        # Hung by its RIGHT edge, because 0.02 of the width is not enough room
+        # for the word at the sizes this actually runs at: drawn from 0.98 w
+        # leftwards it ran 5 px off a 1024 px screen -- the Pi's own mode --
+        # and 9 px off a 640 px one, losing the 'c' on the display nobody has
+        # a console beside.
+        sc.text(sc.w * 0.98 - sc.f_xs.size("Esc")[0], sc.h * 0.975, "Esc",
+                sc.f_xs, C_DIM, centre=False)
 
     def draw_preview(self, sc, x, y, w, h, rings=False, trail=None,
                      label="CAMERA VIEW"):
@@ -2962,10 +4265,18 @@ class App:
         them turns tuning from guesswork into something you can watch. The
         trail of quad centres makes instability visible; the rings mark the
         radius a lens sweep has to push the LEDs past.
+
+        Returns the rectangle it covered, its caption included, so a screen
+        that stacks it above something else can be measured rather than
+        trusted -- the camera page puts the sensor panel directly underneath.
         """
         link = self.link
         pad = 4
         xi, yi, wi, hi = int(x), int(y), int(w), int(h)
+        covered = pygame.Rect(xi, int(y - sc.h * 0.026
+                                      - sc.f_xs.get_height() / 2.0),
+                              wi, 0)
+        covered.height = yi + hi - covered.top
         pygame.draw.rect(sc.s, (16, 20, 26), (xi, yi, wi, hi))
         pygame.draw.rect(sc.s, (48, 54, 61), (xi, yi, wi, hi), 1)
         sc.text(x + w / 2, y - sc.h * 0.026, label, sc.f_xs, C_DIM)
@@ -3002,7 +4313,7 @@ class App:
             if dropping:
                 sc.text(x + w / 2, y + h / 2 + sc.h * 0.015,
                         "background IR too high, or too far", sc.f_xs, C_DIM)
-            return
+            return covered
         if dropping:
             sc.text(x + w / 2, y + sc.h * 0.022, "DROPPING OUT -- last good frame",
                     sc.f_xs, C_WARN)
@@ -3020,6 +4331,7 @@ class App:
             sc.text(pts[i][0] + sc.w * 0.012, pts[i][1], nm, sc.f_xs, C_DIM)
         pygame.draw.line(sc.s, C_RING, (ccx - 6, ccy), (ccx + 6, ccy), 1)
         pygame.draw.line(sc.s, C_RING, (ccx, ccy - 6), (ccx, ccy + 6), 1)
+        return covered
 
     def draw_cursor(self, sc):
         """Show the pointer -- as the system cursor where there is one, else drawn.
@@ -3118,12 +4430,19 @@ class App:
         # comes back under a different name, which is the common case here.
         port = self.link.port
         self.link.close()
+        self.fit.reset()                  # see connect(): it may be a new gun
+        # Taken BEFORE the reconnect, because Link.connect clears everything
+        # it knew about the previous gun. The gun's own frame clock is one of
+        # the few things it keeps, and it is what says whether the gun that
+        # answers next is the same boot.
+        was_t = self.link.gun_t
         if self.link.connect(port):
             self.t_open = now
             self.link.send("~ping")
             self.link.send("~cam?")
             self.link.send("~fx?")
             self._link_bad = False
+            self._gun_t0 = was_t if was_t > 0 else None
             self.toast_now("gun back on %s" % self.link.port)
             # A gun that rebooted has forgotten it was asked to be quiet, and
             # a reconnect during a calibration must not resume with a live
@@ -3188,6 +4507,10 @@ class App:
         while self.link.replies:
             r = self.link.replies.pop(0)
             self.log(r)
+            # The fit verdict arrives as two or three ordinary reply lines,
+            # so it is assembled here where they are drained. A gun on older
+            # firmware never sends one and FitReport simply stays empty.
+            self.fit.feed(r)
             # The lines a user was TOLD to watch for must actually appear:
             # pical has no visible log outside the auto-tune overlay.
             if ("diag VERDICT" in r or "diag stream" in r
@@ -3200,17 +4523,49 @@ class App:
                     # A setting the gun REFUSED. It answers by name and leaves
                     # the old value in place, so the row goes on showing what
                     # is really there -- which looks exactly like an arrow
-                    # that does nothing. The ladders above are built so this
-                    # cannot happen from pical, but a gun holding a setting
-                    # from a serial terminal, or a firmware whose floor has
-                    # moved, both land here, and a refusal nobody sees is a
-                    # control the user gives up on.
+                    # that does nothing. The gate floors are the gun's OWN
+                    # measured LED envelope now, so this is not a case the
+                    # ladders can be built to avoid: a ceiling under what this
+                    # rig measured is refused by name, and a refusal nobody
+                    # sees is a control the user gives up on.
                     or "-- not set" in r
+                    # A gate the gun took and cannot act on, which is the one
+                    # state invisible from every row on the screen: the row
+                    # reads back the value, the gun agrees, and the gate is
+                    # judging nothing because it has no boxes to judge.
+                    or "set but INERT" in r
+                    # The capture starting over. The gun clears it when
+                    # sensitivity or either sensor threshold changes, because
+                    # a distribution spanning the change is two rigs averaged
+                    # into one -- the right call, but it resets the progress
+                    # bars under a user who has just nudged a slider, and
+                    # without this they are left wondering why 400 LED blobs
+                    # became 0. '~camreset' lands here too, for the same
+                    # reason.
+                    or r.startswith("CAM: learn cleared")
+                    # And a save that did not reach flash. Every other save in
+                    # this app is verified and reports itself; the one the
+                    # room sweep fires to keep the report format is sent into
+                    # the stream, so its failure has to be caught here or the
+                    # ceiling comes back on the next power cycle with nothing
+                    # anywhere to say why.
+                    or r.startswith("CAM: SAVE FAILED")
                     or "refused" in r):
                 self.toast_now(r.strip()[:110])
         # After the replies are drained, so the restore check reads the gun's
         # freshest answer rather than the one from the previous frame.
         self.fx_tick(now)
+        # Before the borrow tick, so a gun that restarted has its stale borrow
+        # dropped and a fresh one started in the SAME frame -- otherwise the
+        # pending question from before the reboot would complete against the
+        # new gun and record its post-boot state as the user's own.
+        self.reboot_tick()
+        # ...and for the same reason: a pending borrow is waiting on a
+        # '~camlearn?' answer that pump() has only just delivered. monotonic,
+        # not the wall clock this loop is handed: a Pi has no clock until NTP
+        # corrects it, and a backward step would leave the deadline in the
+        # future for ever.
+        self.cam_tick(time.monotonic())
         if self.session is not None and self.session.state == self.session.S_DONE:
             self.finish_calib()
         self.view.handle(acts, mouse)
@@ -3341,6 +4696,14 @@ def run(stances=3, windowed=False, port=None):
             closer = getattr(app.view, "close_log", None)
             if closer:
                 closer()
+            # And the settings a screen borrowed, for the same reason: a
+            # window closed during the room sweep would otherwise leave the
+            # gun in full report mode with a capture running, and the next
+            # session would have no idea why.
+            back = getattr(app.view, "restore", None)
+            if back:
+                back()
+            app.cam_restore()
             app.fx_quiet(False)
             # Said on stdout, not through a toast: the frame loop has ended,
             # so nothing will ever draw one -- and the launcher keeps this log.

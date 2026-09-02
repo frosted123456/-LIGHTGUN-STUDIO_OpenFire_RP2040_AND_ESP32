@@ -48,7 +48,13 @@ class FakeSer:
     def __init__(self, replies):
         self.replies = replies
         self.written = []
-        self.state = {"lead": 0, "smooth": 3, "beta": -1, "dead": 0, "lens": 0}
+        self.state = {"lead": 0, "smooth": 3, "beta": -1, "dead": 0, "lens": 0,
+                      # The report format and the shape ceiling ride in the
+                      # camsave reply too, and the room sweep VERIFIES both --
+                      # a ceiling that reached flash in a format where the
+                      # gate cannot run is the no-op this whole feature spent
+                      # a release being.
+                      "fmt": 1, "bhmax": 0}
         self.save_fails = False
 
     def write(self, b):
@@ -72,10 +78,11 @@ class FakeSer:
         if "camsave" in txt:
             self.replies.append(
                 "%s thr=110 aec=300 agc=4 boost=0 lead=%dms smooth=%d dead=%d "
-                "beta=%d lens=%d tmode=0 firk=7 firpct=100"
+                "beta=%d lens=%d tmode=0 firk=7 firpct=100 fmt=%d bhmax=%d"
                 % ("CAM: SAVE FAILED" if self.save_fails else "CAM: saved",
                    self.state["lead"], self.state["smooth"],
-                   self.state["dead"], self.state["beta"], self.state["lens"]))
+                   self.state["dead"], self.state["beta"], self.state["lens"],
+                   self.state["fmt"], self.state["bhmax"]))
         return len(b)
 
 
@@ -901,33 +908,88 @@ def main():
        "rest of the power cycle")
 
     # ---- the false-negative meter -----------------------------------------
-    # bnear counts blobs a gate threw away that sat exactly where the missing
-    # corner had to be. It is the only number on this screen that says a gate
-    # is WRONG, and worded as one more drop count it would read as the gate
-    # earning its keep -- the exact opposite. It has to be a warning, and it
-    # has to be a delta like everything else here.
+    # bnear counts blobs the SHAPE gate threw away that sat exactly where the
+    # missing corner had to be. It is the only number on this screen that says
+    # a gate is WRONG, and worded as one more drop count it would read as the
+    # gate earning its keep -- the exact opposite.
+    #
+    # Measured over the same WINDOW as the heavy-gate line, and that is the
+    # point rather than a detail. It was a one-reply delta, so it cleared
+    # about a second after the last rejection while Studio's -- a rate over at
+    # least thirty frames -- was still showing: two front ends on the same
+    # gun, disagreeing at any given moment about whether the gate was taking
+    # LEDs, and the one that said nothing was the one on the screen with no
+    # console beside it. Driven on a simulated clock, because a window that
+    # only expires with real seconds cannot be tested with real seconds.
     ck("GATE MAY BE TAKING REAL LEDs" not in "\n".join(cam3.blob_lines()),
        "a bnear that has not moved raises nothing")
-    app.link.last.update({"bframes": 2300, "bms": 23000, "bnear": 3,
-                          "br4": 1500, "br3": 190, "br2": 60, "br1": 15,
-                          "br0": 4})
-    near = "\n".join(cam3.blob_lines())
-    ck("GATE MAY BE TAKING REAL LEDs" in near,
-       "bnear moving says the gate may be taking real LEDs: %s"
-       % [l for l in cam3.blob_lines() if "GATE" in l])
-    ck("3 dropped by" not in near and "3 dropped as" not in near,
-       "and it is NOT phrased as another drop count -- read as one it looks "
-       "like the gate working, which is the opposite of what it means: %s"
-       % [l for l in cam3.blob_lines() if "GATE" in l])
-    ck("corner" in near,
-       "it says WHY the blob was probably an LED -- it sat where a corner "
-       "should have been")
-    app.link.last.update({"bframes": 2400, "bms": 24000,
-                          "br4": 1600, "br3": 220, "br2": 70, "br1": 18,
-                          "br0": 5})
-    ck("GATE MAY BE TAKING REAL LEDs" not in "\n".join(cam3.blob_lines()),
-       "and it clears once the gate stops doing it, rather than latching on "
-       "a since-boot total for the rest of the power cycle")
+    near_mono, nfake = time.monotonic, {"t": time.monotonic()}
+    time.monotonic = lambda: nfake["t"]
+    try:
+        for i in range(4):
+            app.link.last.update({"bframes": 2300 + 100 * i,
+                                  "bms": 23000 + 1000 * i,
+                                  "bnear": 3 if i else 0,
+                                  "br4": 1500, "br3": 190, "br2": 60,
+                                  "br1": 15, "br0": 4})
+            cam3.blob_lines()
+            nfake["t"] += 1.0
+        near = "\n".join(cam3.blob_lines())
+        ck("GATE MAY BE TAKING REAL LEDs" in near,
+           "bnear moving says the gate may be taking real LEDs: %s"
+           % [l for l in cam3.blob_lines() if "GATE" in l])
+        ck("3 dropped by" not in near and "3 dropped as" not in near,
+           "and it is NOT phrased as another drop count -- read as one it "
+           "looks like the gate working, which is the opposite of what it "
+           "means: %s" % [l for l in cam3.blob_lines() if "GATE" in l])
+        ck("corner" in near,
+           "it says WHY the blob was probably an LED -- it sat where a corner "
+           "should have been")
+        ck("frames" in near,
+           "and it names the window it was measured over, which is what makes "
+           "it the same measurement Studio reports: %s"
+           % [l for l in cam3.blob_lines() if "GATE" in l])
+        # The reply AFTER the last rejection. Under the old one-reply delta
+        # this went silent here while Studio went on warning for its whole
+        # window; now both hold.
+        app.link.last.update({"bframes": 2700, "bms": 27000,
+                              "br4": 1600, "br3": 220, "br2": 70, "br1": 18,
+                              "br0": 5})
+        nfake["t"] += 1.0
+        ck("GATE MAY BE TAKING REAL LEDs" in "\n".join(cam3.blob_lines()),
+           "one quiet reply does NOT clear it -- a one-reply delta is why the "
+           "two front ends used to disagree about the same gun")
+        # It still has to clear, or it is the latched since-boot warning this
+        # project has shipped twice.
+        nfake["t"] += 20.0
+        ck("GATE MAY BE TAKING REAL LEDs" not in "\n".join(cam3.blob_lines()),
+           "and it CLEARS once the window has moved past the last rejection, "
+           "rather than latching for the rest of the power cycle")
+        # ...and it will not be drawn off a handful of frames either, for the
+        # same reason the heavy line will not: a rate over a tenth of a second
+        # of camera swings wildly, and this readout has about seven rows.
+        # Emptied again first: the assertion above ran blob_lines(), which
+        # feeds the meter, so the window already holds a sample from before
+        # this case and the span would be thousands of frames wide.
+        nfake["t"] += 20.0
+        app.link.last.update({"bframes": 5000, "bms": 50000, "bnear": 3})
+        cam3.blob_lines()
+        nfake["t"] += 1.0
+        app.link.last.update({"bframes": 5010, "bms": 50100, "bnear": 9})
+        cam3.blob_lines()
+        ck(cam3._meter.span()[0] == 10,
+           "the window really is ten frames wide (%s)"
+           % (cam3._meter.span(),))
+        ck("GATE MAY BE TAKING REAL LEDs" not in "\n".join(cam3.blob_lines()),
+           "ten frames is not a window, however far bnear moved in them")
+    finally:
+        time.monotonic = near_mono
+    # Left where the worst-case readout expects it: bnear climbing, over a
+    # window wide enough to be drawn from.
+    app.link.last.update({"bframes": 6000, "bms": 60000, "bnear": 0})
+    cam3.blob_lines()
+    app.link.last.update({"bframes": 6100, "bms": 61000, "bnear": 9})
+    cam3.blob_lines()
 
     # The readout must not be drawn ON TOP of the rows, nor over the selected
     # row's own hint below them. Measured at 1024x768, which is the mode the
@@ -1052,8 +1114,12 @@ def main():
     # And the deepest the readout ever gets: both warnings take a row each on
     # top of the rows the blob line already wraps onto, and the fit
     # arithmetic is the only thing keeping the last of them out of the hint.
-    app.link.last.update({"bframes": 2300, "bms": 23000, "bvalve": 90,
-                          "bnear": 9,
+    # Above the frames the meter has already seen, because a frame count that
+    # goes BACKWARDS is how a gun announces a reboot and the window starts
+    # again from nothing -- which would leave this "worst case" a frame short
+    # of being drawn at all.
+    app.link.last.update({"bframes": 6200, "bms": 62000, "bvalve": 90,
+                          "bnear": 12,
                           "br4": 1500, "br3": 190, "br2": 60, "br1": 15,
                           "br0": 4})
     rows_b = readout_rows()
@@ -1786,6 +1852,1712 @@ def main():
     app.step([], t + 14.0)
     ck(True, "the camera screen renders with the shape rows on it")
     app.to_menu()
+
+    # ---- the gun's own verdict on the shape gate ---------------------------
+    # '~camfit' answers with a counter line and then exactly ONE outcome line,
+    # and the two mean nothing apart: the counters say how far the measurement
+    # has got, the outcome says what it came to. Every branch is exercised
+    # here because the whole point of the command is that pical must never
+    # invent a ceiling -- a gate borrowed from another rig blinds the gun and
+    # its owner has no way to find out why -- so a parse that quietly produced
+    # a number where the gun gave none would be the worst failure on the
+    # screen, and the least visible.
+    HDR = "CAM: fit ledn=%d ledmaxh=%d straym=%d strayminh=%d"
+    f = pical.FitReport()
+    ck(f.verdict is None and f.bhmax is None,
+       "an empty fit report is 'we do not know', never a number")
+    ck(not f.feed("CAM: blobs 1,2,3,4") and not f.feed("AIM: pong"),
+       "and it only takes its own lines, so the shared reply stream can be "
+       "fed to it wholesale")
+    f.feed(HDR % (120, -1, 0, -1))
+    f.feed("CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+           "capture on; 120 blobs so far, 500 wanted")
+    ck(f.verdict == "need_led" and f.ledn == 120 and f.led_want == 500,
+       "NEEDS MORE LED DATA carries the count and the target off the gun's "
+       "own sentence (%s, %d of %d)" % (f.verdict, f.ledn, f.led_want))
+    ck(f.led_h is None and f.stray_h is None,
+       "and the firmware's -1 'nothing measured' is None here, so no caller "
+       "can print it as a height of minus one row (%s, %s)"
+       % (f.led_h, f.stray_h))
+    ck(abs(f.progress()[0] - 0.24) < 1e-6 and f.progress()[1] == 0.0,
+       "the sweep's two bars read straight off it: %s" % (f.progress(),))
+    ck(not f.enough(), "and it knows it has not reached a verdict yet")
+    # The STORED line is the gun's record of its own previous capture, and it
+    # carries ledmaxh= and strayminh= of its own. A blanket k=v sweep of every
+    # 'CAM: fit' line would overwrite the LIVE measurement with those, which
+    # is how a screen ends up reporting a stale ceiling as a fresh one.
+    f.feed(HDR % (120, -1, 0, -1))
+    f.feed("CAM: fit STORED ledmaxh=7 strayminh=12 -- from an earlier capture "
+           "on this gun; recapture if the bar, the lens or the room has "
+           "changed")
+    f.feed("CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+           "capture on; 120 blobs so far, 500 wanted")
+    ck(f.stored == (7, 12) and f.led_h is None,
+       "an earlier capture's pair is kept APART from the live measurement, "
+       "which is still empty (stored %s, live %s)" % (f.stored, f.led_h))
+    f.feed(HDR % (900, 7, 2, -1))
+    f.feed("CAM: fit NO STRAY DATA -- sweep the room with the screen in view "
+           "so a lamp or window enters frame; 2 seen, 20 wanted. Your LEDs "
+           "measured 7 tall.")
+    ck(f.verdict == "need_stray" and f.stray_n == 2 and f.stray_want == 20
+       and f.led_h == 7,
+       "NO STRAY DATA is the other half missing, and says so with both "
+       "numbers (%s, %d of %d, LEDs %s)"
+       % (f.verdict, f.stray_n, f.stray_want, f.led_h))
+    f.feed(HDR % (900, 9, 40, 9))
+    f.feed("CAM: fit NO SAFE GATE -- your LEDs reach 9 tall and the stray "
+           "light starts at 9, so a size gate cannot tell them apart. Move "
+           "the bar, block the light, or use brighter LEDs.")
+    ck(f.verdict == "no_gate" and f.bhmax is None,
+       "NO SAFE GATE offers NO ceiling at all -- there is no number that "
+       "works on such a rig and half of one is worse than none (%s, %s)"
+       % (f.verdict, f.bhmax))
+    ck(f.led_h == 9 and f.stray_h == 9 and f.enough(),
+       "but it does carry the two heights, which is what makes the refusal "
+       "explainable (%s, %s)" % (f.led_h, f.stray_h))
+    f.feed(HDR % (900, 7, 40, 13))
+    f.feed("CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)")
+    ck(f.verdict == "gate" and f.bhmax == 10 and f.led_h == 7
+       and f.stray_h == 13 and not f.tight,
+       "a verdict is the ceiling AND the two measurements behind it "
+       "(bhmax %s, %s..%s, tight %s)"
+       % (f.bhmax, f.led_h, f.stray_h, f.tight))
+    f.feed(HDR % (900, 7, 40, 8))
+    f.feed("CAM: fit bhmax=8 (LEDs reach 7, stray starts at 8 -- TIGHT, only "
+           "one step between them)")
+    ck(f.bhmax == 8 and f.tight,
+       "and a one-step gap comes through as TIGHT rather than as an ordinary "
+       "answer, because it is the one worth re-sweeping")
+    # Setting the gate and getting it into flash fail SEPARATELY. A gate that
+    # took but was not saved is gone on the next power cycle, and nothing else
+    # anywhere would say so.
+    f.feed("CAM: fit applied and saved")
+    ck(f.applied == "saved", "'applied and saved' lands as a saved apply")
+    f.feed(HDR % (900, 7, 40, 8))
+    f.feed("CAM: fit bhmax=8 (LEDs reach 7, stray starts at 8)")
+    f.feed("CAM: fit applied but SAVE FAILED -- it will be gone on the next "
+           "power cycle")
+    ck(f.applied == "unsaved",
+       "and a failed save is told apart from a good one (%s)" % f.applied)
+    # A power cycle empties the histograms, so the gun drops back to NEEDS
+    # MORE LED DATA. The counter line has to take the old verdict with it: a
+    # ceiling left standing from before the reboot is the one number on this
+    # screen nobody may be shown by accident.
+    f.feed(HDR % (10, -1, 0, -1))
+    ck(f.verdict is None and f.bhmax is None and f.applied is None,
+       "a fresh counter line clears the previous outcome instead of leaving "
+       "an old ceiling on screen (%s, %s)" % (f.verdict, f.bhmax))
+    f.feed(HDR % (900, 7, 40, 13))
+    f.feed("CAM: fit SOMETHING A LATER FIRMWARE SAYS")
+    ck(f.verdict is None,
+       "an outcome this build has never heard of publishes NOTHING rather "
+       "than a guess -- the counters stay, the verdict does not appear")
+    # pical is fullscreen on a Pi with no console, so one exception anywhere
+    # near a draw is a black TV. Every one of these is a line the gun's send
+    # buffer could cut short, or a firmware that means something else by a key.
+    for junk in ("CAM: fit", "CAM: fit ", "CAM: fit ledn=x ledmaxh= straym",
+                 "CAM: fit bhmax=", "CAM: fit NO SAFE GATE --",
+                 "CAM: fit STORED", "CAM: fit NEEDS MORE LED DATA",
+                 "CAM: fit ledn=9999999999999 ledmaxh=-99 straym=0 strayminh=0",
+                 "CAM: fit bhmax=10 (LEDs reach"):
+        g = pical.FitReport()
+        try:
+            g.feed(HDR % (900, 7, 40, 13))
+            g.feed(junk)
+            threw = None
+        except Exception as e:                 # noqa: BLE001 - that IS the test
+            threw = e
+        ck(threw is None,
+           "a mangled fit line does not take the screen down (%r -> %r)"
+           % (junk[:38], threw))
+        ck(isinstance(g.progress()[0], float),
+           "...and the bars still have a number to draw afterwards")
+    # Firmware older than the fit answers every ask with a refusal. Left
+    # unnoticed that is a thousand lines an hour into a 200-line log ring --
+    # and the log is exactly where a user is sent to read the diag verdict.
+    # The STORED line gained a third measurement -- the pixel envelope --
+    # after this parser was written. Read by NAME for that reason: a
+    # positional reader kept working by luck here and would have silently
+    # mis-read whatever field was added next.
+    f2 = pical.FitReport()
+    f2.feed(HDR % (120, -1, 0, -1))
+    f2.feed("CAM: fit STORED ledmaxh=7 strayminh=12 ledmaxpx=84 -- from an "
+            "earlier capture on this gun; recapture if the bar, the lens or "
+            "the room has changed")
+    ck(f2.stored == (7, 12) and f2.stored_px == 84,
+       "the stored provenance carries all three of the gun's own numbers "
+       "(%s, px %s)" % (f2.stored, f2.stored_px))
+    f2.feed(HDR % (120, -1, 0, -1))
+    f2.feed("CAM: fit STORED strayminh=12 ledmaxpx=84 ledmaxh=7 -- reordered")
+    ck(f2.stored == (7, 12),
+       "in whatever order they arrive, because they are named on the wire "
+       "(%s)" % (f2.stored,))
+    f2.feed(HDR % (120, -1, 0, -1))
+    f2.feed("CAM: fit STORED ledmaxh=7 -- an older firmware, half a pair")
+    ck(f2.stored is None,
+       "half a pair fills nothing, and the reading it belongs to shows no "
+       "provenance rather than the PREVIOUS reading's (%s)" % (f2.stored,))
+    # The gun taking a ceiling and saying it cannot act on it. NOT an outcome
+    # -- it qualifies one, in the same answer -- so it must not blank the
+    # verdict it arrived with.
+    # A stray height of 0 means NO camfit has ever applied on this gun:
+    # camsave records the LED edge on its own and leaves the stray side at
+    # zero. Shown as "stray at 0" it reads as a measured room with no light in
+    # it, which is the opposite of what it says -- and 0 is the one value that
+    # cannot be a measured height, since the gate rejects only what is TALLER
+    # than the ceiling.
+    f2.feed(HDR % (120, -1, 0, -1))
+    f2.feed("CAM: fit STORED ledmaxh=7 strayminh=0 ledmaxpx=84 -- from an "
+            "earlier capture on this gun")
+    ck(f2.stored == (7, 0), "a stray height of 0 still parses")
+    ck("not recorded" in f2.stored_words() and "0 rows" not in f2.stored_words(),
+       "but it reads as NOT RECORDED, never as a room whose light starts at "
+       "zero: %r" % f2.stored_words())
+    f2.feed(HDR % (120, -1, 0, -1))
+    f2.feed("CAM: fit STORED ledmaxh=7 strayminh=12 ledmaxpx=84 -- earlier")
+    ck("12 rows" in f2.stored_words(),
+       "and a real stray height reads as itself: %r" % f2.stored_words())
+
+    # ---- the contamination line ----------------------------------------
+    # It starts with a DIGIT after 'CAM: fit ', so it matched no branch and
+    # reached the log only -- and the log is not where anybody reads it. The
+    # firmware says it out loud because a user who sees "32 ignored at 31
+    # rows" understands their rig, where one who sees a clean 7 never learns
+    # the sun spent the capture inside the LED class.
+    f3 = pical.FitReport()
+    ck(f3.ignored is None and f3.ignored_words() is None,
+       "nothing is contaminated until the gun says so")
+    f3.feed(HDR % (900, 7, 40, 13))
+    f3.feed("CAM: fit 32 LED samples ignored -- they reach 31 tall, far above "
+            "the 7 the rest stop at, and are almost certainly stray light "
+            "learned while the resolver locked on it")
+    ck(f3.ignored == (32, 31, 7),
+       "the count, the height they reached and the height of the rest all "
+       "land (%s)" % (f3.ignored,))
+    said = f3.ignored_words()
+    ck("32" in said and "31" in said and "7" in said,
+       "and come back as words with all three numbers in them: %r" % said)
+    f3.feed("CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)")
+    ck(f3.ignored == (32, 31, 7) and f3.verdict == "gate",
+       "it rides WITH the verdict rather than replacing it -- the ceiling is "
+       "still the answer and this is why it is that number (%s, %s)"
+       % (f3.ignored, f3.verdict))
+    f3.feed(HDR % (900, 7, 40, 13))
+    ck(f3.ignored is None,
+       "and a fresh reading starts clean, so a capture that is no longer "
+       "contaminated stops saying it is")
+    for junk in ("CAM: fit 32 LED samples ignored",
+                 "CAM: fit LED samples ignored -- they reach tall"):
+        g3 = pical.FitReport()
+        try:
+            g3.feed(junk)
+            threw = None
+        except Exception as e:                 # noqa: BLE001 - that IS the test
+            threw = e
+        ck(threw is None and g3.ignored_words() is None,
+           "a contamination line the buffer cut short says nothing rather "
+           "than raising (%r -> %r)" % (junk[:34], threw))
+
+    # ---- apply switches the format itself now --------------------------
+    f2.feed(HDR % (900, 7, 40, 13))
+    f2.feed("CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)")
+    f2.feed("CAM: fit switched to fmt:2 -- the shape gate needs it and the "
+            "ceiling was measured in it")
+    f2.feed("CAM: fit applied and saved")
+    ck(f2.switched and f2.verdict == "gate" and f2.bhmax == 10,
+       "the gun switching itself into full mode rides with the verdict "
+       "rather than replacing it (%s, %s)" % (f2.verdict, f2.switched))
+    f2.feed(HDR % (900, 7, 40, 13))
+    ck(not f2.switched, "and a fresh reading starts from not knowing again")
+
+    # 'CAM: fit INERT RIGHT NOW ...' is GONE from current firmware: apply now
+    # switches the gun into full mode itself, so the sequence that used to
+    # produce it -- apply, then a reply saying the ceiling it just took
+    # cannot act -- cannot happen from '=apply' on this build any more. Fed
+    # here anyway because a gun that has not been reflashed can still send
+    # it from a bare '~camfit?' (bhmax set by hand, outside full mode, on
+    # older firmware), and a line this build no longer emits itself must
+    # still not break the one that reads it.
+    f2.feed(HDR % (900, 7, 40, 13))
+    f2.feed("CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)")
+    f2.feed("CAM: fit applied and saved")
+    ck(not f2.inert, "nothing is inert until the gun says so")
+    f2.feed("CAM: fit INERT RIGHT NOW -- the shape gate needs fmt:2 and this "
+            "gun is in fmt:1; set fmt:2 for it to act")
+    ck(f2.inert and f2.verdict == "gate" and f2.bhmax == 10,
+       "an older gun's INERT line still qualifies the verdict rather than "
+       "replacing it (%s, %s, inert %s)" % (f2.verdict, f2.bhmax, f2.inert))
+    f2.feed(HDR % (900, 7, 40, 13))
+    ck(not f2.inert, "and a fresh reading starts from not knowing again")
+
+    g = pical.FitReport()
+    ck(g.supported, "a gun that has not been asked yet is not a gun that "
+                    "cannot answer")
+    ck(g.feed('AIM: unknown command "camfit?"') and not g.supported,
+       "the refusal is recognised, so the screens can stop asking")
+
+    # ---- a counter read as a RATE, and a warning that CLEARS ---------------
+    # Every counter on the '~camblob?' line counts from POWER-ON. This project
+    # has shipped the two ways of getting that wrong twice: a bvalve warning
+    # built on the raw total, which pinned itself on screen for the rest of
+    # the power cycle after a single give-back, and a _delta() that advanced
+    # its reference on every draw, so a count was visible for the one frame
+    # after each reply and blank for the other fifty-nine -- 16 ms in every
+    # second, which the eye reads as never. Both are tested here, and the
+    # clear-down is driven by a SIMULATED clock rather than a sleep so the
+    # suite does not pay eight seconds for it.
+    real_mono, fake = time.monotonic, {"t": 1000.0}
+    time.monotonic = lambda: fake["t"]
+    try:
+        m = pical.Meter(window_s=8.0)
+        ck(m.per_frame("bsrej") == 0.0 and m.span() == (0, 0.0),
+           "an empty window is 0, not a division by no frames at all")
+        for i in range(6):
+            m.feed(1000 + 100 * i, {"bsrej": 5000 + 300 * i})
+            fake["t"] += 1.0
+        ck(m.span()[0] == 500 and abs(m.per_frame("bsrej") - 3.0) < 1e-9,
+           "a climb of 1500 over 500 frames reads as 3.0 a frame whatever the "
+           "since-boot total behind it is (%s, %.2f)"
+           % (m.span(), m.per_frame("bsrej")))
+        held = len(m._s)
+        for _ in range(60):
+            m.feed(1500, {"bsrej": 6500})
+        ck(len(m._s) == held,
+           "sixty draws in one frame do not fill the window with copies of "
+           "one reply -- samples are keyed on the gun's frame count, not on "
+           "being called (%d samples)" % len(m._s))
+        fake["t"] += 20.0
+        ck(m.per_frame("bsrej") == 0.0 and m.climb("bsrej") == 0
+           and m.span() == (0, 0.0),
+           "and once the counter stops moving the window EXPIRES, so a "
+           "warning built on it cannot latch for the rest of the power cycle "
+           "(%.2f a frame)" % m.per_frame("bsrej"))
+        m2 = pical.Meter()
+        m2.feed(9000, {"bsrej": 9000})
+        m2.feed(10, {"bsrej": 3})
+        ck(m2.climb("bsrej") == 0,
+           "a gun that rebooted restarts the window instead of reporting a "
+           "negative rate that could never recover")
+        m2.feed(None, {"bsrej": 4})
+        m2.feed(20, {"bsrej": None})
+        ck(isinstance(m2.per_frame("bsrej"), float),
+           "and a counter this firmware does not send is 0, not a TypeError "
+           "inside draw()")
+
+        # ---- the gate warnings, on the screen -----------------------------
+        app.link.last["board"] = "rp2040-wiicam"
+        cam5 = pical.Camera(app)
+        app.open(cam5)
+        app.link.blobs = "CAM: blobs " + " ".join(
+            blob9(*b) for b in ((50, 45, 3, 1, 11, 9, 84),
+                                (190, 48, 4, 1, 12, 10, 79)))
+        app.link.last.update({"fmt": 2, "bhmax": 10, "bframes": 1000,
+                              "bms": 10000, "bsrej": 0, "bnear": 0,
+                              "bvalve": 0, "brej": 0, "brrej": 0})
+        cam5.blob_lines()
+        ck(not [l for l in cam5.blob_lines() if "NO SAFE GATE" in l],
+           "a gun that has not answered '~camfit' raises no verdict at all -- "
+           "not knowing is not the same as 'no gate can work here'")
+        for ln in (HDR % (900, 9, 40, 9),
+                   "CAM: fit NO SAFE GATE -- your LEDs reach 9 tall and the "
+                   "stray light starts at 9, so a size gate cannot tell them "
+                   "apart. Move the bar, block the light, or use brighter "
+                   "LEDs."):
+            app.link.src.q.put(ln + "\n")
+        app.step([], t + 15.0)
+        ck(app.fit.verdict == "no_gate",
+           "the app's own loop feeds the verdict, so every screen sees it "
+           "without asking twice (%s)" % app.fit.verdict)
+        gate = [l for l in cam5.blob_lines() if "NO SAFE GATE" in l]
+        ck(gate, "NO SAFE GATE reaches the readout in words: %s" % gate)
+        ck(gate and "bhmax:0" in gate[0],
+           "...and says how to switch the gate off, which is the one action "
+           "that always works and is not guessable from the row's label")
+        ck(gate and ("Move the bar" in gate[0] or "brighter LEDs" in gate[0]),
+           "...and what to do about the room instead of offering a number")
+        tip = [r for r in cam5.rows
+               if r.label == "Biggest blob (height)"][0].tip()
+        ck("NO SAFE GATE" in tip and "rows" not in tip,
+           "the gate's own row says it too, and offers no height at all -- "
+           "there is no number that works on such a rig, and half of one is "
+           "worse than none: %r" % tip)
+        # bsrej is what the SHAPE gate threw away, since boot. Read raw it
+        # only ever grows; what matters is whether the gate is refusing
+        # heavily NOW, which is a share over seconds -- and, since a real
+        # session settled the question, a share of the rejections the RESOLVER
+        # could not account for.
+        #
+        # One helper for every case below, because all three counters have to
+        # move together. bsrej alone is a state the gun cannot produce: a
+        # rejected blob is either placed far from every corner (bfar), or
+        # sitting where a missing LED should be (bnear), or neither. Driving
+        # one of the three is how the first version of this threshold came to
+        # be wrong.
+        def window(base, frames, d_srej, d_far=0, d_near=0, steps=5):
+            """Drive one measurement window; hand back the heavy-gate lines."""
+            fake["t"] += 20.0                  # let the last window expire
+            ck(cam5._meter.span() == (0, 0.0),
+               "the rate window is empty before the next case (%s)"
+               % (cam5._meter.span(),))
+            for i in range(steps + 1):
+                app.link.last.update({
+                    "bframes": base + frames * i // steps,
+                    "bsrej": 30000 + d_srej * i // steps,
+                    "bfar": 40000 + d_far * i // steps,
+                    "bnear": 50000 + d_near * i // steps})
+                cam5.blob_lines()
+                fake["t"] += 1.0
+            # Every case below reads a SILENCE as meaning something, so the
+            # window has to have really been driven: under thirty frames the
+            # warning stands down whatever the rate is, and a case that never
+            # reached that would pass for the wrong reason.
+            ck(cam5._meter.span()[0] == frames,
+               "the window drove the %d frames it meant to (%s)"
+               % (frames, (cam5._meter.span(),)))
+            return [l for l in cam5.blob_lines() if "REFUSING HEAVILY" in l]
+
+        heavy = window(2000, 100, 250)
+        ck(heavy, "a gate throwing away two and a half UNEXPLAINED blobs on "
+                  "every frame is called out: %s" % heavy)
+        ck(heavy and "bhmax:0" in heavy[0],
+           "...and it too names the way out")
+        ck(heavy and "could not account for" in heavy[0],
+           "...and says what it counted, so the number can be argued with: "
+           "%s" % heavy)
+
+        # THE threshold, and it has to be ONE number across both front ends.
+        # pical warned at 2.0 RAW rejections a frame while Studio warned at 25
+        # per 100 frames -- an eight-fold disagreement about the same
+        # measurement. What both were counting turned out to be the wrong
+        # thing: see the daylight session below.
+        ck(pical.GATE_HEAVY_PER_FRAME == 1.0,
+           "the heavy-gate threshold is one UNEXPLAINED rejection per frame "
+           "-- a whole slot of the four, every frame, that nobody can say was "
+           "stray light (%s)" % pical.GATE_HEAVY_PER_FRAME)
+
+        # ---- the session that set the number -------------------------------
+        # 92 s of daylight with bhmax:8. From 01:32:37 to 01:32:41 the gate
+        # rejected EXACTLY 1.00 blobs per frame for four straight seconds --
+        # br4 zero, br3 every frame, bnear zero throughout. That is the sun
+        # holding one of the four slots, the gate refusing it on every frame,
+        # the gun running on three real corners and one reconstructed: the
+        # gate doing precisely its job, in the very scene it exists for. Over
+        # the whole session bsrej climbed 829 and bfar 730 -- 88% of the
+        # refusals vouched for by the resolver, and the worst unexplained rate
+        # was 0.06 a frame.
+        #
+        # A warning on RAW rejections at one per frame fires for the whole of
+        # that stretch, on the one screen a user is sitting at while the gate
+        # is working. This is the case that has to stay silent.
+        ck(not window(12000, 50, 50, d_far=50),
+           "the real daylight stretch -- 50 rejections over 50 frames, every "
+           "one of them placed as stray by the resolver -- is SILENT: one a "
+           "frame is the steady state of one persistent stray correctly "
+           "refused, not a gate misbehaving")
+        rate = (cam5._meter.climb("bsrej") - cam5._meter.climb("bfar")
+                - cam5._meter.climb("bnear")) / float(cam5._meter.span()[0])
+        ck(abs(rate) < 1e-9,
+           "...because nothing about it is unexplained (%.2f a frame, against "
+           "%.2f raw)" % (rate, cam5._meter.per_frame("bsrej")))
+
+        # ---- and the case it has to keep catching --------------------------
+        # A gate set for a different LED bar refuses three or four LEDs a
+        # frame. The resolver then has too few points to lock, so NOTHING gets
+        # vouched for: bfar and bnear stay flat while bsrej runs away. That is
+        # the shape this warning exists for, and it is the opposite shape from
+        # the daylight session even though both are "the gate rejecting a lot".
+        eating = window(13000, 50, 150)
+        ck(eating,
+           "a gate refusing three blobs a frame with the resolver accounting "
+           "for NONE of them warns -- that is a ceiling set for somebody "
+           "else's bar: %s" % eating)
+        ck(eating and "150 blobs" in eating[0],
+           "and the count it names is the unexplained one (%s)" % eating)
+        ck(eating and "different LED bar" in eating[0],
+           "and it says what that usually means, which is the one thing the "
+           "reader can act on: %s" % eating)
+        # But not off a handful of frames. A rate measured over twenty frames
+        # is a tenth of a second of camera and it swings wildly -- and this
+        # readout has about seven rows, so a line that flickers in and out of
+        # them costs a measurement somebody was reading.
+        ck(not window(13500, 20, 100),
+           "five unexplained rejections a frame over only twenty frames is "
+           "NOT warned about -- the window has to have seen enough for the "
+           "rate to mean anything")
+
+        # ---- partly vouched for --------------------------------------------
+        # The interesting middle. Raw rejections identical, and the verdict
+        # flips on how much of it the resolver could place.
+        ck(not window(14000, 50, 100, d_far=60),
+           "100 rejections with 60 placed as stray is 0.8 a frame "
+           "unexplained, and stays silent")
+        part = window(15000, 50, 100, d_far=40)
+        ck(part,
+           "the same 100 rejections with only 40 placed is 1.2, and warns: "
+           "%s" % part)
+        ck(part and "60 blobs" in part[0] and "100 blobs" not in part[0],
+           "and the message reports the 60 it could not explain, not the 100 "
+           "the gate threw away -- the raw figure is the one that was wrong "
+           "(%s)" % part)
+
+        # ---- more vouched for than rejected --------------------------------
+        # bfar can move without a rejection behind it: the resolver labels a
+        # far blob it declines to associate whether or not a gate touched it.
+        # Subtracted raw that is a NEGATIVE rate, which never reaches a
+        # threshold again and would silently disable this warning for the rest
+        # of the power cycle.
+        ck(not window(16000, 50, 10, d_far=80),
+           "bfar climbing faster than bsrej clamps to zero rather than going "
+           "negative, and stays silent")
+        ck(cam5._meter.climb("bfar") > cam5._meter.climb("bsrej"),
+           "...with the window really holding the case it claims to (%d far, "
+           "%d rejected)" % (cam5._meter.climb("bfar"),
+                             cam5._meter.climb("bsrej")))
+        after = window(17000, 50, 150)
+        ck(after,
+           "and the warning still works afterwards, so the clamp did not "
+           "leave it stuck: %s" % after)
+
+        # ---- the two warnings are independent ------------------------------
+        # bnear is subtracted here, because a blob rejected where a corner
+        # should be IS accounted for -- but it is accounted for as the gate
+        # being WRONG, which is the other warning's whole subject. Netting it
+        # out of one must never silence the other.
+        both = window(18000, 50, 10, d_near=10)
+        near_line = [l for l in cam5.blob_lines()
+                     if "GATE MAY BE TAKING REAL LEDs" in l]
+        ck(near_line,
+           "bnear moving still raises the false-negative warning on its own "
+           "delta: %s" % near_line)
+        ck(not both,
+           "while the heavy-gate warning stays silent, because those ten "
+           "rejections were all accounted for: %s" % both)
+        # And bnear really is netted out, not merely present in the sum. A
+        # gate whose every mistake is the bnear kind -- refusing blobs exactly
+        # where a corner should be -- is a real failure, but it is the OTHER
+        # warning's failure; counted here as well it would be reported twice,
+        # once as "taking real LEDs" and once as "set for a different bar",
+        # and the second is advice that would not help.
+        ck(not window(18500, 50, 100, d_near=60),
+           "100 rejections with 60 of them landing where a corner should be "
+           "is 0.8 a frame unexplained, and the heavy-gate warning stays "
+           "silent -- that failure belongs to the false-negative meter")
+        ck([l for l in cam5.blob_lines()
+            if "GATE MAY BE TAKING REAL LEDs" in l],
+           "...which is raising it, so the event is reported once and by the "
+           "warning whose advice fits it")
+
+        # ---- and it still clears --------------------------------------------
+        # With all three counters in the window, which is the state that
+        # actually occurs. A rate that cannot fall back to zero is a warning
+        # pinned to the screen for the rest of the power cycle, and this
+        # project has shipped that twice.
+        ck(window(19000, 50, 150),
+           "a heavy window warns...")
+        fake["t"] += 20.0
+        ck(not [l for l in cam5.blob_lines() if "REFUSING HEAVILY" in l],
+           "...and CLEARS once the counters stop moving, with all three of "
+           "them in the window")
+
+        # ---- a gate that is set and cannot act -------------------------
+        # The shape gate compares box HEIGHTS, and outside full report mode
+        # the gun reports no box at all -- so the gate stands down and the
+        # number in the row above judges nothing. This is the exact shape of
+        # the bug that made the whole feature a no-op for a release: the saved
+        # format was clamped below full mode, so every saved ceiling loaded
+        # into a gun that could never execute it. Nothing else on this screen
+        # shows it -- the row reads "10 rows", the gun agrees.
+        app.link.last.update({"bframes": 22000, "bhmax": 10, "fmt": 2})
+        cam5.blob_lines()
+        ck(not [l for l in cam5.blob_lines() if "INERT" in l],
+           "a gate in full mode is not called inert")
+        app.link.last["fmt"] = 1
+        inert = [l for l in cam5.blob_lines() if "INERT" in l]
+        ck(inert, "a ceiling set outside full mode is called out as INERT: "
+                  "%s" % inert)
+        ck(inert and "Blob detail" in inert[0] and "bhmax:0" in inert[0],
+           "...saying both ways out of it -- the format it needs, or off")
+        ck(not [l for l in cam5.blob_lines() if "REFUSING HEAVILY" in l],
+           "and a gate that cannot act is not also accused of refusing "
+           "things, which would be two contradictory warnings at once")
+        app.link.last["bhmax"] = 0
+        ck(not [l for l in cam5.blob_lines() if "INERT" in l],
+           "a gate that is off is not inert, it is off")
+
+        # ---- naming the row that is ACTUALLY holding the gate up --------
+        # Every case above happened to be tested with bhmax as the only one
+        # of the three ever set. The shape gate is bhmax || pxmax || armax,
+        # so a rig set up entirely from the second page -- pxmax or the
+        # DEPRECATED armax, with Biggest blob (height) never touched -- runs
+        # the gate with bhmax sitting at 0 throughout, and 'bhmax:0 turns it
+        # off' on such a rig is a true sentence that changes nothing.
+        app.link.last.update({"bhmax": 0, "pxmax": 0, "armax": 0})
+        ck(cam5.gate_keys() == [],
+           "nothing set on any of the three reads as the gate being off "
+           "(%s)" % cam5.gate_keys())
+        app.link.last["pxmax"] = 14
+        ck(cam5.gate_keys() == ["pxmax"],
+           "pxmax alone is read as the key actually holding the gate up, "
+           "not assumed to be bhmax just because it is the first row on "
+           "the page (%s)" % cam5.gate_keys())
+        # fmt is still 1 from the case above, so this pxmax ceiling is
+        # inert too -- the gate does not care which row set it -- and the
+        # message has to say so by the RIGHT name.
+        inert_px = [l for l in cam5.blob_lines() if "INERT" in l]
+        ck(inert_px, "a pxmax ceiling outside full mode is inert as well")
+        ck(inert_px and "pxmax:0" in inert_px[0]
+           and "bhmax:0" not in inert_px[0],
+           "...and names pxmax, the row that is actually live, never a "
+           "bhmax that was left at 0 the whole time: %s" % inert_px)
+        # The NO SAFE GATE verdict fed further up this block is still
+        # standing -- nothing between there and here asked the gun again --
+        # so the same rig is checked against its advice too.
+        no_gate_px = [l for l in cam5.blob_lines() if "NO SAFE GATE" in l]
+        ck(no_gate_px and "pxmax:0" in no_gate_px[0]
+           and "bhmax:0" not in no_gate_px[0],
+           "NO SAFE GATE's own advice names pxmax too, not bhmax: %s"
+           % no_gate_px)
+        # More than one of the three can be live at once -- they are
+        # independent settings, not a radio button -- and naming only the
+        # first would leave a user who cleared it still running the gate.
+        app.link.last["bhmax"] = 10
+        both = [l for l in cam5.blob_lines() if "INERT" in l]
+        ck(both and "bhmax:0 and pxmax:0" in both[0],
+           "both live settings are named together: %s" % both)
+        # And with nothing live at all -- which is this gun's actual state
+        # for the whole of the ladder tests further up this file, since
+        # those never touch link.last for real -- the advice has to say
+        # the gate is off rather than name a row that was never the one
+        # holding it up.
+        app.link.last.update({"bhmax": 0, "pxmax": 0, "armax": 0})
+        no_gate_off = [l for l in cam5.blob_lines() if "NO SAFE GATE" in l]
+        ck(no_gate_off and "off already" in no_gate_off[0]
+           and "bhmax:0" not in no_gate_off[0],
+           "nothing set reads as the gate being off already, not as advice "
+           "to zero a row that was never on: %s" % no_gate_off)
+        # The heavy-refusal warning names the live key too.
+        app.link.last.update({"pxmax": 14, "fmt": 2})
+        heavy_px = window(20500, 50, 150)
+        ck(heavy_px and "pxmax:0" in heavy_px[0]
+           and "bhmax:0" not in heavy_px[0],
+           "the heavy-refusal warning names pxmax as well, when pxmax is "
+           "what is actually live: %s" % heavy_px)
+        # Left exactly as the case above left it, so nothing after this
+        # depends on a row this case turned on.
+        app.link.last.update({"bhmax": 0, "pxmax": 0, "armax": 0, "fmt": 1})
+        ck(not [l for l in cam5.blob_lines() if "INERT" in l],
+           "a gate that is off is not inert, it is off")
+
+        # ---- the contamination note, on the readout --------------------
+        # This is the one line that explains a ceiling: an envelope of 7 rows
+        # with 32 samples set aside at 31 is a rig with the sun in the LED
+        # class, and a user told that can go and fix it. It used to reach the
+        # log only, which is nowhere.
+        app.link.last["bhmax"] = 10
+        ck(not [l for l in cam5.blob_lines() if "CONTAMINATED" in l],
+           "a clean capture says nothing about contamination")
+        for ln in (HDR % (900, 7, 40, 13),
+                   "CAM: fit 32 LED samples ignored -- they reach 31 tall, "
+                   "far above the 7 the rest stop at, and are almost "
+                   "certainly stray light learned while the resolver locked "
+                   "on it",
+                   "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+            app.link.src.q.put(ln + "\n")
+        app.step([], t + 15.5)
+        dirty = [l for l in cam5.blob_lines() if "CONTAMINATED" in l]
+        ck(dirty, "a contaminated capture is said on the readout: %s" % dirty)
+        ck(dirty and "32" in dirty[0] and "31" in dirty[0]
+           and "7" in dirty[0],
+           "with all three numbers, because '32 ignored at 31 against 7' is "
+           "the whole of what makes it understandable: %s" % dirty)
+        ck(dirty and "block that light" in dirty[0],
+           "and what to do about it: %s" % dirty)
+        ck(dirty and "left out" in dirty[0],
+           "while saying the ceiling is measured from the rest, so it does "
+           "not read as an error the user has to undo: %s" % dirty)
+        app.link.last.update({"bhmax": 10, "fmt": 2})
+        # A gate that is switched off cannot be refusing anything, however
+        # much it threw away before the user turned it off.
+        app.link.last["bhmax"] = 0
+        ck(not window(23000, 50, 150),
+           "a gate the user has already turned off is not accused of "
+           "refusing anything")
+        app.link.last["bhmax"] = 10
+        ck(window(24000, 50, 150),
+           "...and turning it back on brings the warning back, so the guard "
+           "is on the gate's state and not a latch")
+        app.link.last.update({"bframes": 25000, "bnear": 50100})
+        near = [l for l in cam5.blob_lines() if "GATE MAY BE TAKING" in l]
+        ck(near and "bhmax:0" in near[0],
+           "the false-negative warning names the way out as well, so all "
+           "three warnings answer the same question: %s" % near)
+    finally:
+        time.monotonic = real_mono
+    app.to_menu()
+
+    # ---- no recommended non-zero value, anywhere ---------------------------
+    # Every figure these rows used to suggest was measured on ONE bar with two
+    # LEDs per corner. A bar with five LEDs in each cluster makes a blob
+    # several times bigger in every one of these units, so a borrowed ceiling
+    # silently blinds that gun -- and what its owner sees is a cursor that
+    # will not lock, with nothing on any screen connecting it to a row they
+    # set weeks ago. The only defensible source for a non-zero value is
+    # '~camfit' on the rig it is going to run on.
+    app.link.last["board"] = "rp2040-wiicam"
+    # From a gun that has said nothing yet, which is the state these hints
+    # have to be right in: the height row deliberately CHANGES once the gun
+    # has measured a ceiling, and the previous section left a verdict behind.
+    app.fit.reset()
+    cam6 = pical.Camera(app)
+    app.open(cam6)
+    GATES = ("Biggest blob (height)", "Biggest blob (pixels)",
+             "Roundness limit", "Sensor max size (0x06)")
+    suggested = []
+    for advanced in (False, True):
+        page(cam6, advanced)
+        for r_ in cam6.rows:
+            tip = r_.tip() or ""
+            if r_.label not in GATES:
+                continue
+            for word in ("recommended", "a fair start", "Nintendo",
+                         "is a good", "suggested"):
+                if word in tip and "NOT recommended" not in tip:
+                    suggested.append((r_.label, tip))
+    ck(not suggested,
+       "no gate row suggests a figure for itself on either page (%s)"
+       % suggested)
+    labels = page(cam6, False)
+    bh = cam6.rows[labels.index("Biggest blob (height)")]
+    ck("sweep" in bh.tip() and "recommended" not in bh.tip(),
+       "the height gate points at the room sweep that can measure it, "
+       "instead of at a number: %r" % bh.tip())
+    ck(0 in bh.vals and bh.show(0) == "off",
+       "and it still ships at 0 -- off -- reachable from its own row")
+    adv_labels = page(cam6, True)
+    ar = cam6.rows[adv_labels.index("Roundness limit")]
+    ck("DEPRECATED" in ar.tip() and "NOT recommended" in ar.tip(),
+       "roundness is marked DEPRECATED as well as not recommended -- the two "
+       "are different things and the row has to carry both: %r" % ar.tip())
+    ck(ar.show(20) == "2.5:1" and ar.show(0) == "off" and 0 in ar.vals,
+       "and it still LOADS and displays, so a gun already set up with one "
+       "keeps its meaning (%s)" % [ar.show(v) for v in (0, 16, 20)])
+    hw = cam6.rows[adv_labels.index("Sensor max size (0x06)")]
+    ck("Nintendo" not in hw.tip() and "100-200" not in hw.tip(),
+       "the sensor ceiling quotes nobody else's hardware: %r" % hw.tip())
+    ck(hw.vals[0] == -1 and "leaves it alone" in hw.tip(),
+       "and names the value that leaves the sensor alone, which is how it "
+       "ships (%s)" % (hw.vals[0],))
+    px = cam6.rows[adv_labels.index("Biggest blob (pixels)")]
+    ck(0 in px.vals and px.show(0) == "off",
+       "every gate can still be turned off from its own row")
+    page(cam6, False)
+    app.to_menu()
+
+    # ---- 4b: the room-light sweep ------------------------------------------
+    # A step nobody has to do, offered after a calibration that is ALREADY
+    # finished and saved. Everything here turns on one rule: it must never
+    # cost the user something they did not ask for -- not a setting, not a
+    # measurement, and not their way out of the screen.
+    # ---- borrowing the gun's report format and capture ---------------------
+    # The measurement needs full report mode and the learning capture, and
+    # both are things a user may deliberately have had off. What has to be
+    # right is the ORDER: the one fact that matters -- was the capture already
+    # running? -- can only be learnt before arming, because after
+    # '~camlearn=on:1' the gun answers on=1 whatever it was doing. So a borrow
+    # asks first and arms when the answer lands, and it never blocks: that
+    # answer is thirteen lines and up to 2.6 KB, and waiting for it inside a
+    # key press freezes a screen that has no console beside it.
+    def arm(on, led=0):
+        """Let a pending borrow complete, with the gun saying what it held."""
+        for ln in learn_lines(on, 40, led, 0, {}):
+            app.link.src.q.put(ln)
+        app.step([], time.time())
+
+    app.link.last["board"] = "rp2040-wiicam"
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    n0 = len(ser.written)
+    app.begin_room_sweep()
+    rs = app.view
+    ck(isinstance(rs, pical.RoomSweep), "the menu row opens the sweep")
+    sent = b" ".join(ser.written[n0:])
+    ck(b"camlearn?" in sent and b"camlearn=on:1" not in sent,
+       "it ASKS what the gun is holding before it arms anything -- after "
+       "on:1 the gun answers on=1 whatever it was doing, and there is no way "
+       "left to tell whose capture it is (%s)" % sent)
+    n0 = len(ser.written)
+    arm(0)                                     # the gun: capture was OFF
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=fmt:2" in sent and b"camlearn=on:1" in sent,
+       "and once the gun has answered it takes both -- full report mode and "
+       "the capture (%s)" % sent)
+    n0 = len(ser.written)
+    app.step([key(pygame.K_ESCAPE)], t + 16.0)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=ext:1" in sent and b"camlearn=on:0" in sent,
+       "Esc puts BOTH back exactly as they were -- left on they are a silent "
+       "edit with nothing anywhere to say where it came from (%s)" % sent)
+    ck(b"cam=fmt:1" not in sent,
+       "and goes back as ext:, which both firmware generations take -- fmt: "
+       "is dropped in silence by the older one")
+    ck(isinstance(app.view, pical.Menu),
+       "and lands on the menu, with the calibration untouched")
+    # A capture that was ALREADY running is the user's. It is still armed --
+    # on:1 at a running capture is a no-op, the firmware clears on the off->on
+    # edge only -- but it must not be STOPPED on the way out.
+    app.link.last["fmt"] = 2
+    app.begin_room_sweep()
+    arm(1, led=900)
+    n0 = len(ser.written)
+    app.to_menu()
+    sent = b" ".join(ser.written[n0:])
+    ck(b"camlearn=on:0" not in sent,
+       "a capture the user already had running is not stopped on the way out "
+       "-- pical only ever switches off one it can prove it started (%s)"
+       % sent)
+    ck(b"cam=ext:" not in sent,
+       "and a gun already in full mode is not moved out of it either")
+    # A gun that never answers is not waited on for ever, and its capture is
+    # left running rather than stopped on a guess.
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    # Anchored to the real clock, not to a round number: monotonic is seconds
+    # since boot, so an absolute value can land either side of the deadline
+    # already recorded and the test would pass or fail on the machine's
+    # uptime.
+    real_mono, fake = time.monotonic, {"t": time.monotonic()}
+    time.monotonic = lambda: fake["t"]
+    try:
+        app.step([], t + 16.2)
+        ck(app._cam_borrow is None,
+           "a borrow with no answer yet has taken nothing")
+        fake["t"] += pical.CAM_ARM_S + 0.1
+        n0 = len(ser.written)
+        app.step([], t + 16.3)
+        sent = b" ".join(ser.written[n0:])
+        ck(b"camlearn=on:1" in sent,
+           "but it does not wait for ever -- a gun with no capture at all "
+           "never answers, and a step that collected nothing and said nothing "
+           "about why is worse (%s)" % sent)
+        n0 = len(ser.written)
+        app.to_menu()
+        ck(b"camlearn=on:0" not in b" ".join(ser.written[n0:]),
+           "and with the answer unknown the capture is LEFT running: one "
+           "nobody stopped shows on the camera screen, one stopped out from "
+           "under somebody does not")
+    finally:
+        time.monotonic = real_mono
+    # ...and one that has never said what report mode it holds is not written
+    # a guess.
+    app.link.last.pop("fmt", None)
+    app.link.last.pop("ext", None)
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    n0 = len(ser.written)
+    app.to_menu()
+    ck(b"cam=ext:" not in b" ".join(ser.written[n0:]),
+       "and a gun that never said what report mode it was in is not written "
+       "a guess on the way out")
+    app.link.last["fmt"] = 2
+
+    # ---- the calibration banks its own LED data ----------------------------
+    # A calibration is minutes of frames in which the resolver has locked all
+    # four corners, and every blob in such a frame is a confirmed LED -- which
+    # is exactly what '~camfit' needs 500 of. This used to be discarded, and
+    # both tools instead told the user to switch the capture on by hand on
+    # another screen, so the LED side was only ever filled by somebody who
+    # already knew the feature existed.
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    n0 = len(ser.written)
+    app.begin_calib()
+    ck(isinstance(app.view, pical.Calib), "a calibration starts")
+    arm(0)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"camlearn=on:1" in sent and b"cam=fmt:2" in sent,
+       "and it arms the shape capture and full mode, so its confirmed frames "
+       "are measured instead of thrown away (%s)" % sent)
+    # The borrow SPANS screens: the sweep is offered at the end of the
+    # calibration, and taking it again would re-send on:1 -- an off->on edge
+    # to a capture that is already running is fine, but re-REMEMBERING would
+    # record the borrowed state as the user's own and never give the real one
+    # back.
+    held = app._cam_borrow
+    app.finish_calib()
+    ck(isinstance(app.view, pical.Result), "and finishes on the result screen")
+    ck(app._cam_borrow == held,
+       "which does NOT hand the borrow back -- the sweep offered from that "
+       "screen needs the LED blobs the calibration just banked (%s vs %s)"
+       % (app._cam_borrow, held))
+    # A fitted calibration, so the result screen carries the row that offers
+    # the sweep. finish_calib above had no shots to fit, and the sweep is
+    # deliberately not offered after a refusal: there it would read as part of
+    # the recovery rather than as an optional extra.
+    app.view = pical.Result(app, dict(fit_rms=0.004, w=0.35, h=1.2, bx=5.0,
+                                      by=-3.0), None, "INSTALLED", None)
+    n0 = len(ser.written)
+    app.view.sel = [l for l, _k in app.view.rows].index(
+        "Learn the room light (optional)")
+    app.step([key(pygame.K_RETURN)], t + 16.5)
+    ck(isinstance(app.view, pical.RoomSweep),
+       "the sweep opens from the result screen")
+    ck(app._cam_borrow == held and app._cam_arm is None,
+       "and INHERITS the calibration's borrow rather than taking it again -- "
+       "a second ask would record fmt:2 as what the user had (%s vs %s)"
+       % (app._cam_borrow, held))
+    ck(b"camlearn?" not in b" ".join(ser.written[n0:]),
+       "so it does not even ask, which is what keeps the calibration's own "
+       "LED blobs out of reach of another off->on edge")
+    n0 = len(ser.written)
+    app.step([key(pygame.K_ESCAPE)], t + 16.6)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=ext:1" in sent and b"camlearn=on:0" in sent,
+       "and ONE give-back at the end covers the whole trip (%s)" % sent)
+    app.link.last["fmt"] = 2
+    # Refusals, out loud. A row that silently does nothing is a row the user
+    # decides is broken.
+    app.link.last["board"] = "esp32-ov2640"
+    app.toast = ""
+    app.begin_room_sweep()
+    ck(isinstance(app.view, pical.Menu) and app.toast,
+       "an ESP32 gun is told there is nothing here to measure: %r" % app.toast)
+    app.link.last["board"] = "rp2040-wiicam"
+    src, app.link.src = app.link.src, None
+    app.toast = ""
+    app.begin_room_sweep()
+    app.link.src = src
+    ck(isinstance(app.view, pical.Menu) and "connect" in app.toast,
+       "and with no gun it refuses politely rather than opening a screen "
+       "nothing can answer: %r" % app.toast)
+
+    # Nothing is applied without the user choosing it, and nothing at all is
+    # applied when the gun has said no gate can work.
+    # From fmt:1, and with the borrow actually COMPLETED, because that is the
+    # only state the bug this guards against can be seen in: the sweep is
+    # normally reached from a gun in extended mode, and it was handing that
+    # mode back on the way out -- killing the ceiling the user had just
+    # applied, under a screen that said it would hold through a power cycle.
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    rs = app.view
+    ck(app._cam_borrow == (1, False),
+       "the sweep is entered from a gun in extended mode with the capture "
+       "off, which is the normal way in (%s)" % (app._cam_borrow,))
+    app.fit.reset()
+    # From HERE, because ser.written carries the whole session and the ladder
+    # tests further up nudged the gate rows on purpose.
+    n_gate = len(ser.written)
+    n0 = len(ser.written)
+    app.toast = ""
+    rs.apply()
+    ck(b"camfit=apply" not in b" ".join(ser.written[n0:]) and app.toast,
+       "nothing is applied before there is a verdict, and it says why: %r"
+       % app.toast)
+    for ln in (HDR % (900, 9, 40, 9),
+               "CAM: fit NO SAFE GATE -- your LEDs reach 9 tall and the stray "
+               "light starts at 9, so a size gate cannot tell them apart."):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 17.0)
+    n0 = len(ser.written)
+    app.toast = ""
+    rs.apply()
+    ck(b"camfit=apply" not in b" ".join(ser.written[n0:]),
+       "nor when the gun says no size gate can work here: %r" % app.toast)
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 17.1)
+    ck(b"cam=bhmax:" not in b" ".join(ser.written[n_gate:]),
+       "a verdict sitting on screen has still written NOTHING to the gun by "
+       "itself -- the whole screen is a measurement until somebody presses")
+    n0 = len(ser.written)
+    app.step([key(pygame.K_RETURN)], t + 17.2)
+    ck(b"camfit=apply" in b" ".join(ser.written[n0:]),
+       "only the user's own press applies it, and it applies the GUN's "
+       "number by asking the gun to set it")
+    n0 = len(ser.written)
+    # The fake gun's camfit answers are queued by hand, so the ceiling it
+    # would have stored has to be set by hand too: otherwise its camsave reply
+    # echoes bhmax=0 and the verified save reports a disagreement that exists
+    # only in the simulation.
+    ser.state["bhmax"] = 10
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)",
+               "CAM: fit applied and saved"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 17.3)
+    ck("saved" in rs.done and "10 rows" in rs.done,
+       "and the screen reports what the GUN did, not what pical asked for: "
+       "%r" % rs.done)
+    # '~camfit=apply' now persists the GATE and the report FORMAT itself --
+    # switching the gun into full mode first if it had dropped out of it,
+    # because the gate only acts there. The '~camsave' below still goes out,
+    # belt-and-braces: it is how pical reads back what the gun says actually
+    # reached flash, rather than trusting apply's own reply -- not what makes
+    # the format persist any more. Before apply did this itself, the gate
+    # could take the number and leave the format behind, so the ceiling came
+    # back from a power cycle in a mode where the shape gate cannot run --
+    # the number surviving and the gate not, which is the same no-op the
+    # firmware's own format clamp used to cause.
+    ck(b"camsave" in b" ".join(ser.written[n0:]),
+       "applying also SAVES, belt-and-braces, so pical can read back "
+       "whether the format the gate needs actually reached flash (%s)"
+       % b" ".join(ser.written[n0:])[-60:])
+    ck("full detail" in rs.done,
+       "and the outcome says the format was kept, not just the number: %r"
+       % rs.done)
+    ck(rs.applied,
+       "the screen knows a ceiling is live because of it, which is what "
+       "stops the way out from undoing it")
+    # THE defect: restore() used to send ~cam=ext:<pre-sweep> unconditionally,
+    # and the sweep is normally entered from a gun in fmt:1 -- so the ceiling
+    # the user had just applied was dead before they reached the menu, under a
+    # screen that said it would hold through a power cycle.
+    n0 = len(ser.written)
+    app.step([key(pygame.K_ESCAPE)], t + 17.4)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=ext:" not in sent and b"cam=fmt:1" not in sent,
+       "and leaving does NOT put the old report format back: the shape gate "
+       "only acts in fmt:2, so handing it back would kill the ceiling that "
+       "was just applied and saved (%s)" % sent)
+    ck(app._cam_borrow is None,
+       "while the borrow is still closed out, so nothing is left half-held")
+    # Nothing applied means the format DOES go back -- the exception is for
+    # the one case where giving it back would undo the user's own choice.
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    n0 = len(ser.written)
+    app.step([key(pygame.K_ESCAPE)], t + 17.5)
+    ck(b"cam=ext:1" in b" ".join(ser.written[n0:]),
+       "a sweep the user skipped still hands the report format back")
+    app.link.last["fmt"] = 2
+    # A gun that took the ceiling and says it cannot act on it. Current
+    # firmware cannot produce this from '=apply' any more -- apply switches
+    # the gun into full mode itself before it can ever answer INERT, and
+    # this screen also puts it in full mode first on its own account -- so
+    # the INERT line here stands for a gun that has NOT been reflashed and
+    # is answering the old way. It should never happen on this build, and if
+    # it somehow does, something refused the format and the user must be
+    # told rather than reassured.
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    rs = app.view
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 17.6)
+    ser.state["bhmax"] = 10
+    rs.apply()
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)",
+               "CAM: fit applied and saved",
+               "CAM: fit INERT RIGHT NOW -- the shape gate needs fmt:2 and "
+               "this gun is in fmt:1; set fmt:2 for it to act"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 17.7)
+    ck(app.fit.inert,
+       "an older gun's INERT line is read rather than ignored, even though "
+       "current firmware no longer sends it")
+    ck("INERT" in rs.done and "Blob detail 2" in rs.done,
+       "and the outcome says so instead of promising a gate that acts: %r"
+       % rs.done)
+    app.step([key(pygame.K_ESCAPE)], t + 17.8)
+    # And a save that did not reach flash at all.
+    ser.save_fails = True
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    rs = app.view
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 17.9)
+    ser.state["bhmax"] = 10
+    rs.apply()
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)",
+               "CAM: fit applied and saved"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 18.0)
+    ck("could NOT be saved" in rs.done and "not act" in rs.done,
+       "a format that never reached flash is reported as a gate that will "
+       "not act, not as a success: %r" % rs.done)
+    ser.save_fails = False
+    app.step([key(pygame.K_ESCAPE)], t + 18.05)
+    # ---- apply switches the format itself now ------------------------------
+    # 'apply' used to store the gate and leave the report format behind, so
+    # the ceiling came back from a power cycle in a mode where the shape gate
+    # cannot run. It now switches the gun into full mode and persists THAT --
+    # a change to the gun nobody asked for by name, and the right one, so the
+    # screen has to say it happened rather than let the user find it later.
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    rs = app.view
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 18.1)
+    ser.state["bhmax"] = 10
+    rs.apply()
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)",
+               "CAM: fit switched to fmt:2 -- the shape gate needs it and the "
+               "ceiling was measured in it",
+               "CAM: fit applied and saved"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 18.15)
+    ck("switched itself to full detail" in rs.done,
+       "the outcome says the gun moved its own report format, and why: %r"
+       % rs.done)
+    ck("Set to 10 rows and saved" in rs.done,
+       "...alongside what was actually set: %r" % rs.done)
+    n0 = len(ser.written)
+    app.step([key(pygame.K_ESCAPE)], t + 18.2)
+    ck(b"cam=ext:1" not in b" ".join(ser.written[n0:]),
+       "and leaving still does not undo it -- the gate the gun switched the "
+       "format FOR would die with it")
+    app.link.last["fmt"] = 2
+    # A save that did not reach flash is gone on the next power cycle, and it
+    # is the one outcome that looks identical to success from here.
+    app.begin_room_sweep()
+    rs = app.view
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 18.0)
+    rs.apply()
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)",
+               "CAM: fit applied but SAVE FAILED -- it will be gone on the "
+               "next power cycle"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 18.1)
+    ck("NOT save" in rs.done and "power cycle" in rs.done,
+       "a gate that took but never reached flash is reported as exactly "
+       "that: %r" % rs.done)
+    app.step([key(pygame.K_ESCAPE)], t + 18.2)
+    # And a gun that answers nothing at all does not leave the screen waiting
+    # for ever -- a spinner that never stops is indistinguishable from a hang.
+    app.begin_room_sweep()
+    rs = app.view
+    for ln in (HDR % (900, 7, 40, 13),
+               "CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)"):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 19.0)
+    rs.apply()
+    rs._apply_t = time.monotonic() - (rs.APPLY_WAIT_S + 1.0)
+    app.step([], t + 19.1)
+    ck("did not answer" in rs.done and "Nothing has been changed" in rs.done,
+       "a gun that never answers the apply is said so, and nothing is "
+       "claimed to have changed: %r" % rs.done)
+    app.step([key(pygame.K_ESCAPE)], t + 19.2)
+
+    # ---- the capture starting over, out loud -------------------------------
+    # The gun clears the capture whenever sensitivity or either sensor
+    # threshold changes, because a distribution spanning the change is two
+    # rigs averaged into one. That is the right call and it is invisible: a
+    # user mid-sweep who nudges sensitivity watches 400 LED blobs become 0
+    # with nothing anywhere to say why.
+    for reply, why in (
+            ("CAM: learn cleared -- sensitivity changed from 1 to 2, and a "
+             "capture spanning both is not a measurement of either\n",
+             "a capture cleared by a sensitivity change"),
+            ("CAM: learn cleared -- hwmax changed\n",
+             "one cleared by the sensor's own size ceiling moving"),
+            ("CAM: learn cleared -- hwmin changed\n",
+             "one cleared by its floor moving"),
+            ("CAM: learn cleared\n", "one cleared outright by camreset")):
+        app.toast = ""
+        app.link.src.q.put(reply)
+        app.step([], t + 19.4)
+        ck(reply.split("\n")[0][:34] in app.toast,
+           "%s reaches the user rather than only the log -- the progress bars "
+           "are about to restart and nothing else says so: %r"
+           % (why, app.toast))
+
+    # ---- two failures the user could not otherwise see ---------------------
+    # Both of these are states in which every row on the screen reads back
+    # exactly what was asked for and the thing the user wanted is not
+    # happening. pical has no visible log outside the auto-tune overlay, so a
+    # line that only reaches the log is a line nobody will ever see.
+    for reply, why in (
+            ("CAM: bhmax 10 set but INERT -- the shape gate needs fmt:2 and "
+             "this gun is in fmt:1\n",
+             "a gate the gun took and cannot act on"),
+            ("CAM: SAVE FAILED lead=0ms smooth=3 dead=0 beta=-1 lens=0\n",
+             "a save that never reached flash")):
+        app.toast = ""
+        app.link.src.q.put(reply)
+        app.step([], t + 19.5)
+        ck(reply.split("\n")[0][:36] in app.toast,
+           "%s is said out loud rather than left in a log nobody can read: "
+           "%r" % (why, app.toast))
+
+    # ---- the optional step is documented -----------------------------------
+    # A whole screen missing from the step table is how a feature ends up
+    # never being used: the README is the only place that says what pical
+    # covers, and 4b is the one step that is skippable and therefore the one
+    # most easily forgotten.
+    readme = os.path.join(ROOT, "pical", "README.md")
+    if os.path.isfile(readme):
+        with open(readme) as fh:
+            doc = fh.read()
+        ck("4b" in doc and "room light" in doc.lower(),
+           "the README's step table lists 4b, the room-light sweep")
+        ck("skip" in doc.lower(),
+           "and says it is skippable, which is the whole of why it is safe "
+           "to offer at the end of a calibration")
+
+    # ---- a gun that restarts mid-sweep -------------------------------------
+    # A reconnect is not by itself a reboot: a port that re-enumerated hands
+    # back the same running gun. A gun that RESTARTED comes up with the
+    # capture off, its histograms empty, and its format at whatever flash
+    # holds -- and nothing on this screen noticed. It went on polling, because
+    # the gun still answers '~camfit?'; every answer said ledn=0 and NEEDS
+    # MORE LED DATA; the screen went on saying "keep sweeping" at 0 of 500, at
+    # a gun that was not measuring anything, for as long as the user was
+    # willing to wave it about. And the borrow taken before the reboot
+    # described a gun that no longer existed, so the eventual give-back would
+    # have written a report format into a gun that never had it.
+    app.link.last["fmt"] = 1
+    app.link.hists.reset()
+    app.begin_room_sweep()
+    arm(0)
+    rs = app.view
+    ck(app._cam_borrow == (1, False), "a sweep is under way with a borrow held")
+    app.link.gun_t = 400.0                     # the gun, 400 s into its boot
+    for ln in (HDR % (300, 7, 5, -1),
+               "CAM: fit NO STRAY DATA -- sweep the room with the screen in "
+               "view so a lamp or window enters frame; 5 seen, 20 wanted. "
+               "Your LEDs measured 7 tall."):
+        app.link.src.q.put(ln + "\n")
+    app.step([], t + 19.0)
+    ck(app.fit.verdict == "need_stray" and app.fit.ledn == 300,
+       "and it has got somewhere: 300 LED blobs (%s)" % app.fit.ledn)
+
+    # The reboot. link_tick reconnects and records the clock the OLD session
+    # had; the gun then answers on a clock that has started again.
+    class Rebooted(FakeSrc):
+        def is_alive(self):
+            return False
+    app.link.src = Rebooted()
+    app.link.port = "SIM"
+    app._link_t = 0.0
+    app._link_retry = 0.0
+    app.toast = ""
+    def fake_connect(port=None):
+        """What Link.connect really does on a reconnect: a new port handle,
+        and everything it knew about the previous gun thrown away."""
+        app.link.src = FakeSrc()
+        app.link.last.clear()
+        app.link.blobs = ""
+        app.link.hists.reset()
+        app.link.replies = []
+        return True
+
+    real_connect = app.link.connect
+    app.link.connect = fake_connect
+    try:
+        app.link_tick(time.time())
+    finally:
+        app.link.connect = real_connect
+    app.link.last["board"] = "rp2040-wiicam"    # the '~cam?' answer, arriving
+    ck(app._gun_t0 == 400.0,
+       "the clock the previous session ended on is kept across the reconnect, "
+       "because it is the only thing that can tell a reboot from a "
+       "re-enumeration (%s)" % app._gun_t0)
+    n0 = len(app.link.src.ser.written)
+    app.toast = ""
+    app.link.gun_t = 0.9                        # a gun 0.9 s into a NEW boot
+    app.step([], t + 19.1)
+    ck("RESTARTED" in app.toast,
+       "a gun whose own clock has gone backwards is called a restart, out "
+       "loud: %r" % app.toast)
+    ck("starting over" in app.toast,
+       "and the user is told the measurement is starting over rather than "
+       "left to wonder why the bars stopped moving: %r" % app.toast)
+    ck(app.fit.verdict is None and app.fit.ledn == 0,
+       "the verdict and the counts from before the reboot are dropped -- they "
+       "describe a gun that no longer exists (%s, %s)"
+       % (app.fit.verdict, app.fit.ledn))
+    ck(app._cam_borrow is None and app._cam_arm is not None,
+       "the stale borrow is gone and a fresh one is under way, so the sweep "
+       "is pointed at a gun that is collecting again (%s, %s)"
+       % (app._cam_borrow, app._cam_arm is not None))
+    sent = b" ".join(app.link.src.ser.written[n0:])
+    ck(b"cam=ext:1" not in sent and b"camlearn=on:0" not in sent,
+       "and NOTHING is sent to put the old state back: the gun that would "
+       "receive it is not the gun it was recorded from (%s)" % sent)
+    arm(0)
+    ck(app._cam_borrow is not None,
+       "the fresh borrow completes against the gun that is actually there")
+    sent = b" ".join(app.link.src.ser.written[n0:])
+    ck(b"cam=fmt:2" in sent and b"camlearn=on:1" in sent,
+       "having armed full mode and the capture again (%s)" % sent[-60:])
+    # A re-enumeration that was NOT a reboot keeps the borrow, because the
+    # gun on the other end is still the one the borrow was recorded from.
+    app.link.gun_t = 900.0
+    app._gun_t0 = 400.0
+    held = app._cam_borrow
+    app.toast = ""
+    app.step([], t + 19.2)
+    ck(app._cam_borrow == held and "RESTARTED" not in app.toast,
+       "a clock that simply carried on is not a reboot, and the borrow "
+       "survives it (%s vs %s)" % (app._cam_borrow, held))
+    ck(app._gun_t0 is None, "and the question is answered once, not re-asked "
+                            "every frame")
+    # No frame since the reconnect at all: the decision WAITS for evidence
+    # rather than guessing either way.
+    app._gun_t0 = 400.0
+    app.link.gun_t = 0.0
+    app.step([], t + 19.3)
+    ck(app._gun_t0 == 400.0,
+       "with no frame to decide from, nothing is decided -- guessing early is "
+       "the same mistake as not looking")
+    app.link.gun_t = 900.0
+    app.step([], t + 19.35)
+    app.to_menu()
+    attach(app)
+    ser = app.link.src.ser
+    app.link.last["board"] = "rp2040-wiicam"
+    app.link.last["fmt"] = 2
+
+    # ---- the sweep drawn, at every size, in every state --------------------
+    # Brand-new UI, and the state it is in depends entirely on what the gun
+    # has said -- so each outcome is drawn at each size. Two things must hold
+    # in every one of the forty-nine: nothing is drawn off the screen (these
+    # lines are CENTRED with no wrapping of their own, so an over-long one
+    # does not clip, it loses a word off each end in silence), and the way out
+    # is on screen. A step that cannot be skipped is a step that blocks a
+    # calibration somebody has already finished.
+    SIZES = ((640, 480), (800, 600), (1024, 768), (1280, 720),
+             (1280, 1024), (1366, 768), (1920, 1080))
+    STATES = (
+        ("no answer yet", ()),
+        ("not enough LED data", (HDR % (120, -1, 0, -1),
+                                 "CAM: fit STORED ledmaxh=7 strayminh=12 -- "
+                                 "from an earlier capture on this gun",
+                                 "CAM: fit NEEDS MORE LED DATA -- run a "
+                                 "calibration with the capture on; 120 blobs "
+                                 "so far, 500 wanted")),
+        ("no stray data", (HDR % (900, 7, 2, -1),
+                           "CAM: fit NO STRAY DATA -- sweep the room with the "
+                           "screen in view so a lamp or window enters frame; "
+                           "2 seen, 20 wanted. Your LEDs measured 7 tall.")),
+        ("no safe gate", (HDR % (900, 9, 40, 9),
+                          "CAM: fit NO SAFE GATE -- your LEDs reach 9 tall "
+                          "and the stray light starts at 9, so a size gate "
+                          "cannot tell them apart. Move the bar, block the "
+                          "light, or use brighter LEDs.")),
+        ("a verdict", (HDR % (900, 7, 40, 13),
+                       "CAM: fit bhmax=10 (LEDs reach 7, stray starts at "
+                       "13)")),
+        ("a tight verdict", (HDR % (900, 7, 40, 8),
+                             "CAM: fit bhmax=8 (LEDs reach 7, stray starts at "
+                             "8 -- TIGHT, only one step between them)")),
+        # A verdict with the sun inside the LED measurement. The line the gun
+        # sends about it starts with a DIGIT after 'CAM: fit ', which is why
+        # it used to match no branch and reach the log alone.
+        ("contaminated", (HDR % (900, 7, 40, 13),
+                          "CAM: fit 32 LED samples ignored -- they reach 31 "
+                          "tall, far above the 7 the rest stop at, and are "
+                          "almost certainly stray light learned while the "
+                          "resolver locked on it",
+                          "CAM: fit bhmax=10 (LEDs reach 7, stray starts at "
+                          "13)")),
+        # And provenance from a gun that has been saved but never fitted:
+        # camsave records the LED edge alone and leaves the stray side at 0.
+        ("never fitted before", (HDR % (120, -1, 0, -1),
+                                 "CAM: fit STORED ledmaxh=7 strayminh=0 "
+                                 "ledmaxpx=84 -- from an earlier capture on "
+                                 "this gun",
+                                 "CAM: fit NEEDS MORE LED DATA -- run a "
+                                 "calibration with the capture on; 120 blobs "
+                                 "so far, 500 wanted")),
+    )
+    screens = [(w, h, pical.Screen(pygame.Surface((w, h)))) for w, h in SIZES]
+    app.begin_room_sweep()
+    rs = app.view
+    n0 = len(ser.written)
+    for what, lines in STATES:
+        for ln in lines:
+            app.link.src.q.put(ln + "\n")
+        app.step([], t + 20.0)
+        if what == "contaminated":
+            # The same note the camera readout carries, on the screen the
+            # user is actually looking at while they sweep. Under the verdict,
+            # never instead of it: the ceiling is still the answer and this is
+            # why it is that number.
+            said = " ".join(m for _r, m, _i in texts_of(rs, screens[2][2]))
+            ck("stray light" in said and "32" in said and "31" in said,
+               "the sweep says which of its LED samples were really stray "
+               "light, with the numbers: %s"
+               % [m for _r, m, _i in texts_of(rs, screens[2][2])
+                  if "stray light" in m or "32" in m])
+            ck("left out" in said,
+               "and that they are left out, so the ceiling beside it is not "
+               "read as wrong")
+        if what == "no answer yet":
+            # The agreed description promises about fifteen seconds of
+            # sweeping. A step with no duration on it reads as open-ended,
+            # and an open-ended optional step is one people abandon.
+            said = " ".join(m for _r, m, _i in texts_of(rs, screens[2][2]))
+            ck("15 second" in said,
+               "the sweep says roughly how long it takes: %s"
+               % [m for _r, m, _i in texts_of(rs, screens[2][2])
+                  if "15" in m])
+        for w, h, sc_n in screens:
+            try:
+                drew = texts_of(rs, sc_n)
+                threw = None
+            except Exception as e:             # noqa: BLE001 - that IS the test
+                drew, threw = [], e
+            ck(threw is None, "the sweep survives %s at %dx%d (%r)"
+               % (what, w, h, threw))
+            if threw is not None:
+                continue
+            off = [m for r, m, _i in drew
+                   if r.left < 0 or r.right > w or r.top < 0 or r.bottom > h]
+            ck(not off, "and draws nothing off a %dx%d screen showing %s (%s)"
+               % (w, h, what, [m[:36] for m in off]))
+            ck(any("Esc" in m and "SKIP" in m for r, m, _i in drew),
+               "and the way out is on screen at %dx%d showing %s" % (w, h, what))
+            if what == "never fitted before":
+                # Joined across the wrapped rows, because the sentence is
+                # broken over two of them at these widths. The "never as a
+                # zero" half of this claim is pinned on stored_words() itself
+                # up above: down here the stray PROGRESS BAR legitimately
+                # draws "room light" beside "0 / 20", and a text match cannot
+                # tell that apart from a provenance line saying the same
+                # thing.
+                said = " ".join(m for _r, m, _i in drew)
+                ck("Measured before on this gun" in said
+                   and "not recorded" in said,
+                   "a gun that has been saved but never fitted shows its "
+                   "stray side as NOT RECORDED at %dx%d (%s)"
+                   % (w, h, [m for _r, m, _i in drew
+                             if "Measured" in m or "recorded" in m]))
+    # The one state with no bars and no skip line: the outcome, which any
+    # button leaves. It still has to fit.
+    rs.done = ("Set to 8 rows, but the gun could NOT save it -- it will be "
+               "gone on the next power cycle.")
+    for w, h, sc_n in screens:
+        drew = texts_of(rs, sc_n)
+        off = [m for r, m, _i in drew
+               if r.left < 0 or r.right > w or r.top < 0 or r.bottom > h]
+        ck(not off, "the outcome fits a %dx%d screen too (%s)"
+           % (w, h, [m[:36] for m in off]))
+        ck(any("finish" in m for r, m, _i in drew),
+           "and says how to leave it at %dx%d" % (w, h))
+    ck(b"cam=bhmax:" not in b" ".join(ser.written[n0:]),
+       "and drawing every state of the sweep at every size never wrote a "
+       "gate value to the gun")
+    app.step([key(pygame.K_ESCAPE)], t + 20.5)
+
+    # ---- the camera page's two stacked panels ------------------------------
+    # The sensor panel used to REPLACE the camera view. They answer different
+    # questions -- the view draws the resolved quad, the panel draws every
+    # blob the sensor handed over including the ones a gate threw away -- and
+    # with only the second on screen a gate that had started taking a real
+    # corner looked exactly like a gate that was working. Stacked, they are
+    # both height-limited, and the readout underneath is CENTRED and nearly
+    # full width, so it has to clear the whole column. Measured at every size,
+    # because the faces are chosen from the screen's height and the room the
+    # column has is a fraction of its width.
+    app.link.last["board"] = "rp2040-wiicam"
+    cam7 = pical.Camera(app)
+    app.open(cam7)
+    app.link.blobs = "CAM: blobs " + " ".join(
+        blob9(*b) for b in ((50, 45, 3, 0, 11, 9, 84),
+                            (190, 48, 4, 0, 12, 10, 79),
+                            (52, 150, 3, 0, 10, 9, 80),
+                            (195, 152, 14, 0, 41, 38, 255)))
+    app.link.last.update({"fmt": 2, "bhmax": 10, "bframes": 3000, "bms": 30000,
+                          "brej": 40, "brrej": 18, "bvalve": 4, "bsrej": 6,
+                          "bnear": 0, "br4": 1000, "br3": 60, "br2": 20,
+                          "br1": 5, "br0": 0})
+    cam7._rate.feed(3000, 30000)
+    cam7.blob_lines()
+    cam7.log_toggle()
+    app.link.last.update({"bframes": 3100, "bms": 31000, "brej": 90,
+                          "brrej": 39, "bvalve": 90, "bsrej": 20, "bnear": 9,
+                          "br4": 1200, "br3": 90, "br2": 30, "br1": 8,
+                          "br0": 1})
+    cam7._rate.feed(3100, 31000)
+    cam7.blob_lines()
+    for w, h, sc_n in screens:
+        for advanced in (False, True):
+            page(cam7, advanced)
+            drew = texts_of(cam7, sc_n)
+            what = "%dx%d %s" % (w, h, "second page" if advanced else "page 1")
+            vr, pr = cam7.view_rect, cam7.shape_rect
+            ck(vr is not None and pr is not None,
+               "%s: both panels are drawn and say what they covered" % what)
+            ck(not vr.colliderect(pr),
+               "%s: and they are stacked, not overlapping (%s over %s)"
+               % (what, vr, pr))
+            rows = [r.rect for r in cam7.rows if r.rect]
+            hit = [r for r in rows if vr.colliderect(r) or pr.colliderect(r)]
+            ck(not hit, "%s: the column clears every row beside it (%s)"
+               % (what, hit))
+            under = [m for r, m, ins in drew
+                     if ins and (vr.colliderect(r) or pr.colliderect(r))]
+            ck(not under,
+               "%s: and the readout starts below the whole column rather "
+               "than through it (%s)" % (what, [m[:24] for m in under]))
+            tip_top = h * pical.TIP_Y - sc_n.f_s.get_height() / 2.0
+            ck(pr.bottom <= tip_top - 6,
+               "%s: the column's own numbers clear the row hint (column ends "
+               "%d, hint starts %d)" % (what, pr.bottom, tip_top))
+            off = [m for r, m, _i in drew
+                   if r.left < 0 or r.right > w or r.top < 0 or r.bottom > h]
+            ck(not off, "%s: nothing is drawn off the screen (%s)"
+               % (what, [m[:36] for m in off]))
+            n_rows = len(set(r.top for r, _m, ins in drew if ins))
+            ck(n_rows >= 5,
+               "%s: and the readout still gets a useful number of rows (%d)"
+               % (what, n_rows))
+            # A caption wider than the panel it names is worse than no
+            # caption, and these panels are half the width they used to be.
+            for word, rect in (("SENSOR", pr), ("CAMERA", vr)):
+                cap = [m for r, m, ins in drew
+                       if not ins and m.startswith(word) and rect.colliderect(r)]
+                ck(cap and sc_n.f_xs.size(cap[0])[0] <= rect.width,
+                   "%s: the %s caption fits inside its own panel (%s, %d of "
+                   "%d px)" % (what, word, cap,
+                               sc_n.f_xs.size(cap[0])[0] if cap else -1,
+                               rect.width))
+    page(cam7, False)
+    cam7.close_log()
+    app.to_menu()
+
+
+    # ---- one question at a time --------------------------------------------
+    # The gun answers in the order it is asked and there is ONE wire, so an
+    # answer being sent is a camera frame that is not. The blob poll ran on a
+    # 1 s period and the histogram poll on 2 s, both seeded from zero in
+    # __init__ -- exact harmonics, so every second blob poll landed in the
+    # same frame as a histogram poll and the gun replied with one ~3.2 KB
+    # burst: a quarter of a second in which the preview received nothing at
+    # all, every two seconds. That is what "the preview was laggy" was. The
+    # screen now holds each question until the last answer can have finished.
+    #
+    # Driven on a simulated clock, because the periods are seconds long and
+    # six hundred real frames go by in a fraction of one.
+    app.link.last["board"] = "rp2040-wiicam"
+    cam9 = pical.Camera(app)
+    app.open(cam9)
+    cam9.log_toggle()                      # the fastest the blob poll ever runs
+    app.link.hists.summary = {"on": 1, "frames": 9, "led": 9, "rej": 0}
+    asked, worst = [], 0
+    real_mono, fake = time.monotonic, {"t": 9000.0}
+    time.monotonic = lambda: fake["t"]
+    real_send = app.link.send
+    try:
+        for i in range(1800):              # thirty seconds at the real 60 fps
+            fake["t"] = 9000.0 + i / 60.0
+            batch = []
+            app.link.send = lambda ln, b=batch: (b.append(ln), real_send(ln))[1]
+            try:
+                cam9.handle([], (0, 0))
+            finally:
+                app.link.send = real_send
+            qs = [ln for ln in batch if ln.endswith("?")]
+            worst = max(worst, len(qs))
+            asked.extend((fake["t"], ln) for ln in qs)
+    finally:
+        app.link.send = real_send
+        time.monotonic = real_mono
+    cam9.close_log()
+    ck(worst <= 1,
+       "no single frame ever asks the gun two questions -- sent together they "
+       "come back as one burst, which is the whole failure (worst %d)" % worst)
+    counts = {}
+    for _tt, ln in asked:
+        counts[ln] = counts.get(ln, 0) + 1
+    ck(counts.get("~camblob?", 0) >= 105,
+       "and spacing the questions does not starve the poll that feeds the "
+       "sensor panel and the blob log -- it asks four times a second and a "
+       "question it loses goes out on the next frame, not on the next period "
+       "(%d in thirty seconds)" % counts.get("~camblob?", 0))
+    ck(2 <= counts.get("~camfit?", 0) <= 14
+       and 2 <= counts.get("~camlearn?", 0) <= 8,
+       "the other two still get through, on their own much slower clocks "
+       "(%s)" % counts)
+    ck(counts.get("~camlearn?", 0) <= counts.get("~camblob?", 0) / 8,
+       "the 2.6 KB histogram answer is asked for FAR less often than the "
+       "470-byte one -- at the two seconds it used to run at it was an "
+       "eighth of the whole link (%s)" % counts)
+    # And specifically: nothing is asked in the window the big answer needs.
+    after_learn = [b[0] - a[0] for a, b in zip(asked, asked[1:])
+                   if a[1] == "~camlearn?"]
+    ck(after_learn and min(after_learn) >= cam9.LEARN_REPLY_S - 1e-9,
+       "and nothing else is asked until the histogram dump can have finished, "
+       "so its quarter-second of wire is never doubled (closest %.2f s, needs "
+       "%.2f)" % (min(after_learn) if after_learn else -1, cam9.LEARN_REPLY_S))
+    app.link.hists.summary = {}
+    app.to_menu()
+
+    # ---- a gun on firmware older than the fit ------------------------------
+    # It answers '~camfit' with 'AIM: unknown command' -- once every couple of
+    # seconds, for ever, into a 200-line log ring that is where a user is sent
+    # to read the diag verdict and the result of a save. Asked once, then left
+    # alone, and every screen that would have shown a verdict says plainly
+    # that this gun cannot measure one.
+    class OldSer(FakeSer):
+        """A gun that knows the blob and histogram commands but not the fit."""
+
+        def __init__(self, replies, q):
+            FakeSer.__init__(self, replies)
+            self.q = q
+
+        def write(self, b):
+            n = FakeSer.write(self, b)
+            for line in b.decode("ascii", "replace").split("\n"):
+                line = line.strip().lstrip("~")
+                if line.startswith("camfit"):
+                    self.q.put('AIM: unknown command "%s"\n' % line)
+            return n
+
+    old = FakeSrc()
+    old.ser = OldSer(old.replies, old.q)
+    app.link.src = old
+    app.fit.reset()
+    app.link.last["board"] = "rp2040-wiicam"
+    cam8 = pical.Camera(app)
+    app.open(cam8)
+    # Half a minute of SCREEN time, on a simulated clock -- the poll runs on
+    # a 2.5 s period and sixty real frames go by in a fraction of a second,
+    # so a loop paced by the wall clock would never reach a second poll and
+    # would pass whether or not the refusal was remembered.
+    real_mono, fake = time.monotonic, {"t": 5000.0}
+    time.monotonic = lambda: fake["t"]
+    try:
+        for i in range(60):
+            app.step([], t + 21.0 + i * 0.5)
+            fake["t"] += 0.5
+    finally:
+        time.monotonic = real_mono
+    asked = sum(1 for w in old.ser.written if b"camfit" in w)
+    ck(asked == 1,
+       "an old gun is asked for the fit ONCE, not every two and a half "
+       "seconds for the rest of the session (%d asks in thirty seconds)"
+       % asked)
+    ck(not app.fit.supported and app.fit.verdict is None,
+       "the refusal is remembered rather than read as a verdict")
+    ck(sum(1 for l in app.log_lines if "unknown command" in l) <= 1,
+       "so it costs the log one line, not a thousand an hour")
+    ck("unknown command" not in app.toast,
+       "and it is not shouted at the user, who can do nothing about it")
+    ck(not [l for l in cam8.blob_lines()
+            if "NO SAFE GATE" in l or "REFUSING HEAVILY" in l],
+       "a gun that cannot answer raises no gate verdict -- silence is not "
+       "'no gate can work here'")
+    tip = [r for r in cam8.rows
+           if r.label == "Biggest blob (height)"][0].tip()
+    ck("Blob detail 2" in tip and "drops" in tip,
+       "and the gate row falls back to what it is rather than to a blank: "
+       "%r" % tip)
+    app.begin_room_sweep()
+    rs = app.view
+    said = " ".join(rs.verdict_lines()[0])
+    ck("cannot measure" in said and "Skip" in said,
+       "the sweep says outright that this firmware cannot do it, instead of "
+       "spinning: %r" % said)
+    for w, h, sc_n in screens:
+        drew = texts_of(rs, sc_n)
+        off = [m for r, m, _i in drew
+               if r.left < 0 or r.right > w or r.top < 0 or r.bottom > h]
+        ck(not off, "and it still fits a %dx%d screen (%s)"
+           % (w, h, [m[:36] for m in off]))
+    app.step([key(pygame.K_ESCAPE)], t + 26.0)
+    ck(isinstance(app.view, pical.Menu),
+       "and Esc still leaves cleanly on a gun that answered none of it")
+    attach(app)
+    ser = app.link.src.ser
+    app.link.last["board"] = "rp2040-wiicam"
+
+    # ---- every recording carries a number ----------------------------------
+    # The Pi has NO real-time clock, so two captures taken on two different
+    # evenings are stamped with the same second. Numbering is what makes the
+    # names unique, and there are now TWO places that do it: pical numbers the
+    # files it writes itself, and CaptureSession.save() numbers the
+    # calibration's own pair. What must hold is that they agree -- one number
+    # means one capture, whichever tool wrote it -- and that neither renumbers
+    # the other's work.
+    rec_dir = tempfile.mkdtemp(prefix="pical-rec-")
+    real_out, pical.OUT_DIR = pical.OUT_DIR, rec_dir
+    try:
+        sess = pical.CaptureSession(plan=pical.make_plan(2, 0))
+        sess.shots = [dict(tx=0.5, ty=0.5, q=np.zeros((4, 2)))]
+        sess.raw = [np.zeros((4, 2))]
+        first = sess.save(rec_dir)
+        second = sess.save(rec_dir)
+        names = sorted(os.listdir(rec_dir))
+        ck(len(names) == 4,
+           "two calibrations saved in the SAME second leave four files, not "
+           "two (%s)" % names)
+        nums = {}
+        for n in names:
+            nums.setdefault(n.split("-")[1], set()).add(n.split("-")[0])
+        ck(all(v == {"shots", "rawquads"} for v in nums.values()),
+           "the shot log and the raw quads behind it share ONE number, "
+           "because they are two halves of one capture and 'send me number "
+           "12' has to fetch both (%s)" % nums)
+        # pical used to move these onto its OWN numbering afterwards, from a
+        # time when the session named them off the clock. Once the session
+        # started numbering them that renaming burned a number per
+        # calibration and the count went 2, 4, 6 -- so what has to be true now
+        # is that pical does not touch them at all.
+        ck(not hasattr(pical, "save_session"),
+           "and pical does not renumber them a second time")
+        got = sorted(int(n) for n in nums)
+        ck(got == [got[0], got[0] + 1],
+           "two calibrations advance the count by ONE each, not by two (%s)"
+           % got)
+        # And pical's own recordings count ABOVE them, so a number still names
+        # exactly one capture across both tools.
+        blob, nb = pical.recording_path("blobs")
+        ck(nb > got[-1],
+           "a blob log taken after a calibration counts above it rather than "
+           "reusing its number (calibrations %s, blob log %d)" % (got, nb))
+        open(blob, "w").close()
+        # A sweep that was REFUSED is exactly the one somebody wants to look
+        # at afterwards, so those are numbered too.
+        lens = pical.Lens.__new__(pical.Lens)
+        a = pical.Lens.save_sweep(lens, np.zeros((3, 4, 2)))
+        b = pical.Lens.save_sweep(lens, np.zeros((3, 4, 2)))
+        ck(a and b and a != b,
+           "two lens sweeps in the same second are two files (%s, %s)"
+           % (os.path.basename(a), os.path.basename(b)))
+        ck(os.path.basename(a).startswith("lenssweep-")
+           and os.path.basename(a).split("-")[1].isdigit(),
+           "under the same numbering as everything else (%s)"
+           % os.path.basename(a))
+        ck(pical.Lens.save_sweep(lens, np.zeros((0, 4, 2))) == "",
+           "and a sweep with no frames in it writes nothing at all")
+        seen, clash = set(os.listdir(rec_dir)), []
+        for pref, ext in (("blobs", ".csv"), ("shape", ".csv"),
+                          ("lenssweep", ".log")) * 12:
+            q, _n = pical.recording_path(pref, ext)
+            if os.path.basename(q) in seen:
+                clash.append(os.path.basename(q))
+            seen.add(os.path.basename(q))
+            open(q, "w").close()
+        ck(not clash,
+           "and thirty-six recordings of three kinds inside one second never "
+           "reuse a name (%s)" % clash[:3])
+    finally:
+        pical.OUT_DIR = real_out
 
     # ---- DRM device choice -----------------------------------------------
     # A Pi has two DRM cards; one is the v3d render node with no screen on

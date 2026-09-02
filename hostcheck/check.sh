@@ -203,7 +203,12 @@ else
 fi
 
 # The RP2040/wiicam front end: the stale-slot mask, 240x176 normalisation,
-# lock + solve, lead, and the ~cam subset -- all on the host.
+# lock + solve, lead, and the ~cam subset -- all on the host. Plus '~camfit',
+# which turns the two learned distributions into a shape ceiling or says
+# honestly that this rig has none, the bhmax/pxmax floors now derived from what
+# THIS gun measured (the LARGER of the live histogram and the stored 'fit0' pair) and
+# the 'fit0' key itself, which must never be readable out of either gate's bits
+# nor take one down with it.
 if g++ -std=c++17 -O2 -Wall -Wextra -Werror \
        -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
        -Ilib/QuadResolver -Ilib/AimPipeline -Ilib/RecoilFx \
@@ -224,8 +229,13 @@ fi
 
 # The shape-learning sink: every feature's documented bin mapping including the
 # clamps, the cases that must record NOTHING rather than a large false peak,
-# and -- driven through wiicam_aim_process_sz, because that is where it lives --
-# the safety property that only resolver-confirmed frames are ever learned from.
+# the envelope's -1 for 'never measured' (a 0 there is a rig whose LEDs are no
+# height at all, on which no gate could work), and -- driven through
+# wiicam_aim_process_sz, because that is where it lives -- the safety property
+# that only resolver-confirmed frames are ever learned from, plus the rewritten
+# negative label: positional, twice the resolver's association radius, and
+# producing a sample on a gun with every gate at 0, which the first version
+# could not do at all.
 if g++ -std=c++17 -O2 -Wall -Wextra -Werror \
        -DESP_PLATFORM -Ihostcheck/fakeinc -Ilib/WiicamAim \
        -Ilib/QuadResolver -Ilib/AimPipeline -Ilib/RecoilFx \
@@ -404,8 +414,12 @@ fi
 # wiicam panel needed 340 px of the 307 a 768p laptop actually offers, and
 # "Save to gun" rendered four pixels high. Width stays generous; it is the
 # height that runs out.
+# 120 rather than 60: the camfit and warning coverage took this from 29 s to
+# 40 s, and most of the added time is fixed waits on repaint clocks rather than
+# CPU, so it does not shrink on a faster box. A suite that fails on someone
+# else's slower machine for want of twenty seconds costs more than it saves.
 if [ -n "$OV_PY" ] && command -v xvfb-run >/dev/null 2>&1; then
-    if timeout 60 xvfb-run -a -s "-screen 0 1400x768x24" \
+    if timeout 120 xvfb-run -a -s "-screen 0 1400x768x24" \
          "$OV_PY" hostcheck/studio_render_test.py > /tmp/ov_studio.out 2>&1 \
        && grep -q "studio render: OK" /tmp/ov_studio.out; then
         echo "studio renders: OK"
