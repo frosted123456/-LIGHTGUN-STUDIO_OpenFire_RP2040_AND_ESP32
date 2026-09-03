@@ -1530,9 +1530,10 @@ def main():
             link.send("~camlearn=on:1")
             learn_state["on"] = True
             log("shape capture armed for the calibration: every confirmed "
-                "corner it sees is a measurement of your LEDs. When you are "
-                "back, sweep the room from the Camera tab and press 'Measure "
-                "the gate'.")
+                "corner it sees is a measurement of your LEDs at every "
+                "distance. When you are back: on the Camera tab, with only "
+                "the bar in view, pan slowly so your lamp or window comes "
+                "into the picture, then press 'Measure the gate'.")
         log("Handing the port to the calibration window...")
         link.pointer(True, remember=False)   # calibration reads the trigger as a click
         link.close()
@@ -1900,11 +1901,14 @@ def main():
             # nothing on screen to say why, and the figure is gone. The gun
             # measures its own instead.
             log("'Measure the gate' asks the gun what IT has seen: how tall "
-                "its own LEDs come out and how tall the stray light does. Run "
-                "a calibration with 'Learn LED shape' on, sweep the room so a "
-                "lamp or a window comes into frame, then measure. Nothing "
-                "here suggests a height -- a number measured on somebody "
-                "else's LED bar can blind yours.")
+                "its own LEDs come out and how tall the stray light does. "
+                "Press 'Learn LED shape', point at the bar for a few seconds "
+                "with no bright light in view, then pan slowly so a lamp or a "
+                "window comes into the picture beside it, then measure. "
+                "Right after a calibration is even better -- the gun has "
+                "then seen your LEDs from every distance -- but not required. "
+                "Nothing here suggests a height: a number measured on "
+                "somebody else's LED bar can blind yours.")
     lab(rowb, "blob detail", (F[0], 9), C_DIM).pack(side="left")
     for fv, nm in ((0, "off"), (1, "sizes"), (2, "full detail")):
         tk.Radiobutton(rowb, text=nm, value=fv, variable=cam_fmt,
@@ -2089,10 +2093,11 @@ def main():
                 "has nothing to have measured and the counts stay at zero.")
         if not learn_state["on"]:
             log("the fit only counts blobs while the shape capture is running "
-                "-- press 'Learn LED shape', then aim at the bar from where "
-                "you play and sweep the room so a lamp or a window comes into "
-                "frame. It needs both: the LEDs to find the ceiling, the "
-                "stray light to know there is room under it.")
+                "-- press 'Learn LED shape', aim at the bar from where you "
+                "play with no bright light in view, then pan slowly so a lamp "
+                "or a window comes into the picture beside it. It needs both: "
+                "the LEDs to find the ceiling, the stray light to know there "
+                "is room under it.")
 
     btn_fit = tk.Button(rowfit, text="Measure the gate",
                         command=lambda: fit_ask(False), font=(F[0], 9),

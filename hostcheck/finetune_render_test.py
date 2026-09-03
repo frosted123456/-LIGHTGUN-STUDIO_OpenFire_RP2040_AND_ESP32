@@ -62,16 +62,21 @@ def driver():
         W, H = c.winfo_width(), c.winfo_height()
         # poll: the canvas is cleared and repainted every tick, so a snapshot
         # taken between the delete and the redraw would see nothing
-        ovals = []
+        # ...and the same race sits between find_all() and coords(): the id
+        # found can be deleted by the next tick before its coordinates are
+        # read, and coords() of a dead item is an empty list. So the poll
+        # covers both, and only breaks once it holds four numbers.
+        ovals, xy = [], []
         _dl = time.time() + 3.0
         while time.time() < _dl:
             ovals = [i for i in c.find_all() if c.type(i) == "oval"]
-            if ovals: break
+            xy = c.coords(ovals[0]) if ovals else []
+            if len(xy) == 4: break
             time.sleep(0.03)
-        if not ovals:
+        if len(xy) != 4:
             errors.append("the ring is not drawn at all")
         else:
-            x0, y0, x1, y1 = c.coords(ovals[0])
+            x0, y0, x1, y1 = xy
             gx, gy = (x0+x1)/2.0/W, (y0+y1)/2.0/H
             if abs(gx - F.TARGET[0]) > 0.005 or abs(gy - F.TARGET[1]) > 0.005:
                 errors.append("ring drawn at (%.3f, %.3f) but measured against "

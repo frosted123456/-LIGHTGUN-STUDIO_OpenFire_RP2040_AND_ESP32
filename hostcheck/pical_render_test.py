@@ -1870,7 +1870,7 @@ def main():
        "and it only takes its own lines, so the shared reply stream can be "
        "fed to it wholesale")
     f.feed(HDR % (120, -1, 0, -1))
-    f.feed("CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+    f.feed("CAM: fit NEEDS MORE LED DATA -- aim at the bar with the "
            "capture on; 120 blobs so far, 500 wanted")
     ck(f.verdict == "need_led" and f.ledn == 120 and f.led_want == 500,
        "NEEDS MORE LED DATA carries the count and the target off the gun's "
@@ -1890,7 +1890,7 @@ def main():
     f.feed("CAM: fit STORED ledmaxh=7 strayminh=12 -- from an earlier capture "
            "on this gun; recapture if the bar, the lens or the room has "
            "changed")
-    f.feed("CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+    f.feed("CAM: fit NEEDS MORE LED DATA -- aim at the bar with the "
            "capture on; 120 blobs so far, 500 wanted")
     ck(f.stored == (7, 12) and f.led_h is None,
        "an earlier capture's pair is kept APART from the live measurement, "
@@ -3146,8 +3146,8 @@ def main():
         ("not enough LED data", (HDR % (120, -1, 0, -1),
                                  "CAM: fit STORED ledmaxh=7 strayminh=12 -- "
                                  "from an earlier capture on this gun",
-                                 "CAM: fit NEEDS MORE LED DATA -- run a "
-                                 "calibration with the capture on; 120 blobs "
+                                 "CAM: fit NEEDS MORE LED DATA -- aim at the "
+                                 "bar with the capture on; 120 blobs "
                                  "so far, 500 wanted")),
         ("no stray data", (HDR % (900, 7, 2, -1),
                            "CAM: fit NO STRAY DATA -- sweep the room with the "
@@ -3180,8 +3180,8 @@ def main():
                                  "CAM: fit STORED ledmaxh=7 strayminh=0 "
                                  "ledmaxpx=84 -- from an earlier capture on "
                                  "this gun",
-                                 "CAM: fit NEEDS MORE LED DATA -- run a "
-                                 "calibration with the capture on; 120 blobs "
+                                 "CAM: fit NEEDS MORE LED DATA -- aim at the "
+                                 "bar with the capture on; 120 blobs "
                                  "so far, 500 wanted")),
     )
     screens = [(w, h, pical.Screen(pygame.Surface((w, h)))) for w, h in SIZES]

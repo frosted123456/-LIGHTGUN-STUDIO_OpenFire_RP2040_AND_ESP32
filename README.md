@@ -254,63 +254,34 @@ sweep doubles as a check: whenever fewer than four dots are detected the
 preview freezes on the last full frame and says so, making contamination and
 dropouts visible at a glance.
 
-**2b — RP2040 (wiicam).** Four things to do, in this order. Everything else on
-the tab sits under *Advanced* and can be left alone.
+**2b — RP2040 (wiicam).** Four steps, top to bottom. Leave *Advanced* alone.
 
-1. **Sensitivity — press `Max`.** Three buttons: `Default`, `High`, `Max`. At
-   `Default` and `High` the sensor's blob reports hit a hard 4-pixel floor and
-   an LED disappears at about 1.8× the distance where it was full brightness
-   — a quarter of all corner reports were sitting on that floor. `Max` opens
-   the sensor's own size limit and that fell to under one percent. A freshly
-   flashed gun starts at `Max`; a gun flashed over an older profile keeps
-   whatever it had, so press it regardless. The blob noise figure at the top
-   of the tab still applies — it should settle, with limits already scaled
-   for this sensor.
+1. **Sensitivity — press `Max`.** Lets the gun see the LEDs from further
+   away. A new gun already starts there; press it anyway.
 
-2. **Blob detail — press `full detail`.** Three choices: `off` (positions
-   only), `sizes`, `full detail`. The wiicam has four object slots, so a
-   bright window does not add a fifth point — it *takes* one, and an LED goes
-   missing. The only thing that tells a window from an LED is what the blob
-   looks like, and `full detail` is the report that carries it. Step 3 and
-   the gate below need it; without it they do nothing and say so.
+2. **Blob detail — press `full detail`.** Lets the gun tell an LED from a
+   lamp or a window.
 
-3. **Learn the gate.** Nothing to press yet — step 4 (aim calibration) arms
-   the shape capture for you, so every corner the calibration confirms is a
-   measurement of *your* LEDs, at every distance you shoot from. When the
-   calibration hands the port back, come back to this tab, keep the screen in
-   view and pan slowly around the room so any lamp, window or reflection
-   comes into frame beside the LEDs. Then press **`Measure the gate`**. It
-   answers in one of four ways:
-   *needs more LED data* (calibrate again with the capture on);
-   *no stray data* (sweep the room some more);
-   *no safe gate on this rig* — your LEDs and your stray light overlap in
-   size and **no number would help**: move the bar, block the light, or use
-   brighter LEDs, and leave the gate off;
-   or a ceiling, shown with what it was measured from. Press **`Apply`** to
-   set it. That also switches the gun to full detail and saves both, because
-   a gate saved without the report that feeds it would work until the next
-   power cycle and then silently stop. Skipping this step is fine: the
-   calibration is complete and usable without a gate.
+3. **Teach it your room.** Press `Learn LED shape`. Point at the LED bar for a
+   few seconds with no bright light in view. Then, keeping the screen in
+   view, pan slowly so your lamp or window comes into the picture too. Press
+   `Measure the gate`, then `Apply`.
+   If it says *no safe gate* — your LEDs and your room light look the same to
+   the sensor. Leave the gate off; move the bar or block the light instead.
+   Doing this right after step 4 (aim calibration) is even better, since the
+   gun will have seen your LEDs from every distance — but it is not required.
 
-4. **`Save to gun`.** Writes the sensitivity, the blob detail and the gate
-   into the gun's flash together. Sensitivity lives in the OpenFIRE profile;
-   this button saves it there with everything else. The reply lists what was
-   written, so the tool checks rather than assumes.
+4. **Press `Save to gun`.**
 
-Then leave it alone. If the cursor ever starts sticking or the gate line turns
-red, the tab says which limit is doing it and how to switch it off; the gate
-line stays quiet while the gate is only refusing things the resolver agrees
-were stray light.
+That's it. If the cursor ever sticks or jumps later, the tab says which limit
+is doing it and how to switch it off.
 
-*Advanced* holds the older limits — the blob size window, the odd-one-out
-gate, the pixel-count and roundness ceilings, and the sensor's own two
-registers. None of them ships with a value and none is needed after step 3;
-the serial table at the end of this README describes each one.
+*Advanced* holds the older limits. None of them is needed; the serial table at
+the end of this README describes each one.
 
-On pical the same four steps happen inside the calibration flow: sensitivity
-and blob detail on the camera screen, the capture armed by the calibration
-itself, and the room sweep offered as its own screen (step 4b) right after
-the last stance.
+On pical the same four steps are built into the calibration flow, and the
+room sweep from step 3 is offered as its own screen right after the last
+stance (step 4b).
 
 **3 — Lens / FOV** *(skip on both stock lenses)*. The stock 66° OV2640 lens and
 the wiicam's 33° lens need nothing here. A wide or fisheye lens bends the LED
@@ -417,11 +388,11 @@ the fit will refuse. It ends by sending the calibration to the gun and reading
 it back to confirm.
 
 **4b — Room light sweep** *(RP2040 only, optional, skippable with one key)*.
-This is step 2b-3 from the camera tab, done right after the calibration while
-the capture is still full of your LEDs. Sweep slowly around the room with the
-**screen still in view**, so lamps, windows and reflections come into frame
-alongside the four LEDs; pical offers it as its own screen, Studio does it
-from the Camera tab with `Measure the gate`.
+Step 3 of the camera tab, offered here because this is the best moment for
+it: the gun has just seen your LEDs from every distance. Start with the bar
+clean and any bright light out of view, then pan slowly with the **screen
+still in view** so the lamp or window comes in beside the LEDs. pical shows it
+as its own screen; in Studio it is `Measure the gate` on the Camera tab.
 
 Why it exists: the sensor reports only four blobs, so a bright window does not
 merely add a fifth point, it **takes an LED's slot**. A size ceiling that drops

@@ -269,7 +269,7 @@ def driver():
                "CAM: fit STORED ledmaxh=7 strayminh=15 ledmaxpx=214 -- "
                "from an earlier capture on this gun; recapture if the bar, "
                "the lens or the room has changed",
-               "CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+               "CAM: fit NEEDS MORE LED DATA -- aim at the bar with the "
                "capture on; 120 blobs so far, 500 wanted")
     if (f.verdict, f.led_n, f.led_want, f.stored) != ("need_led", 120, 500,
                                                       (7, 15, 214)):
@@ -283,7 +283,7 @@ def driver():
                 "CAM: fit STORED ledmaxh=7 strayminh=15 -- from an earlier "
                 "capture on this gun; recapture if the bar, the lens or the "
                 "room has changed",
-                "CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+                "CAM: fit NEEDS MORE LED DATA -- aim at the bar with the "
                 "capture on; 120 blobs so far, 500 wanted")
     if f2.stored != (7, 15, None):
         errs.append("a two-field STORED line from an older gun parsed as %r"
@@ -295,7 +295,7 @@ def driver():
     # wants more data would otherwise be reported as "600 of 500", which is
     # not a progress figure, it is a bug on screen.
     f = fit_of("CAM: fit ledn=600 ledmaxh=-1 straym=0 strayminh=-1",
-               "CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+               "CAM: fit NEEDS MORE LED DATA -- aim at the bar with the "
                "capture on; 600 blobs so far, 1000 wanted")
     if f.led_want != 1000:
         errs.append("the target was pinned in tools/ instead of read off the "
@@ -1343,8 +1343,8 @@ def driver():
             # it or whether the room has no stray light in it at all.
             said = fit_reply("CAM: fit ledn=120 ledmaxh=-1 straym=0 "
                              "strayminh=-1",
-                             "CAM: fit NEEDS MORE LED DATA -- run a "
-                             "calibration with the capture on; 120 blobs so "
+                             "CAM: fit NEEDS MORE LED DATA -- aim at the "
+                             "bar with the capture on; 120 blobs so "
                              "far, 500 wanted", want="120 of 500")
             if "120 of 500" not in said or "0 of 20" not in said:
                 errs.append("the panel does not show how far along the "
@@ -1455,8 +1455,8 @@ def driver():
                              "CAM: fit STORED ledmaxh=9 strayminh=0 "
                              "ledmaxpx=214 -- from an earlier capture on this "
                              "gun",
-                             "CAM: fit NEEDS MORE LED DATA -- run a "
-                             "calibration with the capture on; 120 blobs so "
+                             "CAM: fit NEEDS MORE LED DATA -- aim at the "
+                             "bar with the capture on; 120 blobs so "
                              "far, 500 wanted", want="stored")
             if "9 tall" not in said or "not recorded" not in said:
                 errs.append("a stored LED edge with no stray behind it was "
@@ -1469,8 +1469,8 @@ def driver():
                              "strayminh=-1",
                              "CAM: fit STORED ledmaxh=9 strayminh=15 -- from "
                              "an earlier capture on this gun",
-                             "CAM: fit NEEDS MORE LED DATA -- run a "
-                             "calibration with the capture on; 120 blobs so "
+                             "CAM: fit NEEDS MORE LED DATA -- aim at the "
+                             "bar with the capture on; 120 blobs so "
                              # The marker is the VALUE, not the word
                              # "stored": the line before this one carried
                              # that too, and waiting for it would have read

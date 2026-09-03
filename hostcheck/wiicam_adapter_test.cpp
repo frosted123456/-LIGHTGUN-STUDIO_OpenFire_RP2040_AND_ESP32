@@ -3103,8 +3103,8 @@ int main()
         g_replies.clear();
         wiicam_cam_command("camfit?");
         ck(g_replies.size() == 2
-           && g_replies[1] == "CAM: fit NEEDS MORE LED DATA -- run a "
-                              "calibration with the capture on; 499 blobs so "
+           && g_replies[1] == "CAM: fit NEEDS MORE LED DATA -- aim at the "
+                              "bar with the capture on; 499 blobs so "
                               "far, 500 wanted\n",
            "499 LED blobs is not enough, and the reply says how many there are "
            "and how many are wanted -- a bare 'not enough' leaves a user with "

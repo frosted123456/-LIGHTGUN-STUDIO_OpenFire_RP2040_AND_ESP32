@@ -1271,7 +1271,7 @@ bool wiicam_cam_command(const char* line)
                       "from an earlier capture on this gun; recapture if the "
                       "bar, the lens or the room has changed\n",
                       sled, sstray, spx);
-            reply("CAM: fit NEEDS MORE LED DATA -- run a calibration with the "
+            reply("CAM: fit NEEDS MORE LED DATA -- aim at the bar with the "
                   "capture on; %lu blobs so far, 500 wanted\n", e.led_n);
             return true;
         }

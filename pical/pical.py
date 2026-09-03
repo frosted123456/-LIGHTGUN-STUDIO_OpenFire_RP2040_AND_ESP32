@@ -2981,12 +2981,22 @@ class RoomSweep:
         # WHY, before HOW, and in the reader's terms. Somebody who does not
         # know what this is for will skip it, and they would be right to.
         head = []
+        # Start CLEAN, then pan the light in -- said in that order, because
+        # the order is the whole trick. The gun locks on whichever four blobs
+        # it sees first; if a window holds one of the four slots at that
+        # moment, it locks on window-plus-three-LEDs and from then on the
+        # window IS a corner: nothing is ever "far from a corner", the stray
+        # side never fills, and this screen says "keep sweeping" for ever.
+        # Locked on the real bar first, the window that pans in displaces an
+        # LED, that corner is reconstructed, and the window sits far from it
+        # -- which is what makes it a stray.
         for ln in ("This teaches the gun the difference between your LEDs and "
                    "the lights in your room, so a lamp can never take a corner "
                    "from it.",
-                   "Sweep slowly around the room for about 15 seconds, "
-                   "KEEPING THE SCREEN IN VIEW, so lamps, windows and "
-                   "reflections come into the picture beside your LED bar."):
+                   "Start with only the LED bar in view and any bright light "
+                   "out of the picture. Then, KEEPING THE SCREEN IN VIEW, pan "
+                   "slowly for about 15 seconds so lamps, windows and "
+                   "reflections come in beside your LED bar."):
             head.extend(wrap(ln, wide))
         sc.lines(sc.w / 2, sc.h * 0.125, head, sc.f_s, C_DIM, step=1.35)
         if self.done:
