@@ -1513,6 +1513,26 @@ def main():
                 pass
             else:
                 nb.select(tab_cam); return
+        # On the wiicam, the calibration IS the LED measurement. Every frame
+        # where the resolver confirms four corners is a frame that says what
+        # this rig's LEDs look like, across every stance the user shoots from
+        # -- free data, and until now discarded unless the user knew to press
+        # 'Learn LED shape' first. pical arms this itself; Studio hands the
+        # port to a separate process for calibration, so it is armed HERE,
+        # before the handoff, and left running: the gun does not reboot when
+        # the port changes hands, and aim_calib touches neither the format nor
+        # the capture. Full detail first, because the box features the gate
+        # is derived from need it. Arming clears (off->on edge), which is
+        # right: a calibration is a fresh measurement.
+        b = link.last.get("board") or ""
+        if "wiicam" in b:
+            link.send("~cam=fmt:2")
+            link.send("~camlearn=on:1")
+            learn_state["on"] = True
+            log("shape capture armed for the calibration: every confirmed "
+                "corner it sees is a measurement of your LEDs. When you are "
+                "back, sweep the room from the Camera tab and press 'Measure "
+                "the gate'.")
         log("Handing the port to the calibration window...")
         link.pointer(True, remember=False)   # calibration reads the trigger as a click
         link.close()
@@ -1802,13 +1822,19 @@ def main():
                                         log("sensitivity -> %d" % v))
                   ).pack(side="left", padx=(0, 6))
     # What used to have a line of its own, riding on this row instead: a line
-    # here costs 20 px of a panel that has 313, and measured, four words fit
-    # in the 254 px the three buttons leave. The rest of what that line said
+    # here costs 20 px of a panel that has 313, and measured, five words fit
+    # in the 254 px the three buttons leave. "Max", because it is: a fresh
+    # flash now boots there, and a gun flashed over an older profile keeps
+    # whatever it held, which is why the hint says it rather than assuming
+    # it. At Default and High the blob reports hit a hard 4-pixel floor and
+    # an LED vanishes at about 1.8x the distance it was full brightness at;
+    # Max opens the sensor's own size limit and that floor share fell from a
+    # quarter of all reports to under one percent. The rest of what that line said
     # -- that the setting lives in the OpenFIRE profile, and that the noise
     # floor above still measures on this board -- goes to the log when the
     # board is detected, which is where this panel already sends the
     # reasoning that will not fit beside a control.
-    lab(roww, "Default fits most rigs", (F[0], 8), C_DIM).pack(side="left")
+    lab(roww, "Max is the one to use", (F[0], 8), C_DIM).pack(side="left")
 
     # ---- what the sensor reports, and the gate that judges it --------------
     # The wiicam finds blobs in HARDWARE and reports four slots. A bright
@@ -3365,14 +3391,21 @@ def main():
                 # right of this tab, and a panel packed to the top would sit
                 # under it and take the whole width back.
                 frame_wii.pack(side="left", fill="both", expand=True)
-                log("board: %s -- camera tab switched to sensitivity. That "
-                    "setting is kept in the OpenFIRE profile, not by 'Save to "
-                    "gun', and the blob noise figure above still measures on "
-                    "this board: the sensitivity buttons do not replace it."
-                    % b)
+                # The step list's subtitle for this step names the OV2640's
+                # knobs. On this board they are a different three, and a new
+                # user reads the subtitle before anything else.
+                step_rows[2][1].config(text="   sensitivity, blob detail, "
+                                            "learn the gate")
+                log("board: %s -- camera tab switched to sensitivity. Press "
+                    "Max; 'Save to gun' writes it into the OpenFIRE profile "
+                    "with everything else. The blob noise figure above still "
+                    "measures on this board: the sensitivity buttons do not "
+                    "replace it." % b)
             else:
                 frame_wii.pack_forget()
                 frame_esp.pack(side="left", fill="both", expand=True)
+                step_rows[2][1].config(text="   exposure, threshold, noise "
+                                            "floor")
             # The preview is fed from the blob poll, which never runs on a
             # board that has no blob report -- so this is the only moment it
             # can be told which board it is looking at.

@@ -1070,7 +1070,7 @@ class Camera(RowScreen):
                 get=lambda: link.last.get("sens", 0),
                 set=lambda v: link.send("~cam=sens:%d" % v),
                 lo=0, hi=2, step=1,
-                hint="0 default, 2 highest. Use at least 1-2 with a wide lens."))
+                hint="2 is the one to use; a fresh gun starts there"))
             # Ambient light. The wiicam finds blobs in HARDWARE and reports
             # four slots: a bright window does not add a fifth point, it TAKES
             # one, and an LED goes missing. The only hardware fact that tells
