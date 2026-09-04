@@ -273,8 +273,12 @@ dropouts visible at a glance.
 
 4. **Press `Save to gun`.**
 
-That's it. If the cursor ever sticks or jumps later, the tab says which limit
-is doing it and how to switch it off.
+That's it. The *Auto light limit* row shows the gun tuning its own sensor
+limit as you play — leave it on; it saves its value by itself. If the cursor
+ever sticks or jumps later, the tab says which limit is doing it and how to
+switch it off. In the live preview a hollow corner is one the gun filled in
+itself (that LED was hidden or cut) and the small arrow is the motion lead —
+the quad is drawn where the gun actually saw it.
 
 *Advanced* holds the older limits. None of them is needed; the serial table at
 the end of this README describes each one.
@@ -371,13 +375,6 @@ corrected upstream in the firmware — this step configures that.
   fine for aligning iron sights, which is a static task, but it is not a lag
   reference. To compare settings by feel on a Pi: set them, `~camsave`, then
   judge against a game rather than against the calibration screen.
-- **A single-FIR temporal mode exists but is compiled out** (`AIM_FIR_MODE`).
-  It replaced the One Euro filter and the lead with one least-squares fit, so
-  that smoothing and prediction stopped fighting each other. It won in
-  simulation and lost on hardware: a fixed window cannot reproduce One Euro's
-  speed-adaptive cutoff, which is the property that actually makes the shipped
-  filter feel right. The code and its tests are kept — a measured negative
-  result is worth keeping — but the shipped build cannot select it.
 
 **4 — Aim calibration** *(both boards)*. Five dots at each of two or three distances. Aim, pull
 the trigger four times per dot. Note the live preview refreshes slower than the
@@ -541,7 +538,7 @@ passing it to OpenFIRE:
 Almost certainly mechanical, not software — the aim path was measured over two
 simulated hours of a motionless gun and drifts under 0.1 screen px, and the
 32-bit microsecond clock wrap at ~72 minutes moves the cursor by 0.0000 px.
-Both are asserted by `hostcheck/long_run_drift_test.cpp`.
+Both are asserted by a host test that runs before every release.
 
 What does move is the hardware, and the boresight is an *angular* reference, so
 the master gain (~26 screen px per camera px) multiplies any mechanical shift:
@@ -586,14 +583,11 @@ or unplug and replug — the freeze is never stored.
 
 ## 5. Verifying a build
 
-```
-bash hostcheck/check.sh
-```
-
-Compiles every build combination, runs the geometry, protocol and NVS tests,
-and renders each GUI screen headlessly. Needs `g++`, and `Xvfb` for the GUI
-checks (they are skipped with a notice if it is missing). Every line should end
-in `OK`.
+Every release is checked before it is published by a host suite that compiles
+every build combination, runs the geometry, protocol and NVS tests against the
+same sources you flash, and renders each GUI screen headlessly. The suite is
+not part of this repository. What you can verify yourself: the firmware builds
+clean under `pio run`, and `~ping` answers after a flash.
 
 ---
 
@@ -622,17 +616,19 @@ All are prefixed `~` on the native USB port.
 | `~cam=bhmax:0` | Largest blob box HEIGHT kept, and **the only shape gate worth using — but do not pick the number yourself, let `~camfit` measure it.** Height rather than width or area because at sensitivity 2 the sensor smears horizontally: the same LEDs go from a 2x2 box to 12x3 when the gain goes up, width x5.5 against height x1.5, so width measures the gain and height still measures the source. Ships at 0 (off). A value below what this gun has measured its own LEDs at is refused, and the refusal names the figure — that bound is the larger of the live capture and the one stored in flash, so it survives a power cycle and a thin capture in a dim room cannot lower it. Needs `fmt:2`, and a value set outside full mode says so rather than sitting there doing nothing |
 | `~cam=pxmax:0` | Largest blob PIXEL COUNT kept. Superseded by `bhmax` and weak where it was measured — 16 of 19 strays sat inside the LED range, and the largest blobs in that capture turned out to be two LEDs merged rather than strays. Ships at 0 (off); refused below this gun's own measured LEDs. That bound is measured from the blob's bounding-box area, which is an upper limit on its pixel count — so it refuses a slightly wider band than strictly needed, the safe direction. On a rig whose LED blobs run past what that measurement can express, every non-zero value is refused and it says to use `bhmax` instead, rather than accepting a ceiling it cannot vouch for. Needs `fmt:2` |
 | `~cam=armax:0` | **Deprecated.** Roundness limit — longest side over shortest, in EIGHTHS (16 = 2:1). It was chosen at sensitivity 1 as the one feature that survives changing the bar, because an LED is a point source and 63% of blobs came out exactly square. Sensitivity 2 is the default now and its horizontal smear puts the median LED near 4:1, so the feature did not survive the change it was picked for. Still loads and still applies, so a setting already in a gun's flash keeps its meaning; nothing suggests a value and `~camfit` never sets it. Ships at 0 (off) |
-| `~cam=hwmax:-1` | The sensor's OWN maximum blob size, register 0x06. The only gate that acts before the camera allocates its four object slots, and therefore the only one that can stop a stray from displacing an LED rather than merely dropping it afterwards. Its units are not known, and it is not saved. −1 (the default) leaves the register alone |
+| `~cam=hwmax:-1` | The sensor's OWN maximum blob size, register 0x06 — the only gate that acts before the camera allocates its four object slots, so the only one that can stop a stray from displacing an LED. Normally driven by the gun's auto light limit loop (see `~camloop?`). Setting it by hand switches that loop OFF; a hand-set value is not saved. −1 leaves the register alone |
 | `~cam=hwmin:3` | The sensor's own minimum blob size, register 0x1B — never written by the stock driver, so it otherwise sits at an unknown default. −1 leaves it alone |
+| `~cam=loop:1` | The auto light limit loop (wiicam only, on by default). It moves `hwmax` by itself: down when the resolver keeps seeing a fourth blob that is not a corner, straight back up the moment an LED goes missing, and it saves the value once it has held clean for a second. `loop:1` turns it on and starts the search over from the register's current value; `loop:0` turns it off and hands the register back to the sensitivity preset. A hand `hwmax:` also turns it off |
+| `~camloop?` | The loop's state in one line: `CAM: loop on=1 state=HOLD val=255 lo=0 hi=256 dwell=12/50 clean=12 stray=0 cut=0 settled=0 saved=1`. `state` is HOLD, LOWER, RAISE, NOSAFE (lo and hi have met: the room's strays are LED-sized, back at the preset) or OFF; `hi=256` means no value has admitted a stray yet. Both tools show this as the "Auto light limit" row |
 | `~camblob?` | Each blob the sensor last reported — position, size, and whether a gate kept it, plus its bounding box and intensity in full mode — the share of recent frames that saw four, three or two LEDs, how many blobs the shape gate refused that sat nowhere near a corner (`bfar`, strays it was right about) versus exactly where a missing LED should have been (`bnear`, the false-negative meter — a ceiling that is too tight shows up here long before the cursor sticks); both count on every frame, capture or no capture, and the gun's frame counter and clock, from which the camera's true frame rate is measured |
-| `~camreset` | Undo everything that can stop a gun aiming: lens, lead, the software blob gate and the shape gate with their saved copies, the stored `~camfit` provenance, the live shape capture, and the sensor's own thresholds, which go back to the sensitivity preset. Every key is attempted even if an earlier one fails to erase |
+| `~camreset` | Undo everything that can stop a gun aiming: lens, lead, the software blob gate and the shape gate with their saved copies, the stored `~camfit` provenance, and the sensor's own thresholds, which go back to the sensitivity preset. The auto light limit loop restarts from the preset and its saved value (`hwl0`) is erased; the shape capture is emptied and armed again. Every key is attempted even if an earlier one fails to erase |
 | `~camlearn=on:1` | Start measuring what an LED actually looks like on this rig. Both tools switch this on for you during calibration and the room sweep, so the normal path needs no command at all. Two histograms per feature — blobs the quad resolver confirmed as corners, and blobs it placed nowhere near one — so the question "can a window and an LED be told apart at all" is answered from data instead of guessed. Needs `fmt:2` for anything beyond size. Starting clears; nothing is gated on it and nothing is saved |
 | `~camlearn?` | The histograms: a summary line, then one line per class and feature |
 | `~camlearn=reset` | Clear the capture without stopping it |
 | `~camfit?` | What the capture says the gate should be, without changing anything. Answers in one of four ways: it needs more LED data, it has no stray data yet (sweep the room with the screen still in view), the two overlap so **no size gate can work on this rig** and it says so instead of offering a number, or it names a `bhmax` and shows what it was derived from. If some "LED" samples sit far above the rest — the sun, learned while the resolver locked on it at a cold start — it says how many it set aside and where they reached, rather than letting them inflate the answer silently |
 | `~camfit=apply` | The same verdict, and set + save the `bhmax` it names. It **switches the gun to full mode itself and saves that too**, because the shape gate only runs in full mode, the ceiling could only have been measured in it, and a ceiling saved without it is a gate that works until the next power cycle. Says so on the way if it had to switch. Matched exactly, so a typo like `camfit=applyfoo` reads as a query and writes nothing |
 | `~camdiag` | Sensor connection test: power, both data wires, swapped lines, the sensor itself, and whether frames actually flow |
-| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens, temporal mode, the software blob gate (`fmt`, `bmin`, `bmax`, `rtol`), the shape gate (`bhmax`, `pxmax`, `armax`) and and — once a capture holds 500 confirmed LED blobs — the tallest and largest LED this gun has ever measured, which is the refusal floor under `bhmax`/`pxmax` after a power cycle. That record is only ever **raised** by a save, never lowered: a thin capture in a dim corner cannot talk the gun into accepting a ceiling that blinds it at play distance. The two SENSOR thresholds `hwmax` and `hwmin` are deliberately left out: they are the only settings that can leave a gun dark, so a power cycle has to remain a way out. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
+| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens, temporal mode, the software blob gate (`fmt`, `bmin`, `bmax`, `rtol`), the shape gate (`bhmax`, `pxmax`, `armax`) and and — once a capture holds 500 confirmed LED blobs — the tallest and largest LED this gun has ever measured, which is the refusal floor under `bhmax`/`pxmax` after a power cycle. That record is only ever **raised** by a save, never lowered: a thin capture in a dim corner cannot talk the gun into accepting a ceiling that blinds it at play distance. `hwmin` and a hand-set `hwmax` are NOT saved (they are the settings that can leave a gun dark, so a power cycle stays a way out); the loop's own `hwmax` is saved by the loop itself when it settles. `sens` lives in the OpenFIRE profile. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
 | `~fx?` | Recoil engine state: every knob, dry-fire and quiet countdowns, and the trigger path's last temperature reading |
 | `~fx=on:1,drive:45,hold:0` | Tune the recoil engine live. `on:0` is stock OpenFIRE behaviour |
 | `~fx=quiet:1` / `:0` | Silence the gun: nothing fires, and the engine holds both the solenoid and the rumble motor so OpenFIRE's own recoil cannot run either. Used by the calibration screens; lapses by itself after five minutes |

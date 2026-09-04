@@ -18,7 +18,7 @@ driver, Apache-2.0, plus OV2640 and SCCB sources from the OpenMV project, MIT.
 Original copyright headers are preserved in those files.
 
 **Everything else** (`lib/AimPipeline`, `lib/OV2640Capture`,
-`lib/DFRobotIRPositionEx_OV2640`, `tools/`, `hostcheck/`) is this project's own
+`lib/DFRobotIRPositionEx_OV2640`, `tools/`) is this project's own
 code, MIT licensed.
 
 A note on the MIT choice: OpenFIRE's firmware is LGPL-2.1, and this overlay is

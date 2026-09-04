@@ -5,14 +5,19 @@ import numpy as np
 
 MAGIC = 0x414D4331
 
+def canon_index(q):
+    """The permutation canon() applies: wire slots in TL,TR,BL,BR order, so a
+    per-slot flag can follow its corner through the sort."""
+    q = np.asarray(q, float)
+    t0, t1, b0, b1 = np.argsort(q[:,1], kind='stable')
+    if q[t0,0] > q[t1,0]: t0, t1 = t1, t0
+    if q[b0,0] > q[b1,0]: b0, b1 = b1, b0
+    return [int(t0), int(t1), int(b0), int(b1)]
+
 def canon(q):
     """Sort into TL,TR,BL,BR by geometry; must match aim_core.cpp's aim_canon."""
     q = np.asarray(q, float)
-    order = np.argsort(q[:,1], kind='stable')
-    t0, t1, b0, b1 = order
-    if q[t0,0] > q[t1,0]: t0, t1 = t1, t0
-    if q[b0,0] > q[b1,0]: b0, b1 = b1, b0
-    return q[[t0, t1, b0, b1]]
+    return q[canon_index(q)]
 
 
 def square_to_quad(q):

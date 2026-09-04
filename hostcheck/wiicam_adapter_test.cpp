@@ -50,6 +50,7 @@
 // camfit's 500-sample gate, which is what makes that point unreachable by
 // anything that could set a ceiling.
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <vector>
@@ -58,6 +59,10 @@
 #include "wiicam_aim.h"
 #include "wiicam_learn.h"
 #include "aim_runtime.h"
+// Batch A: the caller-side blocks at the end read the resolver's own lock flag.
+// It is the same flag wiicam_aim.cpp gates its size veto and its lead on, and
+// the deferred quad_reset() is only observable through it.
+#include "quad_resolver.h"
 #include "nvs.h"
 
 // ---- fake NVS (same shape as esp_link_test's) ----------------------------
@@ -94,11 +99,20 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 // runs on -- so every camreset in this file would quietly take the calibration
 // with it, and the tests that check the calibration survives would be testing
 // a store that had already lost it.
+//
+// "hwl0" is the fourth, and it arrived with Batch B: the hwmax loop's settled
+// value, written by the loop itself and erased by camreset alongside the
+// others. Left out of this predicate it was the same silent failure one more
+// time -- camreset's erase of a key the stub did not know fell through to the
+// calibration BLOB, so every camreset in this file wiped the calibration while
+// leaving the loop's saved value in place, and the boot tests that read a
+// stored calibration back were reading a store that had already lost it.
 static bool is_u32key(const char* k){
     return k && (!strcmp(k, "gate0") || !strcmp(k, "gate1")
-                                     || !strcmp(k, "fit0")); }
+                                     || !strcmp(k, "fit0")
+                                     || !strcmp(k, "hwl0")); }
 struct U32Slot { char key[16]; uint32_t v; bool have; };
-static U32Slot g_u32s[6];       // gate0 gate1 fit0, plus room
+static U32Slot g_u32s[8];       // gate0 gate1 fit0 hwl0, plus room
 static U32Slot* u32_find(const char* k){
     for (auto& s : g_u32s) if (s.have && k && !strcmp(s.key, k)) return &s;
     return nullptr; }
@@ -123,7 +137,7 @@ esp_err_t nvs_erase_key(nvs_handle_t, const char* k){
     g_bh = false; return ESP_OK; }
 // key-aware i16 store: lead and smoothing live under their own keys
 struct I16Slot { char key[16]; int16_t v; bool have; };
-static I16Slot g_i16s[8];   // lead0 smth0 dead0 tmod0 fir0, plus room
+static I16Slot g_i16s[8];   // lead0 smth0 dead0 beta0, plus room
 static I16Slot* i16_find(const char* k){
     for (auto& s : g_i16s) if (s.have && !strcmp(s.key, k)) return &s;
     return nullptr; }
@@ -178,8 +192,30 @@ static void reply_sink_racing(const char* s)
 
 static int t_sens = 0;
 static int t_sens_saved = 0;
+// How many times the sensitivity has been RE-APPLIED. The hwmax loop's
+// 'RESTORE' path does not write register 0x06 itself: it re-selects the
+// current sensitivity level, because the preset is the only value anyone knows
+// is sane for this part. Counting the calls is the only way to tell that
+// restore apart from "nothing happened", since the level itself does not move.
+static int t_sens_sets = 0;
 static int fails = 0;
 static void ck(bool ok, const char* m){ printf("  [%s] %s\n", ok?"PASS":"FAIL", m); if(!ok) fails++; }
+
+// One parsed Q line: Q,<ms>,<n>,x0,y0,..,x3,y3,<kind>,<real>,<ldx>,<ldy>.
+// ok is false unless every field was present, so a short line fails loudly.
+struct QLine { bool ok; unsigned long ms; int n, x[4], y[4]; char kind; int real, ldx, ldy; };
+static QLine qparse(const std::vector<std::string>& lines)
+{
+    QLine q; memset(&q, 0, sizeof(q)); q.n = -1; q.kind = '?';
+    if (lines.empty()) return q;
+    const int got = sscanf(lines[0].c_str(),
+                           "Q,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%d,%c,%d,%d,%d",
+                           &q.ms, &q.n, &q.x[0], &q.y[0], &q.x[1], &q.y[1],
+                           &q.x[2], &q.y[2], &q.x[3], &q.y[3],
+                           &q.kind, &q.real, &q.ldx, &q.ldy);
+    q.ok = (got == 14) && lines[0].back() == '\n';
+    return q;
+}
 
 // A rig rectangle in wiicam units, centred, and its per-slot report.
 static void rig(int px[4], int py[4], float cx, float cy, float w, float h)
@@ -246,7 +282,8 @@ int main()
     wiicam_aim_begin();
     wiicam_set_line_sink(line_sink);
     wiicam_set_reply_sink(reply_sink);
-    wiicam_set_sens_hooks([](int v){ t_sens = v; }, [](){ return t_sens; },
+    wiicam_set_sens_hooks([](int v){ t_sens = v; ++t_sens_sets; },
+                          [](){ return t_sens; },
                           [](){ t_sens_saved++; });
 
     int px[4], py[4];
@@ -269,6 +306,14 @@ int main()
     ck(n == 4 && qx[0] == 1798, "x un-mirrored and normalised (tenths)");
     // 384-144=240 native -> *176/768*10 = 550 tenths (Y untouched)
     ck(n == 4 && qy[0] == 550, "y normalised into 176-space (tenths)");
+    // The line says what it is: kind, per-pair measured mask, lead vector.
+    {
+        const QLine q = qparse(g_lines);
+        ck(q.ok, "the Q line carries all 14 fields and ends in a newline");
+        ck(q.ok && q.kind == 'r', "raw mode is kind r");
+        ck(q.ok && q.real == 15, "...with every one of its 4 pairs flagged measured");
+        ck(q.ok && q.ldx == 0 && q.ldy == 0, "...and no lead: raw blobs are never led");
+    }
     // a byte-identical poll is the previous camera frame seen again: skipped
     g_lines.clear();
     t += DT;
@@ -295,9 +340,30 @@ int main()
     if (!g_lines.empty())
         sscanf(g_lines[0].c_str(), "Q,%lu,%d", &ms, &n);
     ck(n == 3, "an unseen slot's stale coordinates are MASKED, not forwarded");
+    {
+        const QLine q = qparse(g_lines);
+        ck(q.ok && q.kind == 'r' && q.real == 7,
+           "three raw blobs: kind r, mask 0b0111 -- the mask follows n");
+        ck(q.ok && q.x[3] == -1 && q.y[3] == -1,
+           "...and the unused fourth slot is padded -1,-1, never an old value");
+    }
 
     // ---- resolver + solve through a real calibration ---------------------
     ck(aim_runtime_command("aimcal=0.5,0.5,0.35,1.28,0.0,0.0"), "install a calibration");
+    // Resolver on, no model yet, three blobs: a cold passthrough of fewer than
+    // four corners. The wire must call it partial, not corners.
+    wiicam_cam_command("cam=res:2,dash:2,dashhz:0");
+    g_lines.clear();
+    t += DT;
+    wiicam_aim_process(px, py, 0x7, t, &sx, &sy);
+    {
+        const QLine q = qparse(g_lines);
+        ck(q.ok && q.n == 3 && q.kind == 'p',
+           "resolver on but fewer than four corners: kind p with n=3");
+        ck(q.ok && q.real == 7 && q.ldx == 0 && q.ldy == 0,
+           "...mask 0b0111 (its pairs are kept blobs), lead 0,0");
+        ck(q.ok && q.x[3] == -1 && q.y[3] == -1, "...padded to four pairs with -1,-1");
+    }
     wiicam_cam_command("cam=res:2,dash:0");
     bool solved = false;
     for (int i = 0; i < 40; ++i) {         // let the resolver lock
@@ -311,10 +377,42 @@ int main()
     ck(fabsf(sx - 0.5f) < 0.02f && fabsf(sy - 0.5f) < 0.06f,
        "aiming at the rig centre lands near screen centre");
 
+    // Locked, all four measured, rig still and no lead configured.
+    wiicam_cam_command("cam=dash:2,dashhz:0");
+    g_lines.clear();
+    t += DT;
+    px[1] += 1;
+    wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
+    {
+        const QLine q = qparse(g_lines);
+        ck(q.ok && q.n == 4 && q.kind == 'c', "a locked four-real frame is kind c, n=4");
+        ck(q.ok && q.real == 15, "...mask 0b1111: every corner measured this frame");
+        ck(q.ok && q.ldx == 0 && q.ldy == 0, "...lead 0,0 with lead: unset");
+    }
+
     // one corner lost mid-run: the resolver reconstructs, aim continues
+    g_lines.clear();
     t += DT;
     solved = wiicam_aim_process(px, py, 0xF & ~(1u<<3), t, &sx, &sy);
     ck(solved, "a dropped corner is reconstructed; aim does not stop");
+    {
+        // Which published corner stands where the dropped slot was: that one
+        // is reconstructed, and its bit -- exactly that bit -- must be clear.
+        const QLine q = qparse(g_lines);
+        const int dx3 = (int)lroundf((1023 - px[3]) * (240.0f/1024.0f) * 10.0f);
+        const int dy3 = (int)lroundf(py[3] * (176.0f/768.0f) * 10.0f);
+        int near = -1; long best = -1;
+        for (int i = 0; q.ok && i < 4; ++i) {
+            const long d = (long)(q.x[i]-dx3)*(q.x[i]-dx3) + (long)(q.y[i]-dy3)*(q.y[i]-dy3);
+            if (best < 0 || d < best) { best = d; near = i; }
+        }
+        ck(q.ok && q.n == 4 && q.kind == 'c' && near >= 0,
+           "three real + one reconstructed still publishes four corners, kind c");
+        ck(q.ok && near >= 0 && q.real == (15 & ~(1 << near)),
+           "...and the mask clears exactly the reconstructed corner's bit");
+        ck(q.ok && near >= 0 && best <= 30L * 30L,
+           "...and that corner is published where the missing LED was (within 3 px)");
+    }
 
     // ---- latency lead -----------------------------------------------------
     wiicam_cam_command("cam=lead:20,dash:2,dashhz:0");
@@ -324,12 +422,49 @@ int main()
         g_lines.clear();
         wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
     }
-    int lx = 0;
-    if (!g_lines.empty())
-        sscanf(g_lines[0].c_str(), "Q,%lu,%d,%d", &ms, &n, &lx);
-    // where the raw corner sits in 240-space tenths, no lead
-    const int raw_x = (int)lroundf(px[0] * (240.0f/1024.0f) * 10.0f);
-    ck(lx > raw_x + 5, "published quad leads the raw position during a pan");
+    {
+        // The pairs are the resolver's corners BEFORE the lead: each one sits
+        // where the still rig puts a corner (the resolver's slot order is its
+        // own, so match as a set), and the lead rides in its own field.
+        // Native x pans right; the default mirror turns that into a leftward
+        // move in 240-space, so the lead is negative here.
+        const QLine q = qparse(g_lines);
+        int on_rig = 0;
+        for (int i = 0; q.ok && i < 4; ++i)
+            for (int k = 0; k < 4; ++k) {
+                const int rx = (int)lroundf((1023 - px[k]) * (240.0f/1024.0f) * 10.0f);
+                const int ry = (int)lroundf(py[k] * (176.0f/768.0f) * 10.0f);
+                if (abs(q.x[i] - rx) <= 3 && abs(q.y[i] - ry) <= 3) { ++on_rig; break; }
+            }
+        ck(q.ok && q.kind == 'c' && q.real == 15, "panning, locked: kind c, mask 15");
+        ck(q.ok && on_rig == 4,
+           "the published pairs are PRE-lead: all four match the still rig's corners");
+        ck(q.ok && q.ldx <= -20 && q.ldy == 0,
+           "the lead vector is carried separately and is non-zero during the pan");
+    }
+    {
+        // What the cursor is solved from is corners + lead, as it always was.
+        // Filter off so the solve is pure geometry and can be recomputed here.
+        wiicam_cam_command("cam=smooth:0");
+        for (int i = 0; i < 4; ++i) px[i] += 4;
+        t += DT;
+        g_lines.clear();
+        solved = wiicam_aim_process(px, py, 0xF, t, &sx, &sy);
+        const QLine q = qparse(g_lines);
+        aim_pt_t led[4], unled[4];
+        for (int i = 0; i < 4; ++i) {
+            unled[i].x = q.x[i] * 0.1f;            unled[i].y = q.y[i] * 0.1f;
+            led[i].x   = (q.x[i] + q.ldx) * 0.1f;  led[i].y   = (q.y[i] + q.ldy) * 0.1f;
+        }
+        float ex = 0, ey = 0, ux = 0, uy = 0;
+        const bool es = q.ok && aim_solve(aim_runtime_calib(), led, 240.0f, 176.0f, &ex, &ey);
+        const bool us = q.ok && aim_solve(aim_runtime_calib(), unled, 240.0f, 176.0f, &ux, &uy);
+        ck(solved && es && fabsf(ex - sx) < 2e-3f && fabsf(ey - sy) < 2e-3f,
+           "the cursor equals a solve of (published corners + published lead)");
+        ck(us && fabsf(ux - sx) > 5e-3f,
+           "...and NOT a solve of the corners alone: the lead still moves the cursor");
+        wiicam_cam_command("cam=smooth:3");
+    }
 
     // ---- command surface --------------------------------------------------
     g_replies.clear();
@@ -3922,15 +4057,19 @@ int main()
         ck(wiicam_aim_fmt() == WIICAM_FMT_FULL,
            "...without disturbing the live session either");
         ck(!g_replies.empty()
-           && g_replies[0].find("(sens lives in the OpenFIRE profile; the two "
-                                "SENSOR thresholds hwmax/hwmin are NOT saved, "
-                                "so a power cycle always clears them; fullreg "
-                                "is not saved either and comes back as 0x55)")
+           && g_replies[0].find("(sens lives in the OpenFIRE profile; hwmin and "
+                                "a hand-set hwmax are NOT saved; the loop's own "
+                                "hwmax is saved by the loop when it settles; "
+                                "fullreg is not saved either and comes back as "
+                                "0x55)")
               != std::string::npos,
-           "and the parenthetical lists what did NOT survive -- the two sensor "
-           "thresholds and fullreg, and no longer the format: a line that went "
-           "on claiming full mode was unsaved would send a user chasing the "
-           "wrong setting on the one save they need to trust");
+           "and the parenthetical lists what did NOT survive -- hwmin and a "
+           "HAND-SET hwmax, and no longer the format: a line that went on "
+           "claiming full mode was unsaved would send a user chasing the wrong "
+           "setting on the one save they need to trust. It also has to stop "
+           "saying hwmax is never saved at all, because since Batch B the LOOP "
+           "saves its own settled value -- a user told otherwise would keep "
+           "re-tuning a register that already comes back");
         {
             int sf = -1, smn = -1, smx = -1, srt = -1;
             ck(aim_gate_load(&sf, &smn, &smx, &srt) && sf == WIICAM_FMT_FULL,
@@ -4632,6 +4771,1567 @@ int main()
            "with no capture running, the three changes clear nothing and say "
            "nothing");
         wl_reset();
+    }
+
+    // ======================================================================
+    // Batch A, the caller side. Two of the four "rectangle" checks in
+    // pipeline_schematic.html Level 5 cannot live in the resolver, so they are
+    // pinned here.
+    //
+    // The first is the size outlier. The sensor reports a size per blob and the
+    // resolver is never told it, so "a 15 among 2s is not a corner" has to be
+    // decided out here. It is a PRE-LOCK check only -- past the lock the
+    // resolver has a model of its own to judge with -- and it drops the single
+    // worst offender only, so three points always reach the resolver and the
+    // partial-lock path still has something to work with. It is counted in
+    // 'bsv', which sits after 'bnear' on '~camblob?' line 1.
+    //
+    // The second is where quad_reset() runs. It used to run on whichever core
+    // parsed the '~cam' line, while core 0 could be inside quad_update() (S2).
+    // Now the serial core only raises a flag and the camera core performs it,
+    // so the reset lands one frame late -- which is a visible, testable change
+    // in when the lock goes away, not an invisible one.
+    // ======================================================================
+    {
+        auto qcount = [&]() {
+            int nn = -1; unsigned long mm;
+            if (!g_lines.empty()) sscanf(g_lines[0].c_str(), "Q,%lu,%d", &mm, &nn);
+            return nn;
+        };
+        auto blobstat = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            unsigned long v = 0;
+            if (!g_replies.empty()) {
+                const char* p = strstr(g_replies[0].c_str(), key);
+                if (p) sscanf(p + strlen(key), "%lu", &v);
+            }
+            return v;
+        };
+        int vpx[4], vpy[4];
+        // One frame of the rig at these sizes. The coordinate nudge is what
+        // defeats the duplicate-report cache; without it the second frame of a
+        // repeated stimulus never reaches the gate at all.
+        auto frame = [&](const int* sz) {
+            g_lines.clear();
+            t += DT;
+            vpx[0] += 1;
+            wiicam_aim_process_sz(vpx, vpy, sz, 0xF, t, &sx, &sy);
+        };
+        // Everything that could drop a blob for some OTHER reason, off: this
+        // block is about the seed veto and nothing else.
+        auto arm = [&]() {
+            wiicam_aim_begin();
+            wiicam_cam_command("cam=res:2,dash:2,dashhz:0,mirx:1,"
+                               "bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0");
+            rig(vpx, vpy, 512, 384, 512, 288);
+        };
+
+        const int SUN[4]  = { 2, 2, 3, 15 };   // one blob far above the median
+        const int NEAR[4] = { 2, 2, 3,  8 };   // median 2, so exactly median+6
+        const int EVEN[4] = { 2, 2, 3,  3 };
+
+        // ---- 'bsv' is where it says it is ---------------------------------
+        {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            const std::string l1 = g_replies.empty() ? std::string() : g_replies[0];
+            const size_t at_near = l1.find("bnear=");
+            const size_t at_bsv  = l1.find("bsv=");
+            const size_t at_cold = l1.find("bcold=");
+            ck(at_near != std::string::npos && at_bsv != std::string::npos
+               && at_near < at_bsv,
+               "'~camblob?' line 1 carries bsv, and it comes after bnear -- the "
+               "tools read this line positionally when a field is missing");
+            ck(at_cold != std::string::npos && at_bsv < at_cold,
+               "...and bcold right after it, so a tool reading the line in "
+               "order finds the seed veto and the frames the resolver declined "
+               "next to each other");
+        }
+
+        // ---- unlocked: the outlier does not reach the resolver -------------
+        arm();
+        unsigned long v0 = blobstat("bsv=");
+        frame(SUN);
+        ck(qcount() == 3,
+           "seed veto: with the resolver unlocked, four kept blobs sized "
+           "2,2,3,15 reach it as THREE -- a 15 among 2s is not a corner, and at "
+           "a cold start convexity and anisotropy cannot say so");
+        unsigned long v1 = blobstat("bsv=");
+        ck(v1 == v0 + 1, "...and bsv counts it, once");
+        frame(SUN);
+        ck(qcount() == 3 && blobstat("bsv=") == v0 + 2,
+           "...once per frame, for as long as the outlier keeps arriving");
+
+        // ---- inside the window: all four go through ------------------------
+        arm();
+        v0 = blobstat("bsv=");
+        frame(NEAR);
+        ck(qcount() == 4 && blobstat("bsv=") == v0,
+           "sizes 2,2,3,8 are inside median+6, so all four are offered and the "
+           "resolver seeds on them -- the veto is for an outlier, not a spread");
+
+        // ---- the vetoed blob is reported as not kept ------------------------
+        // '~camblob?' line 2 is "x,y,size,keep" per blob, and the tools colour
+        // by that last field. A blob the seed veto held back was NOT offered to
+        // the resolver, so reporting it as kept drew it as a corner the
+        // resolver had considered and put the user on the wrong trail.
+        arm();
+        frame(SUN);
+        {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            const std::string l2 = g_replies.size() >= 2 ? g_replies[1] : std::string();
+            int bx4, by4, bsz4, bk4, found_keep = -1, nparsed = 0;
+            const char* p = l2.c_str();
+            p = strstr(p, "blobs");
+            if (p) p += 5;
+            while (p && sscanf(p, " %d,%d,%d,%d", &bx4, &by4, &bsz4, &bk4) == 4) {
+                ++nparsed;
+                if (bsz4 == 15) found_keep = bk4;
+                p = strchr(p + 1, ' ');
+            }
+            ck(nparsed == 4,
+               "line 2 still lists all four blobs the sensor gave: the veto is "
+               "about what the RESOLVER was offered, not about hiding a blob "
+               "from the readout it has to be diagnosed in");
+            ck(found_keep == 0,
+               "...and the size-15 blob is marked k=0 there, so the readout says "
+               "which blob was held back rather than showing four kept blobs "
+               "and a resolver that mysteriously saw three");
+        }
+
+        // ---- the gate is a learned MODEL, not the lock ----------------------
+        // A model exists from the very first accepted seed, several frames
+        // before the lock. That is the moment the resolver can judge a set for
+        // itself, so that is where the caller's size veto stands down.
+        arm();
+        frame(EVEN);                       // one frame: seeds, nowhere near locked
+        ck(quad_has_model() && !quad_locked(),
+           "one clean four-blob frame gives the resolver a model but not yet a "
+           "lock -- the window the veto used to keep running in");
+        v0 = blobstat("bsv=");
+        frame(SUN);
+        ck(blobstat("bsv=") == v0,
+           "the size veto stops at the MODEL, not at the lock: from the first "
+           "seed the resolver has a rig shape to judge the set against, and "
+           "dropping a corner on size alone would cost a real one every time "
+           "the rig is seen at an angle");
+
+        // ---- and it is still off once locked ---------------------------------
+        arm();
+        for (int f = 0; f < 12 && !quad_locked(); ++f) frame(EVEN);
+        ck(quad_locked(), "a clean four-blob rig locks the resolver");
+        v0 = blobstat("bsv=");
+        const unsigned long r4a = blobstat("br4=");
+        frame(SUN);
+        ck(blobstat("bsv=") == v0,
+           "...and stays off past the lock");
+        ck(blobstat("br4=") == r4a + 1,
+           "...so all four blobs are offered and all four associate");
+
+        // ---- raw mode: the veto is downstream of it -------------------------
+        arm();
+        wiicam_cam_command("cam=res:0");
+        frame(EVEN);                       // performs the deferred reset
+        v0 = blobstat("bsv=");
+        frame(SUN);
+        ck(qcount() == 4 && blobstat("bsv=") == v0,
+           "in res:0 the resolver is out of the path entirely, so the seed veto "
+           "does not run and the Q line still carries all four kept blobs");
+        wiicam_cam_command("cam=res:2");
+    }
+
+    // ======================================================================
+    // s_quad_cfg itself. Everything above tests the resolver's flags through
+    // the resolver; these two test that the WIICAM still passes them. The
+    // resolver's own suite runs the flags on because its test sets them; the
+    // gun runs them on only because one lambda in wiicam_aim.cpp says so, and
+    // nothing else in this file would notice if that lambda lost a line.
+    // ======================================================================
+    {
+        int vpx[4], vpy[4];
+        auto arm = [&]() {
+            wiicam_aim_begin();
+            wiicam_cam_command("cam=res:2,dash:2,dashhz:0,mirx:1,"
+                               "bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0");
+        };
+        auto blobstat = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            unsigned long v = 0;
+            if (!g_replies.empty()) {
+                const char* p = strstr(g_replies[0].c_str(), key);
+                if (p) sscanf(p + strlen(key), "%lu", &v);
+            }
+            return v;
+        };
+
+        // ---- veto_seed: a non-convex four-set must never lock the gun -------
+        // The last corner pulled inside the triangle of the other three. The
+        // mirror and the scale into 240x176 are affine, so what the sensor
+        // reports non-convex reaches the resolver non-convex.
+        arm();
+        vpx[0] = 256; vpy[0] = 240;
+        vpx[1] = 768; vpy[1] = 240;
+        vpx[2] = 256; vpy[2] = 528;
+        vpx[3] = 450; vpy[3] = 350;        // inside the other three
+        const unsigned long d0 = blobstat("bdrop=");
+        const unsigned long r40 = blobstat("br4="), r00 = blobstat("br0=");
+        const unsigned long c0 = blobstat("bcold=");
+        bool ever = false;
+        for (int f = 0; f < 30; ++f) {
+            t += DT; vpx[0] += 1;
+            wiicam_aim_process(vpx, vpy, 0xF, t, &sx, &sy);
+            if (quad_locked()) ever = true;
+        }
+        const unsigned long d1 = blobstat("bdrop=");
+        const unsigned long r41 = blobstat("br4="), r01 = blobstat("br0=");
+        const unsigned long c1 = blobstat("bcold=");
+        ck(!ever,
+           "s_quad_cfg still sets veto_seed: 30 frames of a non-convex "
+           "four-set and the gun never locks on it -- with the flag dropped "
+           "the angular seed would take it in three");
+
+        // ...and the counters say so. A cold passthrough is the resolver
+        // handing the blobs back untouched -- no model, nothing accepted --
+        // and it carries QuadResult::passthrough to say exactly that, so these
+        // frames go to 'bcold' rather than being tallied as corners. They used
+        // to land in br4: thirty refused frames read as thirty clean
+        // four-corner frames, which is the one reading that would send Level
+        // 5's hwmax oracle the wrong way. bdrop is not the right home for them
+        // either -- nothing was dropped, the whole set was declined.
+        char fm[240];
+        snprintf(fm, sizeof(fm),
+                 "a refused set is not a corner count: over 30 refused frames "
+                 "bdrop +%lu, br4 +%lu and bcold +%lu, so the tools show them "
+                 "as cold frames the resolver would not take rather than as a "
+                 "rig it locked onto",
+                 d1 - d0, r41 - r40, c1 - c0);
+        ck(d1 == d0 && r41 == r40 && r01 == r00 && c1 == c0 + 30, fm);
+
+        // The counterpart: a rig the resolver DOES take never touches bcold,
+        // so the number means "declined", not "cold start" loosely.
+        arm();
+        rig(vpx, vpy, 512, 384, 512, 288);
+        for (int f = 0; f < 12 && !quad_locked(); ++f) {
+            t += DT; vpx[0] += 1;
+            wiicam_aim_process(vpx, vpy, 0xF, t, &sx, &sy);
+        }
+        ck(quad_locked(), "a real rig locks, ready to check bcold stays put");
+        const unsigned long c2 = blobstat("bcold=");
+        const unsigned long r42 = blobstat("br4=");
+        for (int f = 0; f < 10; ++f) {
+            t += DT; vpx[0] += 1;
+            wiicam_aim_process(vpx, vpy, 0xF, t, &sx, &sy);
+        }
+        ck(blobstat("bcold=") == c2 && blobstat("br4=") == r42 + 10,
+           "a locked rig adds nothing to bcold and ten frames to br4: the two "
+           "counters partition the frames rather than overlapping, so "
+           "bcold + br0..br4 is still every frame the resolver saw");
+
+        // ---- partial_lock: one LED absent must still reach a lock ------------
+        arm();
+        rig(vpx, vpy, 512, 384, 512, 288);
+        t += DT;
+        wiicam_aim_process(vpx, vpy, 0xF, t, &sx, &sy);     // seed on all four
+        int lk = -1;
+        for (int f = 0; f < 20; ++f) {
+            t += DT; vpx[0] += 1;
+            wiicam_aim_process(vpx, vpy, 0x7, t, &sx, &sy); // one LED gone
+            if (quad_locked() && lk < 0) lk = f + 1;
+        }
+        char m[280];
+        snprintf(m, sizeof(m),
+                 "s_quad_cfg still sets partial_lock: with one LED persistently "
+                 "unseen the gun reaches a lock on frame %d -- with the flag "
+                 "dropped it never would, and the lead, the learning and every "
+                 "'locked' guard would stay off for as long as the LED is out",
+                 lk);
+        ck(lk > 0 && lk <= 8, m);
+    }
+
+    // ---- the deferred quad_reset (S2) --------------------------------------
+    {
+        int vpx[4], vpy[4];
+        auto frame = [&](int nudge) {
+            t += DT;
+            vpx[0] += nudge;
+            wiicam_aim_process(vpx, vpy, 0xF, t, &sx, &sy);
+        };
+        wiicam_aim_begin();
+        wiicam_cam_command("cam=res:2,dash:2,dashhz:0,mirx:1,"
+                           "bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0");
+        rig(vpx, vpy, 512, 384, 512, 288);
+        for (int f = 0; f < 12 && !quad_locked(); ++f) frame(1);
+        ck(quad_locked(), "locked, ready for a reset from the serial core");
+
+        wiicam_cam_command("cam=mirx:1");
+        ck(quad_locked(),
+           "'~cam=mirx:1' does NOT reset the resolver on the spot: the serial "
+           "core raises a flag instead, so it can no longer clear the model out "
+           "from under a quad_update() running on the camera core (S2)");
+        frame(1);
+        ck(!quad_locked(),
+           "...the camera core performs it on the very next frame, so the reset "
+           "still happens -- one frame later, and on the right core");
+
+        // res: resets on a CHANGE of value, not on every arrival. Both tools
+        // send res:2 on connect and the studio re-sends it after a sweep; a
+        // locked gun losing its model to a value it already had is a reset the
+        // user never asked for and cannot see the cause of.
+        for (int f = 0; f < 12 && !quad_locked(); ++f) frame(1);
+        ck(quad_locked(), "re-locked, ready for a same-value res:");
+        wiicam_cam_command("cam=res:2");           // already 2
+        ck(quad_locked(), "'~cam=res:2' at a value already set raises nothing");
+        frame(1);
+        ck(quad_locked(),
+           "...and the next frame performs nothing either, so re-sending res:2 "
+           "on connect costs a locked gun nothing");
+
+        // A real change still resets, and res:0 used to be the one key that
+        // skipped it entirely.
+        ck(quad_locked(), "still locked, ready for the second key");
+        wiicam_cam_command("cam=res:0");
+        ck(quad_locked(), "'~cam=res:0' is deferred the same way");
+        frame(1);
+        ck(!quad_locked(),
+           "...and res:0 now DOES reset the resolver -- it used to be the one "
+           "key that left the resolver's state standing, so a lens sweep came "
+           "back to a model learned before it");
+        wiicam_cam_command("cam=res:2");
+        frame(1);
+    }
+
+    // ======================================================================
+    // BATCH B -- THE hwmax LOOP
+    // ======================================================================
+    // Every software gate above runs AFTER the sensor has handed out its four
+    // object slots, so by the time we can reject the sun the LED it displaced
+    // is already gone. The one control that acts BEFORE the slots is the
+    // sensor's own size ceiling, MAXSIZE (register 0x06) -- and its units are
+    // unknown and do not matter, because the resolver already says, every
+    // frame, which side of it the LEDs are on and which side the stray is on.
+    // Move it, read the verdict, repeat. See /work/schema/pipeline_schematic
+    // .html, Level 5, and guardrails K1-K5.
+    //
+    // Everything below is driven through wiicam_aim_process_sz with real rigs
+    // and read back through the two serial lines a tool would read -- never by
+    // reaching into the controller. Three things are pinned in every group:
+    // WHICH verdict a rig produces (the oracle), WHAT the controller does with
+    // a dwell of them, and WHERE the register ends up.
+    {
+        wiicam_set_blobreg_hook([](int reg, int val) -> int {
+            if (g_reg_fail) return 0;
+            g_reg.push_back(std::make_pair(reg, val));
+            return 1;
+        });
+
+        // ---- reading the controller, the way a tool does -------------------
+        struct LoopLine {
+            int on, val, lo, hi, dwell, dwmax, clean, stray, cut, settled, saved;
+            char state[16];
+        };
+        auto loopq = [&]() {
+            LoopLine L;
+            memset(&L, 0, sizeof(L));
+            L.on = L.val = L.lo = L.hi = L.dwell = L.dwmax = -1;
+            L.clean = L.stray = L.cut = L.settled = L.saved = -1;
+            g_replies.clear();
+            wiicam_cam_command("camloop?");
+            if (!g_replies.empty())
+                sscanf(g_replies[0].c_str(),
+                       "CAM: loop on=%d state=%15s val=%d lo=%d hi=%d "
+                       "dwell=%d/%d clean=%d stray=%d cut=%d settled=%d saved=%d",
+                       &L.on, L.state, &L.val, &L.lo, &L.hi, &L.dwell, &L.dwmax,
+                       &L.clean, &L.stray, &L.cut, &L.settled, &L.saved);
+            return L;
+        };
+        auto camhas = [&](const char* frag) {
+            g_replies.clear();
+            wiicam_cam_command("cam?");
+            return !g_replies.empty()
+                && g_replies[0].find(frag) != std::string::npos;
+        };
+        // Every 0x06 the loop has driven into the sensor since the last clear,
+        // in order. The register is the only thing the LEDs ever feel, so a
+        // controller that moves its own idea of the value without moving this
+        // has done nothing at all.
+        auto regs06 = [&]() {
+            std::vector<int> v;
+            for (size_t i = 0; i < g_reg.size(); ++i)
+                if (g_reg[i].first == 0x06) v.push_back(g_reg[i].second);
+            return v;
+        };
+
+        // ---- the rigs ------------------------------------------------------
+        // One frame of whatever is currently loaded into lpx/lpy. The 1-unit
+        // alternating nudge is not decoration: a byte-identical report is the
+        // PREVIOUS camera frame seen again and the pipeline returns the cached
+        // answer without judging it, so a stimulus repeated verbatim would
+        // never reach the loop at all.
+        int lpx[4], lpy[4];
+        int lsz[4] = {2, 2, 2, 2};
+        int ljit = 0;
+        auto shot = [&](unsigned seen, const int* sz) {
+            int qx[4], qy[4];
+            const int j = (ljit++ & 1) ? 1 : -1;
+            for (int i = 0; i < 4; ++i) { qx[i] = lpx[i] + j; qy[i] = lpy[i]; }
+            t += DT;
+            g_lines.clear();
+            wiicam_aim_process_sz(qx, qy, sz ? sz : lsz, seen, t, &sx, &sy);
+            // The pump core runs alongside: a write the loop asked for lands
+            // here, and the loop waits for it (s_hw_dirty) before judging.
+            wiicam_aim_hw_tick();
+        };
+        auto run = [&](int n_, unsigned seen) { for (int i = 0; i < n_; ++i) shot(seen, 0); };
+        // A 4-LED bar, dead centre. In 240-space its corners land 74 px from
+        // the middle of the rig -- comfortably outside twice the resolver's
+        // association radius, which is what makes the next two rigs mean what
+        // they say.
+        auto load_rig = [&](void){ rig(lpx, lpy, 512, 384, 512, 384); };
+        // Three LEDs and a window: the fourth slot went to something in the
+        // middle of the bar that no corner can be.
+        auto load_stray = [&](void){ rig(lpx, lpy, 512, 384, 512, 384);
+                                     lpx[3] = 512; lpy[3] = 384; };
+        // Four blobs that CANNOT be a rectangle seen from anywhere: the fourth
+        // sits inside the triangle of the other three, so the set is not in
+        // convex position and Batch A's seed veto refuses it. This is the
+        // "cannot lock at all" arm of the LOWER verdict, and it is the case
+        // G2 says only the loop can get a gun out of.
+        auto load_bad = [&](void){ rig(lpx, lpy, 512, 384, 512, 384);
+                                   lpx[3] = 512; lpy[3] = 340; };
+
+        // A gun at a known starting line: nothing in flash, the capture off
+        // (begin() ARMS it now -- G3 -- so a block that wants it quiet has to
+        // say so), every software gate inert, and the sensitivity preset the
+        // loop's ceiling is taken from pinned before begin() reads it.
+        auto arm = [&](int sens) {
+            aim_hwloop_clear();
+            t_sens = sens;
+            // Hand register 0x06 back FIRST. begin() does not clear it, and
+            // 'loop:1' adopts whatever it holds -- so without this a block
+            // would silently start from the value the previous block left in
+            // the sensor rather than from the preset.
+            wiicam_cam_command("cam=hwmax:-1,hwmin:-1");
+            wiicam_aim_begin();
+            wiicam_cam_command("camlearn=on:0");
+            wiicam_cam_command("cam=res:2,dash:0,mirx:1,lead:0,bmin:0,bmax:15,"
+                               "rtol:0,bhmax:0,pxmax:0,armax:0,fmt:0");
+            load_rig();
+            g_reg.clear();
+            wiicam_aim_hw_tick();
+            g_reg.clear();
+        };
+        // Lock the resolver, then zero the dwell so a block's own frames are
+        // the only ones in it. 'loop:1' is the only reset a tool has, and it
+        // leaves the wall clock behind K2 alone, which is what we want.
+        auto lock_and_zero = [&](void) {
+            run(40, 0xF);
+            wiicam_cam_command("cam=loop:1");
+        };
+
+        // ==================================================================
+        // K1 -- THE ORACLE COUNTS WHAT THE SENSOR REPORTED
+        // ==================================================================
+        printf("\n  -- the loop's oracle (K1, K2) --\n");
+
+        // (a) A clean locked rig. Nothing else may move.
+        arm(2);
+        lock_and_zero();
+        ck(quad_locked(), "a 4-LED bar locks the resolver");
+        run(20, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.clean == 20 && L.stray == 0 && L.cut == 0,
+               "a clean locked rig reads CLEAN every frame -- twenty frames, "
+               "twenty cleans, and neither of the two verdicts that move the "
+               "register");
+            ck(L.dwell == 20 && L.dwmax == 50,
+               "...counted into a dwell of 50 frames, which is the quarter "
+               "second the LOWER decision is allowed to take");
+            ck(L.val == 255 && L.lo == 0 && L.hi == 256 && !strcmp(L.state, "HOLD"),
+               "...and the controller holds: at the sens-2 preset, no bound "
+               "found yet, hi still reading 256 for 'no value has been seen to "
+               "admit a stray'");
+        }
+
+        // (b) The window case. The sensor still gives four blobs -- it has
+        // only four slots -- but one of them is not a corner, so an LED is
+        // missing and the resolver reconstructs it.
+        load_stray();
+        wiicam_cam_command("cam=loop:1");
+        run(20, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.stray == 20 && L.cut == 0 && L.clean == 0,
+               "four sensor blobs with the resolver locked on three of them "
+               "and the fourth far from every corner is a STRAY every frame -- "
+               "a slot went to something that is not an LED, which is the one "
+               "thing lowering the ceiling can fix");
+            ck(quad_locked(),
+               "...and the resolver stays locked through it, so the verdict is "
+               "read off a geometry the firmware trusts rather than a guess");
+        }
+
+        // (c) The other arm of LOWER: four blobs the resolver REFUSES. Batch A
+        // made an impossible four-set give "cannot lock" instead of a wrong
+        // lock; G2 says the gun then has no lock at all until the loop reads
+        // that and lowers the ceiling. This is that read.
+        arm(2);
+        load_bad();
+        run(20, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(!quad_locked(),
+               "a non-convex four-set is refused at seed -- Batch A's veto, "
+               "and the state the loop has to get the gun out of");
+            ck(L.stray == 20 && L.cut == 0 && L.clean == 0,
+               "...and 'cannot lock at all' is a STRAY, not a cut: the sensor "
+               "gave four blobs, so nothing was cut, and the only lever left "
+               "is to stop admitting whatever the fourth one is");
+        }
+
+        // (d) K1's whole point. A SOFTWARE gate dropping one of four is not an
+        // LED the sensor cut and not a stray the sensor admitted. Read off the
+        // kept count instead of 'an' it looks exactly like a cut -- and the
+        // loop would answer by RAISING the ceiling, which opens the sensor
+        // wider to the very light the gate was set for.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=rtol:3");
+        // Deliberately BELOW the preset. At the preset a wrong RAISE is a
+        // no-op and this block would pass while reading the gate as a cut;
+        // from 120 a wrong RAISE moves the register and cannot hide.
+        wiicam_cam_command("cam=hwmax:120");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();                   // the hand-set value lands
+        {
+            int gz[4] = {2, 2, 2, 9};      // one blob the consensus gate throws out
+            for (int i = 0; i < 20; ++i) shot(0xF, gz);
+            LoopLine L = loopq();
+            ck(L.val == 120 && L.lo == 0 && !strcmp(L.state, "HOLD"),
+               "K1: twenty frames of a software gate eating one of four sensor "
+               "blobs move the ceiling NOWHERE. Read off the kept count this "
+               "is five cuts and a RAISE, and the loop answers a gate we set "
+               "by opening the sensor wider to the light the gate is for");
+            ck(L.cut == 0,
+               "K1: the relative size gate dropping one of FOUR sensor blobs "
+               "is not a cut. The sensor reported four; a gate we set threw "
+               "one away. Counting the kept blobs here reads it as a missing "
+               "LED and RAISES the ceiling, which is the exact wrong direction "
+               "-- it opens the sensor to the light the gate exists to refuse");
+            ck(L.stray == 0 && L.clean == 0,
+               "...and it is not a stray-by-rejection either: the blob the "
+               "gate dropped is sitting exactly where its corner is, so there "
+               "is nothing far from the quad and nothing for the loop to do");
+            ck(L.dwell == 20,
+               "...the frame is still JUDGED, though -- it counts into the "
+               "dwell with no verdict, so a gate eating a blob every frame "
+               "makes the dwell indecisive rather than invisible");
+        }
+
+        // ...and the same with the SHAPE gate, which is the one K1 names.
+        // bhmax runs on the sensor's own bounding box in full mode, so this
+        // arm goes through the 37-byte report the way the gun does.
+        {
+            arm(2);
+            wiicam_set_fullread_hook(full_hook);
+            g_ffail_on = 0; g_fdrift = 0; g_fhdrdrift = 0;
+            wiicam_cam_command("cam=fmt:2,dash:2,dashhz:0,bhmax:0");
+            int hpx[4], hpy[4], hsz[4]; unsigned hseen = 0; int hjit = 0;
+            static const FullObj BAR[4] = {
+            //    x    y  sz  xmn ymn xmx ymx  px
+                { 256, 192, 2,  10, 20, 14, 28, 12 },   // 4 wide, 8 tall
+                { 768, 192, 2,  10, 20, 14, 28, 12 },
+                { 256, 576, 2,  10, 20, 14, 28, 12 },
+                { 768, 576, 2,  10, 20, 14, 28, 12 },
+            };
+            auto fshot = [&](int tall) {
+                memcpy(g_fobj, BAR, sizeof(g_fobj));
+                g_fobj[3].ymx = 20 + tall;
+                const int j = (hjit++ & 1) ? 1 : -1;
+                for (int k = 0; k < 4; ++k) g_fobj[k].x += j;
+                wiicam_aim_full_poll(hpx, hpy, hsz, &hseen);
+                t += DT;
+                g_lines.clear();
+                wiicam_aim_process_sz(hpx, hpy, hsz, hseen, t, &sx, &sy);
+            };
+            // The Q line is no use here: on a locked frame it carries the
+            // resolver's four corners, reconstruction included, not the count
+            // that reached it (C1). The shape gate's own counter is.
+            auto bsrej = [&]() {
+                g_replies.clear();
+                wiicam_cam_command("camblob?");
+                unsigned long v = 0;
+                if (!g_replies.empty()) {
+                    const char* q = strstr(g_replies[0].c_str(), "bsrej=");
+                    if (q) sscanf(q + 6, "%lu", &v);
+                }
+                return v;
+            };
+            for (int i = 0; i < 40; ++i) fshot(8);
+            ck(quad_locked(), "locked in full mode, ready for the shape gate");
+            wiicam_cam_command("cam=bhmax:8");
+            wiicam_cam_command("cam=hwmax:120");     // below the preset, as above
+            wiicam_cam_command("cam=loop:1");
+            wiicam_aim_hw_tick();                   // the hand-set value lands
+            const unsigned long rej0 = bsrej();
+            for (int i = 0; i < 20; ++i) fshot(9);
+            ck(bsrej() - rej0 == 20,
+               "bhmax:8 really is throwing one of the four away, on every one "
+               "of the twenty frames -- one row over the ceiling and the "
+               "resolver is offered three points");
+            LoopLine L = loopq();
+            ck(L.cut == 0 && L.stray == 0 && L.val == 120 && L.lo == 0,
+               "K1 again, on the gate the guardrail names: a bhmax rejection "
+               "is not a sensor cut. This is the one that would have chased "
+               "its own tail -- the loop raises the ceiling, the sensor admits "
+               "more, bhmax throws away more, and the loop raises again");
+            wiicam_cam_command("cam=bhmax:0,fmt:0,dash:0");
+            wiicam_set_fullread_hook(0);
+        }
+
+        // (e) A cut, and K2. Three blobs off a rig that was locked a moment
+        // ago is a corner that has GONE -- the sensor stopped reporting it.
+        arm(2);
+        lock_and_zero();
+        run(4, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 4 && L.clean == 0 && L.stray == 0,
+               "three sensor blobs where four were locked a moment ago is a "
+               "CUT: the ceiling is refusing an LED and the cursor is paying "
+               "for it");
+        }
+        // K2: the same three blobs on a gun that has never had a lock are a
+        // gun pointed at the wall, and they are worth nothing. Without this
+        // every glance away from the screen would reset the search.
+        arm(2);
+        run(30, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 0 && L.stray == 0 && L.clean == 0 && L.dwell == 30,
+               "K2: three blobs on a gun that has never had a lock at all are "
+               "not evidence of anything -- a gun pointed off-screen must not "
+               "look like a cut LED, or every glance away walks the ceiling "
+               "back to the preset and the search starts over");
+        }
+
+        // (f) The resolver off is the loop off: there is no verdict to read in
+        // raw mode, so the controller does not run. K2's window is the other
+        // half of this and it does NOT stop -- it is wall time, and a lens
+        // sweep is not evidence about anything.
+        arm(2);
+        lock_and_zero();
+        wiicam_cam_command("cam=res:0");
+        // 210, not 200: 200 is four whole dwells, so a loop that wrongly kept
+        // counting through a sweep would land back on dwell 0 and look right.
+        // 210 frames is also just over a second of wall time, which is what
+        // the second assertion needs.
+        run(210, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 0 && L.clean == 0 && L.stray == 0 && L.cut == 0,
+               "'res:0' pauses the CONTROLLER outright: two hundred and ten raw "
+               "frames for a lens sweep produce no verdicts at all, because "
+               "there is no resolver to produce them");
+        }
+        wiicam_cam_command("cam=res:2");
+        run(4, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 4,
+               "'res:2' resumes it on the next frame");
+            ck(L.cut == 0,
+               "...but the lock has AGED OUT under it. K2's window is wall "
+               "time, and a second of lens sweep is a second in which the "
+               "resolver vouched for nothing -- so the corner missing on the "
+               "far side of it is not a cut. A window counted in judged frames "
+               "would have stopped dead through the sweep and handed the loop "
+               "a lock an arbitrarily long time old");
+        }
+
+        // K2 in wall time, pinned from both sides of the half second. One
+        // frame each, because a three-blob frame RE-LOCKS the resolver through
+        // the partial lock and re-arms the window behind itself -- which is
+        // right, and which makes the first frame after the gap the only one
+        // that asks the question.
+        arm(2);
+        lock_and_zero();
+        t += 400000;                      // 0.4 s: a glance away
+        shot(0x7, 0);
+        ck(loopq().cut == 1,
+           "a corner gone four tenths of a second after the last lock is a cut "
+           "-- that is a hand moving, not a gun put down");
+        arm(2);
+        lock_and_zero();
+        t += 600000;                      // 0.6 s: past the window
+        shot(0x7, 0);
+        ck(loopq().cut == 0,
+           "...and six tenths of a second after it is not. Half a second is "
+           "what 'a moment ago' means here, and past it the loop needs a fresh "
+           "lock before it will believe a missing corner again");
+
+        // The case the wall clock exists for: a gun parked facing a wall. Its
+        // reports are byte-identical, so the duplicate cache swallows them and
+        // NO frame reaches the loop at all -- a frame-counted window would sit
+        // frozen for as long as the gun sits, and the first three blobs on
+        // pick-up would read as a cut however many hours had passed.
+        arm(2);
+        lock_and_zero();
+        run(400, 0x0);                    // ~1.9 s of wall time, one judged frame
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 1,
+               "four hundred empty reports are ONE judged frame: an unchanged "
+               "report is the previous camera frame seen again, so the loop "
+               "cannot age anything it counts in frames");
+        }
+        wiicam_cam_command("cam=loop:1");  // zero the counters, not the clock
+        shot(0x7, 0);
+        ck(loopq().cut == 0,
+           "...and that is exactly why the window is wall time: the gun has "
+           "been down two seconds, the loop has judged one frame in all of it, "
+           "and the three blobs it comes back to are NOT a cut LED");
+
+        // ==================================================================
+        // THE CONTROLLER -- K3: LOWER is patient, RAISE is immediate
+        // ==================================================================
+        printf("\n  -- the controller: LOWER, RAISE, bisection --\n");
+
+        // (g) Persistent strays and nothing else. One full dwell buys one
+        // halving, and the register really moves each time.
+        arm(2);
+        load_bad();
+        {
+            static const int WANT_VAL[8] = { 127, 63, 31, 15, 7, 3, 1, 255 };
+            static const int WANT_HI[8]  = { 255, 127, 63, 31, 15, 7, 3, 1 };
+            bool seq_ok = true, hi_ok = true, lo_ok = true;
+            std::vector<int> wrote;
+            for (int d = 0; d < 8; ++d) {
+                // 8 settle frames after the previous write, then a full dwell.
+                run(58, 0xF);
+                wiicam_aim_hw_tick();
+                LoopLine L = loopq();
+                if (L.val != WANT_VAL[d]) seq_ok = false;
+                if (L.hi  != WANT_HI[d])  hi_ok  = false;
+                if (L.lo  != 0)           lo_ok  = false;
+            }
+            wrote = regs06();
+            ck(seq_ok,
+               "LOWER walks the ceiling down by bisection and by nothing else: "
+               "255 -> 127 -> 63 -> 31 -> 15 -> 7 -> 3 -> 1, one halving per "
+               "dwell. A guess per FRAME would have crossed the whole range in "
+               "the time it takes a hand to shake");
+            ck(hi_ok,
+               "...and 'hi' follows it down one step behind -- every value a "
+               "stray got in at becomes the new lowest-known-bad, which is "
+               "what makes the next step a bisection rather than a walk");
+            ck(lo_ok,
+               "...while 'lo' stays 0: nothing has cut an LED, so nothing is "
+               "known to be too low");
+            bool regs_ok = (wrote.size() == 8);
+            for (size_t i = 0; i < wrote.size() && i < 8; ++i)
+                if (wrote[i] != WANT_VAL[i]) regs_ok = false;
+            ck(regs_ok,
+               "...and every one of those steps reached register 0x06. A "
+               "controller that moved only its own idea of the value would "
+               "satisfy every line above and change nothing the LEDs can feel");
+        }
+        // ...and the bottom of that ladder is where the bounds MEET.
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "NOSAFE") && L.lo == 0 && L.hi == 1,
+               "a stray that gets in at the step just above the one that would "
+               "blind the sensor leaves no threshold between them -- lo and hi "
+               "adjacent, and the loop says NOSAFE rather than hunting");
+            ck(L.val == 255,
+               "...and parks at the preset, which is the choice that protects "
+               "the LEDs. K5: same-size strays are a room problem, and the "
+               "honest answer is to stop moving the register and say so");
+        }
+        // (k, second half) Only a clean dwell leaves NOSAFE, and it clears the
+        // bounds -- what changed is the room, not the threshold.
+        load_rig();
+        run(50, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.lo == 0 && L.hi == 256,
+               "a clean dwell releases NOSAFE and throws both bounds away: "
+               "they were measured in a room that no longer exists, and a "
+               "bound found there is not evidence here");
+        }
+
+        // (m) The eight frames after a write were exposed under the OLD
+        // register value. Counting them is how a controller reads its own
+        // stale evidence and moves twice for one observation.
+        arm(2);
+        load_bad();
+        run(50, 0xF);                     // one dwell -> LOWER to 127
+        {
+            LoopLine L = loopq();
+            ck(L.val == 127 && !strcmp(L.state, "LOWER") && L.dwell == 0,
+               "a write starts a new dwell");
+        }
+        load_rig();
+        run(8, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 0 && L.clean == 0,
+               "and the EIGHT frames after it are not evidence about the value "
+               "just written -- they were taken while the old one was still in "
+               "the sensor, and the loop counts none of them");
+        }
+        shot(0xF, 0);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 1 && L.clean == 1,
+               "...the ninth is the first frame the new value produced, and it "
+               "is frame one of the dwell");
+        }
+
+        // (i) RAISE at the preset is a no-op (deviation 1 from the schematic,
+        // which says only "raise now"). At the preset there is nothing above
+        // to go to and MAXSIZE cannot be what cut the LED -- the sensor is as
+        // permissive as anyone ever configures it. Recording lo = preset here
+        // would poison the bounds from an off-screen glance K2 happened not to
+        // close.
+        arm(2);
+        lock_and_zero();
+        run(4, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 4 && L.val == 255 && !strcmp(L.state, "HOLD"),
+               "four consecutive cuts at the preset move nothing yet");
+        }
+        shot(0x7, 0);
+        {
+            LoopLine L = loopq();
+            ck(L.val == 255 && L.lo == 0 && !strcmp(L.state, "HOLD"),
+               "and the fifth is a no-op AT THE PRESET: there is nothing above "
+               "to raise to, and MAXSIZE cannot be what cut the LED when the "
+               "sensor is already as permissive as it is ever set. Writing lo "
+               "= 255 here would poison the search from one glance away");
+            ck(L.dwell == 0 && L.cut == 0,
+               "...but the dwell does restart, so the run of cuts is not "
+               "carried into the next one");
+        }
+
+        // (h) RAISE below the preset, with no upper bound yet: straight to the
+        // preset, and IMMEDIATELY -- on the fifth frame of the run, not at the
+        // end of the dwell. K3: a missed stray costs a reconstructed corner, a
+        // cut LED costs the cursor, and the two are not worth the same wait.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=hwmax:100");     // a hand-set value...
+        wiicam_cam_command("cam=loop:1");        // ...that the loop adopts
+        wiicam_aim_hw_tick();                   // the hand-set value lands
+        {
+            LoopLine L = loopq();
+            ck(L.val == 100 && L.lo == 0 && L.hi == 256 && L.on == 1,
+               "the loop restarts from a value the sensor really holds");
+        }
+        run(4, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 4 && L.val == 100 && !strcmp(L.state, "HOLD"),
+               "four cuts and the register has not moved");
+        }
+        g_reg.clear();
+        shot(0x7, 0);
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(!strcmp(L.state, "RAISE") && L.lo == 100,
+               "K3: the FIFTH cut raises at once -- not at the end of the "
+               "dwell -- and the value that did the cutting becomes the "
+               "highest-known-bad");
+            ck(L.val == 255,
+               "...and with no value yet known to admit a stray there is "
+               "nothing to bisect toward, so it goes to the preset");
+            ck(w.size() == 1 && w[0] == 255,
+               "...and that reaches 0x06 on the same tick, because the LED is "
+               "being cut right now");
+            ck(L.dwell == 0,
+               "...on a fresh dwell, since every frame before the write was "
+               "taken under the old value");
+        }
+
+        // (j) The whole search, closed round a sensor that actually filters.
+        // The rig below is a room: LEDs that need at least 40 in MAXSIZE to be
+        // reported at all, and a stray that gets a slot at 44 and above. The
+        // only safe band is 40..43, four values out of 255, and nothing in the
+        // firmware is told any of those numbers -- it has three verdicts and a
+        // register.
+        printf("\n  -- bisection, closed loop against a filtering sensor --\n");
+        {
+            const int LED_NEEDS = 40;     // below this the sensor cuts an LED
+            const int STRAY_IN  = 44;     // at and above this the stray gets a slot
+            arm(2);
+            run(40, 0xF);
+            wiicam_cam_command("cam=loop:1");
+            std::vector<int> path;
+            int last = -1;
+            for (int f = 0; f < 4000; ++f) {
+                LoopLine L = loopq();
+                if (L.val != last) { path.push_back(L.val); last = L.val; }
+                if (L.val >= STRAY_IN)      { load_stray(); shot(0xF, 0); }
+                else if (L.val < LED_NEEDS) { load_rig();   shot(0x7, 0); }
+                else                        { load_rig();   shot(0xF, 0); }
+            }
+            LoopLine L = loopq();
+            static const int WANT[9] = { 255, 127, 63, 31, 62, 46, 38, 45, 41 };
+            bool path_ok = (path.size() == 9);
+            for (size_t i = 0; i < path.size() && i < 9; ++i)
+                if (path[i] != WANT[i]) path_ok = false;
+            ck(path_ok,
+               "the search converges the way a bisection does and by the route "
+               "the two rules give: 255 127 63 31 halving on strays, then a cut "
+               "at 31 throwing it up to 62 = hi-1, then 46 38 halving again, a "
+               "cut at 38 throwing it to 45, and 41");
+            ck(L.val >= LED_NEEDS && L.val < STRAY_IN,
+               "...and it LANDS inside the only safe band this room has -- four "
+               "values out of 255, found from three verdicts and no knowledge "
+               "of what the register means");
+            ck(L.lo == 38 && L.hi == 45 && (L.hi - L.lo) <= 8,
+               "...with the bounds closed around it: lo is a value measured to "
+               "cut an LED, hi a value measured to admit the stray, and seven "
+               "steps between them");
+            ck(!strcmp(L.state, "HOLD") && L.settled == 1,
+               "...then it stops. Four clean dwells in a row and the search is "
+               "over -- it does not keep probing a value that works");
+            ck(L.saved == 1,
+               "...and the value it stopped at is in flash");
+            int lv = -1, llo = -1, lhi = -1;
+            const bool got = aim_hwloop_load(&lv, &llo, &lhi);
+            ck(got && lv == L.val && llo == L.lo && lhi == L.hi,
+               "...all three of it: the value, and the two bounds that justify "
+               "it. A value with no lo beside it cannot honour K4 on the next "
+               "boot, because nothing would say what an LED needed");
+        }
+
+        // (l) Settling and storing.
+        printf("\n  -- settling, storing, and the two things that must not store --\n");
+        arm(2);
+        lock_and_zero();
+        for (int d = 0; d < 3; ++d) run(50, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.settled == 0 && L.saved == 0,
+               "three clean dwells are not enough to write flash");
+        }
+        run(50, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.settled == 1 && L.saved == 1,
+               "the FOURTH consecutive clean dwell settles the value and it "
+               "goes to flash -- G3's other half: the gun that learns as you "
+               "play has to remember it");
+            int lv = -1, llo = -1, lhi = -1;
+            ck(aim_hwloop_load(&lv, &llo, &lhi) && lv == 255 && llo == 0
+               && lhi == 256,
+               "...and it reads back exactly, including 'no stray has ever got "
+               "in' as 256 rather than as a bound of zero");
+        }
+        // An indecisive dwell -- a dark room, a gate eating a blob -- must not
+        // RESET the run. It is not evidence against the value, only an absence
+        // of evidence for it.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=rtol:3");
+        wiicam_cam_command("cam=loop:1");
+        {
+            int gz[4] = {2, 2, 2, 9};
+            run(50, 0xF); run(50, 0xF);              // two clean dwells
+            for (int i = 0; i < 24; ++i) shot(0xF, 0);
+            for (int i = 0; i < 26; ++i) shot(0xF, gz);   // 24 cleans: indecisive
+            LoopLine M = loopq();
+            ck(M.settled == 0 && M.saved == 0,
+               "a dwell that could not make up its mind stores nothing");
+            run(50, 0xF);                             // the third clean dwell
+            M = loopq();
+            ck(M.saved == 0,
+               "a clean dwell after it and still nothing -- so the indecisive "
+               "one did not count as evidence FOR the value either");
+            run(50, 0xF);                             // the fourth
+            M = loopq();
+            ck(M.saved == 1,
+               "...and the fourth clean dwell does it: two before the "
+               "indecisive one and two after. It neither advanced the run nor "
+               "threw it away -- advancing it would put a value in flash that "
+               "this gun never actually aimed with, and resetting it would "
+               "mean a room that blinks never saves at all");
+        }
+
+        // The from-flash correction AT THE PRESET, which is the ordinary case
+        // and not an exotic one: a gun that settles in a clean room saves the
+        // preset routinely (255 > lo of 0, so K4's store gate is satisfied),
+        // and the morning after it boots with the lens cap on or pointing at
+        // the ceiling. The first dwell then has no lock -- and at the preset
+        // that is NOT evidence the value cuts an LED, for the same reason
+        // loop_raise() has always refused to record a bound there: MAXSIZE
+        // cannot be what cut it when the sensor is already as permissive as
+        // anyone ever configures it.
+        auto boot_with = [&](int saved, int sens) {
+            aim_hwloop_clear();
+            aim_hwloop_store(saved, 0, 256);
+            t_sens = sens;
+            wiicam_cam_command("cam=hwmax:-1,hwmin:-1");
+            wiicam_aim_begin();
+            wiicam_cam_command("camlearn=on:0");
+            wiicam_cam_command("cam=res:2,dash:0,mirx:1,lead:0,bmin:0,bmax:15,"
+                               "rtol:0,bhmax:0,pxmax:0,armax:0,fmt:0");
+            load_rig();
+        };
+        boot_with(255, 2);
+        run(58, 0x7);                     // a whole dwell with no lock at all
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.lo == 0 && L.val == 255,
+               "a saved value that IS the preset survives an unlocked first "
+               "dwell untouched: no bound recorded, no raise, still HOLD. "
+               "Recording lo = preset here says the preset cuts an LED, which "
+               "nothing measured and which loop_raise() refuses to say");
+        }
+        run(40, 0xF);
+        for (int d = 0; d < 6; ++d) run(50, 0xF);
+        {
+            LoopLine L = loopq();
+            int lv = -1, llo = -1, lhi = -1;
+            ck(L.settled == 1 && L.saved == 1,
+               "...and the clean dwells that follow settle and store normally, "
+               "because lo is still 0 and K4's floor is still satisfied");
+            ck(aim_hwloop_load(&lv, &llo, &lhi) && lv == 255 && llo == 0
+               && lhi == 256,
+               "...with flash holding the same three numbers it booted from");
+        }
+
+        // THE REGRESSION THAT MATTERS. With lo pinned at the preset the loop
+        // is dead for the session: 'val > lo + 1' is false at every value, so
+        // the first stray dwell jumps straight to hi = val, the bounds meet,
+        // and the answer is NOSAFE -- in the room the loop exists for, which
+        // never gives the clean dwell that would clear it again.
+        boot_with(255, 2);
+        run(58, 0x7);                     // unlocked first dwell, as above
+        load_bad();                       // now a real room, with a real stray
+        {
+            static const int WANT[4] = { 127, 63, 31, 15 };
+            bool ladder = true, never_nosafe = true;
+            for (int d = 0; d < 4; ++d) {
+                run(58, 0xF);
+                LoopLine L = loopq();
+                if (L.val != WANT[d]) ladder = false;
+                if (!strcmp(L.state, "NOSAFE")) never_nosafe = false;
+            }
+            ck(never_nosafe,
+               "and after that unlocked first dwell the loop still SEARCHES. "
+               "A lower bound recorded at the preset leaves it NOSAFE on the "
+               "very first stray dwell -- and a room with a persistent stray "
+               "never gives the clean dwell that would clear the bounds, so "
+               "the one gun that needs the loop is the one that would not get "
+               "it");
+            ck(ladder,
+               "...and it searches by the same ladder as a gun with nothing in "
+               "flash: 127, 63, 31, 15. Booting at a saved value must cost the "
+               "search nothing when the value turns out to be innocent");
+        }
+
+        // Below the preset the branch is unchanged and still fires -- see the
+        // boot group further down, where a saved 40 raises with lo = 40.
+
+        // A gun that never sees a usable frame never stores anything either.
+        arm(2);
+        run(400, 0x1);
+        {
+            LoopLine L = loopq();
+            int lv = -1, llo = -1, lhi = -1;
+            ck(L.settled == 0 && L.saved == 0 && !aim_hwloop_load(&lv, &llo, &lhi),
+               "four hundred frames of a gun that can see one blob and never "
+               "locks: eight dwells, and not one of them evidence. Nothing is "
+               "settled and nothing reaches flash");
+            ck(L.val == 255,
+               "...and the register was never moved either -- there is no "
+               "verdict to move it on");
+        }
+        // And a sensor reporting NOTHING is not even a frame: the report is
+        // byte-identical every poll, so the pipeline hands back the cached
+        // cursor and the dwell does not fill. Pinned again here because it is
+        // the reason K2's window cannot be counted in frames -- see the parked
+        // gun in the oracle group above.
+        arm(2);
+        run(400, 0x0);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 1 && L.saved == 0,
+               "four hundred empty reports are ONE judged frame and store "
+               "nothing: an unchanged report is the previous camera frame seen "
+               "again, and the loop only ever judges frames the sensor "
+               "actually produced something in");
+        }
+
+        // ==================================================================
+        // THE CONTROLS
+        // ==================================================================
+        printf("\n  -- the controls: hwmax by hand, loop:0/1, sens, camreset --\n");
+
+        // (n) A hand-set hwmax is a manual override. The loop stops driving
+        // the register rather than fighting the user for it -- but it KEEPS
+        // the bounds, which are measurements of this room and not opinions.
+        arm(2);
+        load_bad();
+        run(58, 0xF);                     // one LOWER dwell: hi=255, val=127
+        g_reg.clear();
+        wiicam_cam_command("cam=hwmax:77");
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(L.on == 0 && !strcmp(L.state, "OFF"),
+               "a hand-set hwmax switches the loop off: it stops driving the "
+               "register rather than fighting the user for it");
+            ck(L.val == 77 && w.size() == 1 && w[0] == 77,
+               "...the value is applied, and it reaches 0x06");
+            ck(L.lo == 0 && L.hi == 255,
+               "...and the bounds are KEPT. They are measurements of this room, "
+               "and 'loop:1' should not have to find them again");
+            ck(camhas(" loop=0 hwv=77 hwlo=0 hwhi=255 hws=OFF"),
+               "and cam? carries the whole controller on its tail, verbatim: "
+               "loop, value, both bounds, and the state as a word");
+        }
+        run(20, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 0 && L.val == 77,
+               "...and with the loop off the frames are not even counted: the "
+               "user's value stands until the user changes it");
+        }
+
+        // (o) The switch itself.
+        g_reg.clear();
+        const int sets_before = t_sens_sets;
+        wiicam_cam_command("cam=loop:0");
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            ck(L.on == 0 && !strcmp(L.state, "OFF") && L.val == 255,
+               "'loop:0' stops it and hands the register back to the "
+               "sensitivity preset");
+            ck(regs06().empty() && t_sens_sets == sets_before + 1,
+               "...and RESTORE is that preset being re-applied, not a byte we "
+               "invented: the only value known to be sane for this part is the "
+               "one the driver writes itself");
+            ck(camhas("hwmax=-1"),
+               "...after which cam? reports the register as ours no longer");
+        }
+        wiicam_cam_command("cam=hwmax:88");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();                   // the hand-set value lands
+        {
+            LoopLine L = loopq();
+            ck(L.on == 1 && !strcmp(L.state, "HOLD") && L.val == 88,
+               "'loop:1' adopts whatever the register currently holds, so 'hwv' "
+               "is never a value the sensor does not have");
+            ck(L.lo == 0 && L.hi == 256,
+               "...and starts the search over: the bounds it had were about a "
+               "register somebody has since moved by hand");
+        }
+
+        // (p) A sensitivity change rewrites 0x06 from the preset, underneath
+        // the loop. Every bound it found is about a sensor configuration that
+        // no longer exists.
+        arm(2);
+        load_bad();
+        run(58, 0xF);                     // hi=255, val=127
+        g_reg.clear();
+        wiicam_cam_command("cam=sens:1");
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            ck(L.val == 144 && L.lo == 0 && L.hi == 256 && !strcmp(L.state, "HOLD"),
+               "a sens change restarts the search from the NEW preset -- 144 at "
+               "sensitivity 0 and 1, 255 at 2");
+            ck(regs06().empty() && camhas("hwmax=-1"),
+               "...and leaves the register alone, because the preset write is "
+               "what just happened. Putting our old value back would undo the "
+               "change the user asked for");
+        }
+
+        // (q) The command a user reaches for when the gun has gone dark.
+        arm(2);
+        load_bad();
+        run(58, 0xF);
+        aim_hwloop_store(70, 10, 200);
+        ck(g_bh, "a calibration is in the (fake) store before the reset");
+        wiicam_cam_command("camreset");
+        {
+            LoopLine L = loopq();
+            int lv = -1, llo = -1, lhi = -1;
+            ck(L.on == 1 && !strcmp(L.state, "HOLD") && L.val == 255
+               && L.lo == 0 && L.hi == 256,
+               "camreset restarts the loop from the preset with no bounds -- "
+               "the loop is on afterwards, or the one command a user reaches "
+               "for when nothing works would leave the ceiling frozen");
+            ck(!aim_hwloop_load(&lv, &llo, &lhi),
+               "...and erases the SAVED value too, or a ceiling that blinds the "
+               "gun would come back on the next boot and the reset would fix "
+               "the session and lose the argument");
+            ck(g_bh,
+               "...while the CALIBRATION survives it, which is what the store's "
+               "key list is for: an erase of a key the store does not know by "
+               "name falls through to the calibration blob, and 'hwl0' is the "
+               "fourth key to have to be in that list");
+        }
+
+        // ==================================================================
+        // K4 -- BOOT AT THE SAVED VALUE, AND CORRECT IT BEFORE ANYTHING ELSE
+        // ==================================================================
+        printf("\n  -- boot (K4) --\n");
+
+        // (t) Nothing in flash: the preset, which is the value the sensitivity
+        // level writes into 0x06 and the ceiling the loop may never exceed.
+        aim_hwloop_clear();
+        t_sens = 2; wiicam_aim_begin();
+        {
+            LoopLine L = loopq();
+            ck(L.val == 255 && L.lo == 0 && L.hi == 256 && !strcmp(L.state, "HOLD"),
+               "with nothing in flash the loop starts at the sensitivity "
+               "preset -- 255 at sens 2");
+        }
+        aim_hwloop_clear();
+        t_sens = 1; wiicam_aim_begin();
+        ck(loopq().val == 144,
+           "...and 144 at sens 0 and 1, because that is what the preset writes "
+           "and the preset is the ceiling");
+
+        // (r) A saved value. It is written before the first frame, the capture
+        // is armed with it (G3), and the BOUNDS are not restored -- a bound
+        // found in another room is not evidence in this one, and it is the
+        // first dwell's RAISE rule that protects the LEDs here.
+        aim_hwloop_clear();
+        aim_hwloop_store(90, 0, 256);
+        t_sens = 2;
+        g_reg.clear();
+        wiicam_aim_begin();
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(L.val == 90 && !strcmp(L.state, "HOLD") && L.on == 1,
+               "a saved value is adopted at boot");
+            ck(w.size() == 1 && w[0] == 90,
+               "...and written into 0x06 before the gun has aimed at anything");
+            ck(L.lo == 0 && L.hi == 256,
+               "...with the bounds UNKNOWN. Bounds are measurements of a room, "
+               "and the room is where the gun is now, not where it was saved");
+            ck(L.saved == 1,
+               "...and it is reported as being in flash, because it is");
+            ck(wl_enabled(),
+               "G3: the shape capture is armed at boot. Nothing used to arm it, "
+               "so 'learns as you play' was true only inside a session some "
+               "tool happened to switch it on in -- and those histograms are "
+               "the loop's own margin");
+            g_replies.clear();
+            wiicam_cam_command("camloop?");
+            ck(!g_replies.empty() && g_replies[0] ==
+               "CAM: loop on=1 state=HOLD val=90 lo=0 hi=256 dwell=0/50 "
+               "clean=0 stray=0 cut=0 settled=0 saved=1\n",
+               "and '~camloop?' is the whole controller in one line, verbatim: "
+               "a tool reads where it is, what it is bracketed between, and "
+               "what this dwell has seen");
+            ck(camhas("hwmax=90 hwmin=-1 loop=1 hwv=90 hwlo=0 hwhi=256 hws=HOLD"),
+               "...and cam? carries the same five fields on its tail beside the "
+               "register value itself, so one line answers 'what did the loop "
+               "ask for' and 'what does the sensor hold'");
+        }
+
+        // (s) K4's other half, and deviation 2 from the schematic. A saved
+        // value that cuts an LED leaves three blobs; three blobs never seed
+        // the resolver; with no lock there is never a V_CUT to read -- so the
+        // rule as written ("if the first dwell reads LED cut, raise") could
+        // never fire on the very case it exists for. A whole dwell with no
+        // lock AT ALL is that evidence in the only form available.
+        aim_hwloop_clear();
+        aim_hwloop_store(40, 0, 256);
+        t_sens = 2;
+        wiicam_aim_begin();
+        wiicam_cam_command("camlearn=on:0");
+        wiicam_cam_command("cam=res:2,dash:0,mirx:1,lead:0,bmin:0,bmax:15,"
+                           "rtol:0,bhmax:0,pxmax:0,armax:0,fmt:0");
+        load_rig();
+        g_reg.clear();
+        run(65, 0x7);
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(!strcmp(L.state, "RAISE") && L.val == 255,
+               "a saved value the resolver could not lock on once in a whole "
+               "dwell goes straight back to the preset -- before anything else, "
+               "which is what makes saving a ceiling safe at all");
+            ck(L.lo == 40,
+               "...and the value that did it is recorded as the "
+               "highest-known-bad, so the search never comes back to it");
+            ck(!w.empty() && w.back() == 255,
+               "...and the register really goes back up: a gun that boots into "
+               "a ceiling cutting an LED must not need a camreset to escape it");
+        }
+
+        // ==================================================================
+        // S1 -- THE OTHER CORE READS THIS LINE WHILE THE CAMERA WRITES IT
+        // ==================================================================
+        // Everything the loop keeps is a plain variable shared between the
+        // camera core and the serial core. Nothing here can prove the sharing
+        // is safe -- S1 says so -- but the line the serial core prints has to
+        // be self-consistent on its own terms at every point in a dwell, or a
+        // tool cannot draw anything from it: counts that exceed the dwell they
+        // were counted in, a dwell past its own length, bounds that have
+        // crossed.
+        printf("\n  -- the serial core reads mid-dwell (S1) --\n");
+        {
+            const int LED_NEEDS = 40, STRAY_IN = 44;
+            arm(2);
+            run(40, 0xF);
+            wiicam_cam_command("cam=loop:1");
+            int bad = 0, mid = 0;
+            for (int f = 0; f < 600; ++f) {
+                LoopLine L = loopq();
+                const bool known = !strcmp(L.state, "HOLD")
+                                || !strcmp(L.state, "LOWER")
+                                || !strcmp(L.state, "RAISE")
+                                || !strcmp(L.state, "NOSAFE")
+                                || !strcmp(L.state, "OFF");
+                if (!known) ++bad;
+                if (L.dwell < 0 || L.dwell > 50 || L.dwmax != 50) ++bad;
+                if (L.clean < 0 || L.stray < 0 || L.cut < 0) ++bad;
+                if (L.clean + L.stray + L.cut > L.dwell) ++bad;
+                if (L.val < 1 || L.val > 255) ++bad;
+                if (L.lo < 0 || L.hi > 256 || L.lo > L.hi) ++bad;
+                if (L.val <= L.lo) ++bad;      // K4's floor, as an invariant
+                if (L.settled < 0 || L.settled > 1 || L.saved < 0 || L.saved > 1) ++bad;
+                if (L.dwell > 0 && L.dwell < 50) ++mid;
+                if (L.val >= STRAY_IN)      { load_stray(); shot(0xF, 0); }
+                else if (L.val < LED_NEEDS) { load_rig();   shot(0x7, 0); }
+                else                        { load_rig();   shot(0xF, 0); }
+            }
+            ck(mid > 400,
+               "six hundred reads of '~camloop?' from the serial core, most of "
+               "them landing mid-dwell while the camera core is filling it");
+            ck(bad == 0,
+               "...and every one of them is a line a tool can use: the dwell "
+               "never past its own length, no verdict counted more often than "
+               "there were frames to count it in, the bounds never crossed, "
+               "the value always ABOVE what an LED has been measured to need "
+               "(K4's floor, held as an invariant and not only at the moment "
+               "of a store), and the state always one of the five words");
+        }
+
+        // ==================================================================
+        // BATCH B REVIEW FIXES
+        // ==================================================================
+        printf("\n  -- review: LOWER into a cut, the pump core, the preset under the loop --\n");
+        // A frame the pump core has NOT run after: a write the loop asked for
+        // is still pending on the other core.
+        auto shot_nopump = [&](unsigned seen) {
+            int qx[4], qy[4];
+            const int j = (ljit++ & 1) ? 1 : -1;
+            for (int i = 0; i < 4; ++i) { qx[i] = lpx[i] + j; qy[i] = lpy[i]; }
+            t += DT;
+            g_lines.clear();
+            wiicam_aim_process_sz(qx, qy, lsz, seen, t, &sx, &sy);
+        };
+
+        // (u) B1. A room that never locks LOWERs on strays alone; if the
+        // bisection step lands where the LEDs are also cut there has never been
+        // a lock to make 'recent' from, and the old verdict could not see it.
+        arm(2);
+        load_bad();
+        run(58, 0xF);                             // one LOWER dwell: hi=255, val=127
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.val == 127 && L.hi == 255,
+               "a room that never locks still LOWERs on its strays");
+        }
+        load_rig();
+        run(20, 0x3);
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 0 && L.val == 127,
+               "...two blobs with no lock ever is not a cut, even right after "
+               "the LOWER: a glance away must not move the register");
+        }
+        g_reg.clear();
+        run(5, 0x7);
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(!strcmp(L.state, "RAISE") && L.lo == 127 && L.val == 254
+               && w.size() == 1 && w[0] == 254,
+               "...but THREE blobs right after a LOWER is a cut with no lock "
+               "to vouch for it (K4): the value just written is untested, and "
+               "the loop climbs back to just under the value the stray got in at "
+               "instead of sitting on a cut LED for the rest of the session");
+        }
+        run(5, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "RAISE") && L.lo == 127 && L.val == 254,
+               "...and only after a LOWER: in RAISE with no lock, three blobs "
+               "is not read again, or a gun pointed away would walk lo up to "
+               "hi and declare NOSAFE from nothing");
+        }
+
+        // (v) S2. The pause menu and a profile switch rewrite 0x06 from the
+        // preset and only call wiicam_aim_hw_dirty(); the serial 'sens:' path
+        // is not the only one, and the loop must restart from the new preset
+        // here too rather than put its old value back over it.
+        arm(2);
+        load_bad();
+        run(58, 0xF);                             // val=127, hi=255
+        g_reg.clear();
+        t_sens = 1;
+        wiicam_aim_hw_dirty();
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            ck(L.val == 144 && L.lo == 0 && L.hi == 256 && !strcmp(L.state, "HOLD"),
+               "a preset change reported through hw_dirty restarts the search "
+               "from the NEW preset -- same as '~cam=sens:'");
+            ck(regs06().empty() && camhas("hwmax=-1"),
+               "...and does not write the old 127 back over the 144 the preset "
+               "just put there");
+        }
+        run(58, 0xF);                             // LOWER again: val=72, hi=144
+        g_reg.clear();
+        wiicam_aim_hw_dirty();                    // same preset re-applied
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(L.val == 72 && L.hi == 144 && w.size() == 1 && w[0] == 72,
+               "...while the SAME preset re-applied (a profile switch to the "
+               "same sensitivity) keeps the search and puts the loop's value "
+               "back, because the preset write wiped it");
+        }
+        t_sens = 2;
+
+        // (w) S3. The settle frames count from the write LANDING on the pump
+        // core, not from the request. A ~camlearn? reply can hold that core
+        // for a quarter of a second, and every frame in between was taken
+        // under the OLD value.
+        arm(2);
+        load_bad();
+        run(49, 0xF);
+        shot_nopump(0xF);                         // frame 50: LOWER requested
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.val == 127 && regs06().empty(),
+               "the LOWER is decided on the camera core and waits for the pump");
+        }
+        for (int i = 0; i < 20; ++i) shot_nopump(0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 0 && L.stray == 0,
+               "...and twenty frames while it waits are not judged: the sensor "
+               "still holds 255, so they say nothing about 127");
+        }
+        g_reg.clear();
+        wiicam_aim_hw_tick();                     // the pump lands it
+        for (int i = 0; i < 8; ++i) shot_nopump(0xF);
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(w.size() == 1 && w[0] == 127 && L.dwell == 0,
+               "...the eight settle frames start only once it has landed");
+        }
+        shot_nopump(0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.dwell == 1, "...and the ninth is frame one of the dwell");
+        }
+
+        // (x) S4. The settled value reaches flash from the pump core, after
+        // the recoil shutdown hook -- a flash write parks both cores, and the
+        // camera poll is not where the coil gets dropped.
+        static int t_preflash = 0;
+        wiicam_set_preflash_hook([]() { ++t_preflash; });
+        arm(2);
+        lock_and_zero();
+        for (int d = 0; d < 3; ++d) run(50, 0xF);
+        for (int i = 0; i < 50; ++i) shot_nopump(0xF);   // the fourth clean dwell
+        {
+            LoopLine L = loopq();
+            int lv = -1, llo = -1, lhi = -1;
+            ck(L.settled == 1 && L.saved == 0 && !aim_hwloop_load(&lv, &llo, &lhi)
+               && t_preflash == 0,
+               "settled on the camera core, but nothing in flash yet: the store "
+               "is a request to the pump core");
+        }
+        wiicam_aim_hw_tick();
+        {
+            LoopLine L = loopq();
+            int lv = -1, llo = -1, lhi = -1;
+            ck(L.saved == 1 && aim_hwloop_load(&lv, &llo, &lhi) && lv == 255
+               && t_preflash == 1,
+               "...the pump core runs the pre-flash hook once and writes it");
+            wiicam_aim_hw_tick();
+            ck(t_preflash == 1, "...and once only");
+        }
+        wiicam_cam_command("cam=loop:0");
+        {
+            LoopLine L = loopq();
+            ck(L.saved == 0,
+               "'loop:0' hands the register to the preset, so 'saved' no "
+               "longer describes the value in force");
+        }
+        wiicam_set_preflash_hook(0);
+
+        // (y) The RAISE that finds the bounds already met. hi is known from a
+        // stray, lo lands one below it, and there is nothing between them.
+        arm(2);
+        run(40, 0xF);                             // locked: 'recent' is true
+        wiicam_cam_command("cam=hwmax:3");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        load_stray();
+        run(50, 0xF);                             // stray at 3: hi=3, val=1
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.hi == 3 && L.val == 1,
+               "a stray at 3 halves to 1");
+        }
+        load_rig();
+        run(8, 0x7);                              // settle
+        run(5, 0x7);                              // cut at 1: lo=1, val=2
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "RAISE") && L.lo == 1 && L.val == 2,
+               "a cut at 1 raises to 2, the only value left between the bounds");
+        }
+        run(8, 0x7);                              // settle
+        run(5, 0x7);                              // cut at 2: lo=2, hi-1 <= lo
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "NOSAFE") && L.lo == 2 && L.hi == 3 && L.val == 255,
+               "a cut at 2 with the stray known at 3 is NOSAFE from the RAISE "
+               "path too: same-size strays, back to the preset (K5)");
+        }
+
+        // camreset arms the capture, as boot does (G3): the loop's margin is
+        // measured by it, and a reset is when it is needed most.
+        wiicam_cam_command("camlearn=on:0");
+        wiicam_cam_command("camreset");
+        {
+            g_replies.clear();
+            wiicam_cam_command("camlearn?");
+            ck(!g_replies.empty() && g_replies[0].find("on=1") != std::string::npos,
+               "camreset empties the histograms but keeps the capture armed");
+        }
+
+        aim_hwloop_clear();
+        wiicam_set_blobreg_hook(0);
+        wiicam_cam_command("cam=rtol:0,bhmax:0,fmt:0");
     }
 
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

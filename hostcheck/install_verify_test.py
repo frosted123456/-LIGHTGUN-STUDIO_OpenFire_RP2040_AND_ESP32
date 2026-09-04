@@ -72,6 +72,44 @@ msg3 = A.install_over_serial(g3, cmd, dict(C, rx=0.5), timeout=1.0)
 print("mismatch   :", msg3.splitlines()[0])
 if "DISAGREES" not in msg3: fails.append("a mismatched read-back was not detected")
 
+# The reply buffer itself, on a SerialSource with no port: the reader thread
+# appends while a waiter reads, so the list is locked and copied out; it holds
+# 80 lines (a 13-line camlearn answer, a blob pair, verdicts and margin); and a
+# reader that dies says WHY, so a front end can show more than "lost".
+import threading
+class RaisingSer:
+    def __init__(self, lines):
+        self.lines = list(lines)
+    @property
+    def in_waiting(self):
+        if not self.lines: raise OSError("device reports readiness to read but returned no data")
+        return len(self.lines[0])
+    def read(self, n):
+        return self.lines.pop(0)
+    def write(self, b): pass
+src = A.SerialSource.__new__(A.SerialSource)
+threading.Thread.__init__(src, daemon=True)
+src.ser = RaisingSer([("CAM: n=%d\n" % i).encode() for i in range(100)] + [b"Q,1,4,1,2,3,4,5,6,7,8,c,15,0,0\n"])
+src.stop = False; src.replies = []; src.lock = threading.Lock(); src.dead = False; src.dead_reason = ""
+src.q = __import__("queue").Queue(maxsize=4000)
+src.via_queue = True; src.want_dash = False # owned by a Link: the re-arm is a request, not a write
+src.run()                                   # runs to the raise, inline
+if not src.want_dash:
+    fails.append("a queue-owned reader did not ask the Link to re-arm the stream")
+snap = src.snapshot()
+if len(snap) != 80 or snap[0] != "CAM: n=20" or snap[-1] != "CAM: n=99":
+    fails.append("the reply buffer did not keep the last 80 lines: %d, %r..%r"
+                 % (len(snap), snap[:1], snap[-1:]))
+if snap is src.replies:
+    fails.append("snapshot() handed out the live list instead of a copy")
+if not (src.dead and "readiness" in src.dead_reason):
+    fails.append("a reader that died did not say why: dead=%r reason=%r"
+                 % (src.dead, src.dead_reason))
+src.clear_replies()
+if src.snapshot():
+    fails.append("clear_replies() left lines behind")
+print("reply buffer: 80 kept, copied out under the lock, death reason %r" % src.dead_reason[:40])
+
 for f in fails: print("  [FAIL]", f)
 print("install verification: %s" % ("ALL PASS" if not fails else "FAILED"))
 sys.exit(1 if fails else 0)

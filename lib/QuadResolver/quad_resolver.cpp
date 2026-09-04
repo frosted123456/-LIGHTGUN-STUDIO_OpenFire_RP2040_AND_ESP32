@@ -39,15 +39,12 @@ QuadStats   ST;
 // ---- learned plausibility envelope and homography memory ------------------
 // On every all-4-real frame the true deformation is known, so a slowly decaying
 // maximum of what this rig has actually shown bounds later reconstructions.
-// The rig is planar, so model->image is exactly a homography (8 DOF): Hm is the
-// last 4-real solve, Hr the most recent effective H, re-anchored by the 3-real
-// rung and by the fits.
-float Hm[9]; bool H_valid = false;
+// The rig is planar, so model->image is exactly a homography (8 DOF); Hr holds
+// the most recent effective one, re-anchored by the 4-real solve, the 3-real
+// rung and the fits.
 float Hr[9]; bool Hr_valid = false;
 
 float       env_aniso_max = 1.0f;    // largest s_max/s_min seen, decayed
-float       env_scale_max = 1.0f;    // largest scale seen, decayed
-float       env_scale_min = 1.0f;
 bool        env_valid = false;
 const float ENV_MARGIN  = 1.30f;     // allow 30% beyond anything observed
 const float ENV_DECAY   = 0.99995f;  // ~halves over 3-4 min of play at 135fps
@@ -69,6 +66,15 @@ int reshape_bad = 0;
 // Deadlock breaker: blobs keep arriving that every slot refuses.
 const int STUCK_AFTER = 20;             // ~150ms of refusing offered blobs
 int stuck_cnt = 0;
+// partial_lock: every second 3-real frame advances the lock, so this counts the
+// phase. Reset on any 4-real or 0-real frame.
+int partial_phase = 0;
+// veto_seed: the four positions the residual detector just condemned. seed()
+// refuses that set back while the ban lives, or the impostor re-seeds itself
+// and the model it teaches is never questioned again (R2's other half).
+const int BAN_FRAMES = 120;             // ~0.6s at 200fps
+float banned_x[4], banned_y[4];
+int   banned_ttl = 0;
 
 // Squared distance between two points.
 inline float d2(float ax, float ay, float bx, float by) {
@@ -344,13 +350,22 @@ bool reseed_with_model(const float* xs, const float* ys, int n, bool strict = fa
     float bpick[4][2]; float bscore = 1e18f; bool have = false;
 
     if (n == 4 && !strict) {
+        // veto_seed: a lone candidate gets the cheap vetoes too. Cold, the
+        // envelope reads 1.0, so cold_aniso_max is the ceiling.
+        float ceil_aniso = env_aniso_max * ENV_MARGIN;
+        if (ceil_aniso < C.cold_aniso_max) ceil_aniso = C.cold_aniso_max;
         float sc, an;
-        if (score_quad(xs, ys, mo, &sc, &an, bpick)) { bscore = sc; have = true; }
+        if (score_quad(xs, ys, mo, &sc, &an, bpick)
+            && (!C.veto_seed
+                || (convex4(xs, ys) && an <= ceil_aniso
+                    && (sc - an) * 20.0f <= RESHAPE_RESID_PX * 3.0f))) {
+            bscore = sc; have = true;
+        }
     } else if (n == 4) {
         // strict: one candidate, but every cheap veto -- convex position, the
         // learned envelope, and an absolute residual ceiling junk cannot fake
         float ceil_aniso = env_valid ? (env_aniso_max * ENV_MARGIN) : 1e18f;
-        if (env_valid && ceil_aniso < ANISO_FLOOR) ceil_aniso = ANISO_FLOOR;
+        if (env_valid && ceil_aniso < C.cold_aniso_max) ceil_aniso = C.cold_aniso_max;
         float sc, an;
         if (convex4(xs, ys) && score_quad(xs, ys, mo, &sc, &an, bpick)
             && an <= ceil_aniso
@@ -359,7 +374,7 @@ bool reseed_with_model(const float* xs, const float* ys, int n, bool strict = fa
         }
     } else {
         float ceil_aniso = env_valid ? (env_aniso_max * ENV_MARGIN) : 1e18f;
-        if (env_valid && ceil_aniso < ANISO_FLOOR) ceil_aniso = ANISO_FLOOR;
+        if (env_valid && ceil_aniso < C.cold_aniso_max) ceil_aniso = C.cold_aniso_max;
         int c0, c1, c2, c3;
         for (c0 = 0;      c0 < n - 3; ++c0)
         for (c1 = c0 + 1; c1 < n - 2; ++c1)
@@ -386,17 +401,43 @@ bool reseed_with_model(const float* xs, const float* ys, int n, bool strict = fa
         S[i].vx = 0; S[i].vy = 0; S[i].live = true; S[i].miss = 0;
     }
     lock_count = 1;
-    H_valid = Hr_valid = false;                      // refreshed on next 4-real
+    Hr_valid = false;                                // refreshed on next 4-real
     reshape_bad = 0;                                 // fresh identity, fresh clocks:
     stuck_cnt   = 0;                                 // old streaks must not bill it
+    partial_phase = 0;
     ST.reseeds++;
     return true;
 }
 
+// True if this angularly-ordered set IS the condemned one, up to a rotation.
+// The radius is RESHAPE_RESID_PX, not the association gate: the impostor's
+// position is known to a pixel, so a real LED a few px away gets straight back in.
+bool banned_match(const float* xs, const float* ys, const int* order)
+{
+    if (banned_ttl <= 0) return false;
+    const float g2 = RESHAPE_RESID_PX * RESHAPE_RESID_PX;
+    for (int r = 0; r < 4; ++r) {
+        bool all = true;
+        for (int i = 0; i < 4 && all; ++i) {
+            const int s = order[(i + r) & 3];
+            if (d2(xs[s], ys[s], banned_x[i], banned_y[i]) > g2) all = false;
+        }
+        if (all) return true;
+    }
+    return false;
+}
+
 // Seeds identity from a full, clean quad, in canonical angular slot order so the
 // order is reproducible across resets and matches the model's own ordering.
-void seed(const float* xs, const float* ys)
+// Returns false when veto_seed refuses the set.
+bool seed(const float* xs, const float* ys)
 {
+    // Only a convex set can be the projection of a rectangle. Anisotropy and
+    // residual are measured against a model, and seed() runs with none, so
+    // convexity, the ban below and the caller's size veto are the whole
+    // cold-start defence.
+    if (C.veto_seed && !convex4(xs, ys)) return false;
+
     float cx = 0, cy = 0;
     for (int i = 0; i < 4; ++i) { cx += xs[i]; cy += ys[i]; }
     cx /= 4; cy /= 4;
@@ -410,6 +451,11 @@ void seed(const float* xs, const float* ys)
         for (int j = i + 1; j < 4; ++j)
             if (ang[order[j]] < ang[order[i]]) { int t = order[i]; order[i] = order[j]; order[j] = t; }
 
+    // The set the residual detector just condemned may not walk straight back
+    // in; the caller then publishes it raw and un-locked, which is the honest
+    // "cannot lock on this" the hwmax loop needs.
+    if (C.veto_seed && banned_match(xs, ys, order)) return false;
+
     for (int i = 0; i < 4; ++i) {
         const int s = order[i];
         S[i].x = xs[s]; S[i].y = ys[s];
@@ -419,8 +465,11 @@ void seed(const float* xs, const float* ys)
     }
     model_valid = true;
     lock_count  = 1;
-    H_valid = Hr_valid = false;                      // rebuilt on next 4-real
+    Hr_valid = false;                                // rebuilt on next 4-real
     reshape_bad = 0; stuck_cnt = 0;                  // fresh clocks
+    partial_phase = 0;
+    banned_ttl = 0;                                  // a different set got in
+    return true;
 }
 
 } // namespace
@@ -437,8 +486,16 @@ QuadConfig quad_default_config(void)
     c.model_lr    = 1.0f / 64.0f;
     c.lock_frames = 4;
     c.max_stretch = 1.35f;   // one frame cannot legitimately rescale the rig
+    // Batch A off by default: the OV path must not change behaviour.
+    c.veto_seed      = false;
+    c.partial_lock   = false;
+    c.cold_aniso_max = ANISO_FLOOR;   // the existing floor
     return c;
 }
+
+// State as of the last quad_update(), for the camera core -- see the header.
+bool quad_locked(void)    { return locked; }
+bool quad_has_model(void) { return model_valid; }
 
 // Clears all state and installs cfg (NULL = defaults).
 void quad_reset(const QuadConfig* cfg)
@@ -450,12 +507,14 @@ void quad_reset(const QuadConfig* cfg)
     model_valid = false;
     lock_count  = 0;
     locked      = false;
-    env_aniso_max = 1.0f; env_scale_max = 1.0f; env_scale_min = 1.0f;
+    env_aniso_max = 1.0f;
     env_valid = false;
-    H_valid = Hr_valid = false;
+    Hr_valid = false;
     consec_bad = 0;
     reshape_bad = 0;
     stuck_cnt = 0;
+    partial_phase = 0;
+    banned_ttl = 0;
 }
 
 // Returns telemetry accumulated since the last call and zeroes the counters.
@@ -487,6 +546,7 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         }
     } tguard;
     if (n > QUAD_MAX_IN) { ST.dropped_blobs += (n - QUAD_MAX_IN); n = QUAD_MAX_IN; }
+    if (banned_ttl > 0) --banned_ttl;      // the seed ban is a frame TTL
 
     int live = 0;
     for (int i = 0; i < 4; ++i) if (S[i].live) live++;
@@ -499,7 +559,7 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         if (n >= 4) got = reseed_with_model(xs, ys, n);
         // angular seed ONLY when there is no learned model: a failed re-acquire
         // must not overwrite MX/MY with whatever four blobs are in frame
-        if (!got && n == 4 && !model_valid) { seed(xs, ys); got = true; }
+        if (!got && n == 4 && !model_valid) got = seed(xs, ys);
         if (got) {
             consec_bad = 0;
         } else {
@@ -516,6 +576,7 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
             const int m = n < 4 ? n : 4;
             for (int i = 0; i < m; ++i) { R.p[i].x = xs[i]; R.p[i].y = ys[i]; R.p[i].real = true; }
             R.count = m; R.n_real = m; R.locked = false; R.confidence = 0.0f;
+            R.passthrough = true;        // blobs, not corners -- see the header
             ST.dropped_blobs += (n - m);
             return R;
         }
@@ -550,6 +611,18 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         }
         if (bs < 0) break;
         slot_of[bs] = bb; blob_used[bb] = true;
+    }
+    // veto_seed: a slot re-associating after a miss has a gate up to 3x wide and
+    // snapped to anything inside it. Demand that the resulting four-set is still
+    // convex, or leave the slot unmatched this frame.
+    if (C.veto_seed) {
+        for (int s = 0; s < 4; ++s) {
+            if (slot_of[s] < 0 || S[s].miss == 0) continue;
+            float cx4[4], cy4[4];
+            for (int i = 0; i < 4; ++i) { cx4[i] = S[i].x; cy4[i] = S[i].y; }
+            cx4[s] = xs[slot_of[s]]; cy4[s] = ys[slot_of[s]];
+            if (!convex4(cx4, cy4)) { blob_used[slot_of[s]] = false; slot_of[s] = -1; }
+        }
     }
     for (int b = 0; b < n; ++b) if (!blob_used[b]) ST.dropped_blobs++;
 
@@ -700,18 +773,23 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     }
 
     // ---- deadlock breaker ---------------------------------------------------
-    // k<=2 with enough refused blobs to rebuild is the deadlock signature, so fire
-    // at once; the strict vetoes make a false positive decline, not misfire. A
-    // declined reseed backs off instead of re-running the subset search per frame.
+    // k<=2 with enough refused blobs to rebuild is the deadlock signature; the
+    // strict vetoes make a false positive decline, not misfire, and a declined
+    // reseed backs off instead of re-running the subset search per frame.
+    // partial_lock waits the clock out rather than firing at once, which pinned
+    // lock_count at 1 every frame (R5).
     if (k < 4 && n > k) {
         const bool signature = (k <= 2 && n >= 4);
-        bool fire = signature && stuck_cnt == 0;
+        bool fire = signature && stuck_cnt == 0 && !C.partial_lock;
         if (!fire) fire = (++stuck_cnt >= STUCK_AFTER);
         if (fire) {
             if (reseed_with_model(xs, ys, n, /*strict=*/true)) {
                 // identity re-verified from the full blob set; fresh gates,
                 // H rebuilt on the next 4-real frame
-                H_valid = Hr_valid = false;
+                Hr_valid = false;
+                // it passed convexity, the envelope and the residual: that has
+                // earned most of a lock, not one frame of it
+                if (C.partial_lock) lock_count = C.lock_frames - 1;
                 ST.reshapes++;               // same "locked-but-wrong repaired" meaning
                 stuck_cnt = 0;
                 // the give-up clock below reads this frame's k, which is stale
@@ -732,24 +810,22 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     // ---- 4. LEARN: rig shape AND the deformation envelope -------------------
     // Both train only on all-4-real frames, where the observation is the ground
     // truth for this pose.
+    if (k == 4 || k == 0) partial_phase = 0;   // the phase runs across 3-real frames only
+    bool condemned = false;      // veto_seed: this frame's model was just refused
     if (k == 4) {
         Lin2 L4; float a1, a2, a3, a4;
         if (model_valid && fit_affine(midx, 4, ox, oy, &L4, &a1, &a2, &a3, &a4)) {
             float smax, smin;
             lin2_svals(L4, &smax, &smin);
             const float aniso = (smin > 1e-6f) ? (smax / smin) : 1.0f;
-            const float scale = sqrtf(fabsf(L4.a * L4.d - L4.b * L4.c));
             // do not widen the envelope while the residual clock is suspicious
             if (reshape_bad == 0) {
             if (!env_valid) {
-                env_aniso_max = aniso; env_scale_max = scale; env_scale_min = scale;
+                env_aniso_max = aniso;
                 env_valid = true;
             } else {
-                env_aniso_max *= ENV_DECAY; env_scale_max *= ENV_DECAY;
-                env_scale_min /= ENV_DECAY;
+                env_aniso_max *= ENV_DECAY;
                 if (aniso > env_aniso_max) env_aniso_max = aniso;
-                if (scale > env_scale_max) env_scale_max = scale;
-                if (scale < env_scale_min) env_scale_min = scale;
             }
             }
             // perspective the parallelogram model is not capturing, px RMS
@@ -761,8 +837,22 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
                 if (++reshape_bad >= RESHAPE_FRAMES) {
                     for (int i = 0; i < 4; ++i) { S[i].live = false; S[i].miss = 0; S[i].vx = S[i].vy = 0; }
                     lock_count = 0; locked = false; reshape_bad = 0;
-                    H_valid = Hr_valid = false;      // pose memory is part of the error
+                    Hr_valid = false;                // pose memory is part of the error
                     ST.reshapes++;
+                    if (C.veto_seed) {
+                        // A model learned from a wrong four cannot vet the next
+                        // reseed, so condemn it too; the reseed then rests on
+                        // convexity, anisotropy and the caller's size veto.
+                        model_valid = false;
+                        for (int i = 0; i < 4; ++i) { MX[i] = MY[i] = 0.0f; }
+                        // and ban the four positions themselves, or seed() takes
+                        // the impostor straight back on convexity alone.
+                        for (int i = 0; i < 4; ++i) {
+                            banned_x[i] = S[i].x; banned_y[i] = S[i].y;
+                        }
+                        banned_ttl = BAN_FRAMES;
+                        condemned = true;   // and do not learn from this frame
+                    }
                 }
             } else if (reshape_bad) {
                 reshape_bad--;
@@ -770,6 +860,9 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
             if (ST.resid_x100 > ST.resid_max_x100) ST.resid_max_x100 = ST.resid_x100;
             ST.env_aniso_x100 = (uint32_t)(env_aniso_max * 100.0f);
         }
+        // Nothing below may run on a condemned frame: it would re-learn the
+        // model, refresh Hr and advance the lock from the four just refused.
+        if (!condemned) {
         float cx = 0, cy = 0;
         for (int i = 0; i < 4; ++i) { cx += S[i].x; cy += S[i].y; }
         cx /= 4; cy /= 4;
@@ -784,12 +877,23 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         model_valid = true;
         ST.relearns++;
         // refresh the homography memory: exact on 4 real corners, and never from
-        // a frame the residual clock distrusts
-        if (reshape_bad == 0 && h_solve4(ox, oy, Hm)) {
-            for (int i=0;i<9;++i) Hr[i]=Hm[i];
-            H_valid = Hr_valid = true;
-        }
+        // a frame the residual clock distrusts. h_solve4 commits only a valid
+        // solve, so Hr survives a refused one.
+        if (reshape_bad == 0 && h_solve4(ox, oy, Hr)) Hr_valid = true;
         if (lock_count < C.lock_frames) lock_count++;
+        }
+    } else if (C.partial_lock && R.n_real == 3 && n == 3 && model_valid
+               && have_H && rung == 3) {
+        // R1: three real corners plus a rung-3 reconstruction is evidence too,
+        // at half rate -- so one displaced LED no longer pins the lock off.
+        // n == 3 as well: an unmatched blob means the fourth slot may be parked
+        // on nothing while the real LED sits outside its gate, and locking a
+        // phantom corner is worse than not locking at all.
+        // R.n_real, not k: the stuck breaker zeroes it when it rebinds identity.
+        if (++partial_phase >= 2) {
+            partial_phase = 0;
+            if (lock_count < C.lock_frames) lock_count++;
+        }
     } else if (lock_count > 0 && k == 0) {
         lock_count--;                      // total loss slowly un-locks
     }
@@ -804,7 +908,7 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         if (++consec_bad >= RESEED_AFTER) {
             for (int i = 0; i < 4; ++i) { S[i].live = false; S[i].miss = 0; S[i].vx = S[i].vy = 0; }
             lock_count = 0; locked = false; consec_bad = 0;
-            H_valid = Hr_valid = false;              // stale pose must not seed rungs
+            Hr_valid = false;                        // stale pose must not seed rungs
             reshape_bad = 0; stuck_cnt = 0;          // dead lock, dead clocks
             ST.lock_losses++;
         }
@@ -833,14 +937,15 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     } else {
         R.vx = 0.0f; R.vy = 0.0f;
     }
-    // confidence: fraction measured, damped by the worst corner's miss streak
-    R.confidence = (k / 4.0f) / (1.0f + 0.05f * (float)worst_miss);
+    // confidence: fraction measured, damped by the worst corner's miss streak.
+    // From R.n_real, not k: the strict reseed zeroes n_real and k is stale there.
+    R.confidence = ((float)R.n_real / 4.0f) / (1.0f + 0.05f * (float)worst_miss);
     // cost metering is handled by tguard's destructor on every return path
 #ifdef QUAD_DEBUG_HOOK
     quad_dbg.k = k; quad_dbg.n = n;
     quad_dbg.rung = have_H ? rung : (have_fit ? (fit_is_affine ? -1 : -2) : 0);
     for (int i = 0; i < 4; ++i) { quad_dbg.slot_of[i] = slot_of[i]; quad_dbg.miss[i] = S[i].miss; }
-    quad_dbg.hr_valid = Hr_valid ? 1 : 0; quad_dbg.h_valid = H_valid ? 1 : 0;
+    quad_dbg.hr_valid = Hr_valid ? 1 : 0; quad_dbg.h_valid = 0;   // legacy field
     quad_dbg.stuck = stuck_cnt; quad_dbg.cbad = consec_bad;
 #endif
     return R;

@@ -34,21 +34,31 @@ import pygame
 import aim_fit
 import calib_lens
 from aim_calib import (CaptureSession, aimcal_line, camsave_verified,
-                       install_over_serial, make_plan, FRAME_W, FRAME_H)
-from aim_finetune import (BETA_MAX, LEAD_MAX, LEAD_STEP, SHOT_FRAMES,
-                          SMOOTH_MAX, TARGET, Tuner)
+                       install_over_serial, make_plan, parse_aimcal_reply,
+                       replies_clear, replies_snapshot, FRAME_W, FRAME_H)
+from aim_finetune import (BETA_MAX, LEAD_STEP, SHOT_FRAMES, SMOOTH_MAX,
+                          TARGET, Tuner)
 from aim_verify import GRID_3x3
 import gun_studio
-from gun_studio import (BlobLog, CAM_KEYS, CAM_RANGE, FrameRate, LENS_KEYS,
+from gun_studio import (BlobLog, CAM_RANGE, FrameRate, LENS_KEYS,
                         Link, QUIET_REARM_S, auto_tune, parse_blobs,
-                        quiet_plan, sigma_gates, write_shape_csv)
+                        quiet_plan, sigma_gates, write_shape_csv,
+                        GATE_HEAVY_PER_FRAME, NATIVE_W, NATIVE_H,
+                        PREVIEW_LEGEND, SHAPE_OFF_MAX, blob_shape, preview_quad)
 
 # The shared serial layer lives in tools/ beside this file, and this file is
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
 # every feature whose parsing lives in tools/ stops working -- silently, in a
 # way that looks exactly like a broken screen. So it is checked, out loud.
-LINK_API_NEEDED = 10
+LINK_API_NEEDED = 12
 LINK_API_OK = getattr(gun_studio, "LINK_API", 0) >= LINK_API_NEEDED
+
+# The loop's wording, via getattr rather than the import list above: on an old
+# tools/ an ImportError would kill the app before the stale-tools banner shows,
+# while an absent name here just reads as a gun without the loop.
+_loop_line = getattr(gun_studio, "loop_line", None)
+_loop_state_of = getattr(gun_studio, "loop_state_of",
+                         lambda last, loop=None: (None, None, None))
 
 OUT_DIR = os.environ.get("PICAL_OUT", os.path.join(HERE, "calib_out"))
 NO_DATA_S = 5.0
@@ -62,21 +72,9 @@ COV_GATE = 0.55           # fraction of the frame half-extent the LEDs must reac
 SPAN_GATE = 25.0          # px, smallest quad that carries usable distortion
 CX, CY = calib_lens.CX, calib_lens.CY
 
-# The sensor's OWN pixel array, which is NOT the space a blob's position is
-# reported in. A full-mode blob carries both at once: x,y have already been
-# scaled into the pipeline's 240x176 by the gun (wiicam_aim.cpp, x = nx * SX),
-# while the bounding box -- w, h and the origin xmn,ymn -- is left in the
-# 7-bit numbers the sensor produced. Drawing them together means converting
-# one of them, and the panel converts the POSITION, because the box is the
-# thing under suspicion and a suspect measurement should not set the scale.
-SENSOR_W, SENSOR_H = 128.0, 96.0
-
-# How far a box centre may sit from its own reported position before the shape
-# panel calls it a disagreement, in sensor pixels. A real blob is lopsided, so
-# its centroid and the middle of its bounding box differ by a fraction of a
-# pixel honestly. Two pixels is far more than that, and far less than the
-# factor of nearly two that reading the box in the wrong array would produce.
-BOX_MATCH_PX = 2.0
+# NATIVE_W/H, SHAPE_OFF_MAX and blob_shape come from gun_studio, so both
+# front ends convert and judge the same blob the same way. SHAPE_OFF_MAX is
+# 3.0, the value Studio's shape panel has always been read against.
 
 C_BG = (10, 12, 16)
 C_FG = (230, 237, 243)
@@ -86,6 +84,8 @@ C_WARN = (216, 161, 58)
 C_BAD = (210, 75, 75)
 C_RING = (224, 122, 95)
 C_SEL = (31, 111, 235)
+C_CORNER = (255, 210, 74)     # a measured LED corner in the camera view
+C_LEAD = (198, 120, 221)      # the motion-lead arrow, unlike anything else drawn
 
 
 def wrap(text, width=72):
@@ -163,35 +163,6 @@ def recording_path(prefix, ext=".csv"):
 # ---------------------------------------------------------------------------
 # what a blob actually looked like, in the sensor's own pixels
 # ---------------------------------------------------------------------------
-def blob_shape(b):
-    """One parsed blob, converted into the sensor's own 128x96 pixels.
-
-    Hands back (x, y, box, px, dens, placed):
-      x, y    the REPORTED position, scaled out of the pipeline's 240x176
-      box     (x0, y0, w, h) of the bounding box, in sensor pixels, or None
-      px      the blob's lit-pixel count, or None outside full mode
-      dens    px / box area -- how full the box is -- or None
-      placed  True when the box's own origin came off the wire (nine fields),
-              False when there was none and the box had to be hung on the
-              position instead (seven fields, the previous firmware)
-
-    Sizes are w+1 by h+1 on purpose: the gun sends xmx-xmn, a DIFFERENCE, so a
-    blob one pixel across reports 0 and a box drawn 0 wide is an LED that
-    vanishes off the panel entirely.
-    """
-    x = b[0] * SENSOR_W / FRAME_W
-    y = b[1] * SENSOR_H / FRAME_H
-    if len(b) < 7:
-        return x, y, None, None, None, False
-    w = max(1, b[4] + 1)
-    h = max(1, b[5] + 1)
-    px = b[6]
-    dens = px / float(w * h)
-    if len(b) >= 9:
-        return x, y, (float(b[7]), float(b[8]), w, h), px, dens, True
-    return x, y, (x - w / 2.0, y - h / 2.0, w, h), px, dens, False
-
-
 def box_position_gap(blobs):
     """Worst distance between a box centre and its own reported position.
 
@@ -204,11 +175,10 @@ def box_position_gap(blobs):
     """
     worst = None
     for b in blobs:
-        x, y, box, _px, _dens, placed = blob_shape(b)
-        if box is None or not placed:
+        s = blob_shape(b)
+        if s is None or s["off"] is None:
             continue
-        g = math.hypot(box[0] + box[2] / 2.0 - x, box[1] + box[3] / 2.0 - y)
-        worst = g if worst is None else max(worst, g)
+        worst = s["off"] if worst is None else max(worst, s["off"])
     return worst
 
 
@@ -224,13 +194,8 @@ def box_position_gap(blobs):
 LED_WANT = 500
 STRAY_WANT = 20
 
-# When the shape gate counts as "refusing heavily": UNEXPLAINED rejections per
-# camera frame, where unexplained means the resolver did not confirm the blob
-# as stray light. Measured, not chosen -- see Camera.gate_lines for the session
-# that set it. Shared with Studio's own warning, which used to fire at 0.25 of
-# raw rejections while this one waited for 2.0, an eight-fold disagreement
-# about the same number.
-GATE_HEAVY_PER_FRAME = 1.0
+# When the shape gate counts as "refusing heavily": GATE_HEAVY_PER_FRAME, the
+# same number Studio warns off, imported from there so they cannot drift apart.
 
 # The fewest camera frames a gate warning will be drawn from. A rate measured
 # over twenty frames is a tenth of a second of camera and swings wildly, and
@@ -1022,6 +987,8 @@ class Camera(RowScreen):
         self._log_seq = 0          # ...and the number in its name
         self._learn_t = 0.0        # last '~camlearn?' poll, monotonic
         self._fit_t = 0.0          # ...and the last '~camfit?' one
+        self._loop_t = 0.0         # ...and the last '~camloop?' one
+        self._shape_pending = None # (seq0, deadline) while a CSV waits its set
         self._ask_t = 0.0          # the last question of ANY kind, so two of
                                    # them can never be asked in one breath
         self._meter = Meter()      # bsrej as a rate, over seconds of replies
@@ -1137,6 +1104,13 @@ class Camera(RowScreen):
                 vals=(0, 8, 10, 12, 16, 24),
                 fmt=lambda v: "off" if not v else "%d rows" % v,
                 hint=self.bhmax_hint))
+            # The one control that acts BEFORE the sensor hands out its four
+            # slots, right under the height gate (same question, other side of
+            # the wire). A spin, not a button, so the row shows the state unselected.
+            self.rows.append(Row(
+                "Auto light limit", "spin",
+                get=self.loop_value, set=self.loop_set,
+                vals=(0, 1), fmt=self.loop_show, hint=self.loop_hint))
             # Measuring what an LED actually looks like on this rig, from the
             # couch. The gun does the accumulating; both of these exist
             # because the Pi has no console and the LED bar is at the TV, so
@@ -1169,12 +1143,13 @@ class Camera(RowScreen):
         # and the two SENSOR thresholds are left out on purpose, because they
         # are the settings that can leave a gun dark and a power cycle has to
         # stay a way back.
-        # A flat "keeps these settings" sent people away believing an hwmax
-        # they had spent an evening on would still be there in the morning.
+        # 'a sensor limit set by hand', not 'the sensor thresholds': this press
+        # writes neither, but the loop saves the ceiling it settled on itself.
+        # One centred line, so what the loop saves is said on its own rows.
         self.rows.append(Row(
             "Save to gun", act=self.save,
             hint=("keeps these across power cycles, except the full-mode "
-                  "register and the two sensor thresholds") if self.wiicam()
+                  "register and a sensor limit set by hand") if self.wiicam()
             else "keeps these settings across power cycles"))
         if self.wiicam():
             self.rows.append(Row(
@@ -1277,13 +1252,20 @@ class Camera(RowScreen):
         # No figure here either. The range this row used to quote was read off
         # somebody else's hardware, and "our LEDs can never be large" is a
         # claim about one bar: on a five-LED cluster they certainly can.
+        #
+        # AND THE HINT NO LONGER SAYS IT IS NEVER SAVED. That was true while
+        # nothing but a hand could set it: a number somebody typed has no
+        # measurement behind it, and saving it is how a gun comes back blind
+        # after a power cycle. The loop changed one half of that -- a limit it
+        # settled on is defended by what the rig's own LEDs needed, so the gun
+        # saves that one itself -- and left the other half exactly as it was.
+        # Both halves are said, because the difference is the whole rule.
         self.rows.append(Row(
             "Sensor max size (0x06)", "spin",
             get=lambda: link.last.get("hwmax"),
-            set=lambda v: link.send("~cam=hwmax:%d" % v),
+            set=self.hwmax_set,
             vals=(-1, 60, 80, 100, 120, 140, 160, 180, 200, 224, 255),
-            hint="the camera's OWN ceiling, inside the sensor; -1 leaves it "
-                 "alone, which is how it ships"))
+            hint=self.hwmax_hint))
         self.rows.append(Row(
             "Sensor min size (0x1B)", "spin",
             get=lambda: link.last.get("hwmin"),
@@ -1385,6 +1367,92 @@ class Camera(RowScreen):
         stops the capture from anywhere, and a row still offering to 'stop'
         would be claiming something is being measured when nothing is."""
         return self.app.link.hists.running()
+
+    # ---- the loop that steers the sensor's own limit -----------------------
+    def loop_value(self):
+        """0 or 1 as the GUN has it, None when it has never said.
+
+        None is what a firmware without the loop looks like, and the row shows
+        '--' for it rather than 'off' -- 'off' is a claim about a feature this
+        gun does not have, and it would invite somebody to press right and
+        wonder why nothing happened."""
+        link = self.app.link
+        on, state, _v = _loop_state_of(link.last, getattr(link, "loop", {}))
+        if state == "OFF":
+            return 0
+        return None if on is None else int(bool(on))
+
+    def loop_set(self, v):
+        link = self.app.link
+        # Nothing is sent while the state is unknown: 'loop:1' at a running
+        # loop wipes its search and its saved limit, so ask first instead.
+        if self.loop_value() is None:
+            link.send("~camloop?")
+            self._loop_t = time.monotonic()
+            self.app.toast_now("waiting for the gun to say whether the auto "
+                               "light limit is on -- press again in a moment")
+            return
+        link.send("~cam=loop:%d" % (1 if v else 0))
+        # Ask straight back, so the row follows the gun's own answer within a
+        # frame rather than this screen's memory of the press.
+        link.send("~camloop?")
+        self._loop_t = time.monotonic()
+        if v:
+            self.app.toast_now("auto light limit ON -- the gun moves the "
+                               "sensor's own size limit itself and saves it "
+                               "once it settles")
+        else:
+            self.app.toast_now("auto light limit OFF -- this row or ~camreset "
+                               "turns it back on")
+
+    def loop_show(self, v):
+        """The row's own value column: short enough for it, and the state in
+        a word. The whole sentence -- the limit, the dwell's three counts and
+        whether it has been saved -- is in the readout under the rows, which
+        is on screen whether or not this row is selected."""
+        if not v:
+            return "off"
+        link = self.app.link
+        _on, state, _val = _loop_state_of(link.last, getattr(link, "loop", {}))
+        return {"HOLD": "on, holding", "LOWER": "on, searching",
+                "RAISE": "on, raising",
+                "NOSAFE": "on, NO SAFE LIMIT"}.get(state, "on")
+
+    def hwmax_set(self, v):
+        """Type a ceiling in by hand and the loop stands down -- the firmware
+        does that itself, silently, and a row that did not say so would leave
+        somebody watching a limit they had just set being moved by something
+        they could not see."""
+        link = self.app.link
+        link.send("~cam=hwmax:%d" % v)
+        # Asked straight back so the loop row three lines up follows the gun
+        # within a frame instead of waiting out its own second.
+        link.send("~camloop?")
+        self._loop_t = time.monotonic()
+        self.app.toast_now("set by hand, so the auto light limit is now OFF "
+                           "-- and a hand-set one is NOT saved. Turn the auto "
+                           "limit back on to have the gun find and keep one")
+
+    def hwmax_hint(self):
+        """Short: hints are one centred line with no wrapping, so the two
+        halves of the saving rule take turns rather than both being cut."""
+        if self.loop_value():
+            return ("-1 leaves it alone; the loop steers this and saves what "
+                    "it settles on. Setting it here turns the loop off")
+        return ("the camera's OWN ceiling; -1 leaves it alone. A hand-set one "
+                "is not saved -- only one the loop settled on")
+
+    def loop_hint(self):
+        """Short: hints are drawn centred on one line with no wrapping, so a
+        long one loses a word off each end -- and the end is where the
+        instruction is."""
+        if self.loop_value() is None:
+            return "this gun's firmware does not have the loop"
+        if not self.loop_value():
+            return ("off -- the sensor keeps the limit it is on now; right "
+                    "turns the auto limit back on")
+        return ("the gun finds the sensor's own size limit and keeps it -- "
+                "the line below says where it is")
 
     def learn_toggle(self):
         """Start or stop the shape capture.
@@ -1614,36 +1682,43 @@ class Camera(RowScreen):
                           self.gate_off_clause(keys)))
         return out
 
+    SHAPE_WAIT_S = 2.0
+
     def shape_save(self):
         """Write the histograms to the stick, beside the blob logs.
 
-        Asks the gun and WAITS for a set it sent after the asking, rather than
+        Asks the gun and waits for a set it sent AFTER the asking, rather than
         writing whatever the last poll left behind: the file carries no clue
         about its own age, so one written from a capture that ended ten
-        minutes ago is indistinguishable from one taken just now."""
+        minutes ago is indistinguishable from one taken just now. The wait is
+        a pending job finished by shape_tick from the frame loop -- a key
+        press that blocks for two seconds is a Pi that looks crashed."""
         link = self.app.link
         if not link.src:
-            # Said at once rather than after the two-second wait below, which
-            # this screen spends blocked: with no port there is nothing that
-            # could answer, and a frozen screen is how a Pi looks when it has
-            # crashed.
             self.app.toast_now("connect the gun first")
             return
-        seq0 = link.hists.seq
-        link.send("~camlearn?")
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < 2.0:
-            # Pumped from here, because this runs off a key press rather than
-            # from the frame loop and the reply would otherwise not be read
-            # until the next draw -- long after this function has given up.
-            link.pump()
-            if link.hists.seq != seq0 and link.hists.ready():
-                break
-            time.sleep(0.02)
-        if link.hists.seq == seq0 or not link.hists.ready():
-            self.app.toast_now("no complete set of histograms came back in "
-                               "2 s -- nothing written")
+        if self._shape_pending is not None:
             return
+        self._shape_pending = (link.hists.seq, time.monotonic() + self.SHAPE_WAIT_S)
+        link.send("~camlearn?")
+
+    def shape_tick(self, now_m):
+        """Finish a pending shape_save: write once a fresh set is held, or
+        say so once the wait is up. Called every frame from handle()."""
+        if self._shape_pending is None:
+            return
+        seq0, deadline = self._shape_pending
+        link = self.app.link
+        if link.hists.seq != seq0 and link.hists.ready():
+            self._shape_pending = None
+            self.shape_write()
+        elif now_m >= deadline:
+            self._shape_pending = None
+            self.app.toast_now("no complete set of histograms came back in "
+                               "%.0f s -- nothing written" % self.SHAPE_WAIT_S)
+
+    def shape_write(self):
+        link = self.app.link
         try:
             path, seq = recording_path("shape")
             n = write_shape_csv(path, link.hists)
@@ -1729,10 +1804,13 @@ class Camera(RowScreen):
         # the readout and the logging until wall time caught up.
         every = 0.25 if self._log is not None else 1.0
         now_m = time.monotonic()
+        self.shape_tick(now_m)
+        # Each poll's clock is stamped only when the line was QUEUED: a poll
+        # the link declined would otherwise retry a full period later.
         if (self.wiicam() and now_m - self._blob_t > every
-                and self.ask(now_m, self.BLOB_REPLY_S)):
+                and self.ask(now_m, self.BLOB_REPLY_S)
+                and self.app.link.send("~camblob?", poll=True)):
             self._blob_t = now_m
-            self.app.link.send("~camblob?")
             self._rate.feed(self.app.link.last.get("bframes"),
                             self.app.link.last.get("bms"))
             if self._log is not None:
@@ -1743,6 +1821,13 @@ class Camera(RowScreen):
                 except Exception as e:
                     self.app.toast_now("log write failed: %s" % e)
                     self.close_log()
+        # The loop's counters, once a second, through the SAME arbitration as
+        # every other question here (one wire; an answer is a frame that is
+        # not). One line of ~110 bytes, so it can be the fastest poll.
+        if (self.wiicam() and now_m - self._loop_t > 1.0
+                and self.ask(now_m, self.LOOP_REPLY_S)
+                and self.app.link.send("~camloop?", poll=True)):
+            self._loop_t = now_m
         # The gate's verdict. One short line plus one sentence, so it can be
         # asked for often enough to be live without taking anything from the
         # preview -- and it is what turns 'Biggest blob (height)' from a
@@ -1750,9 +1835,9 @@ class Camera(RowScreen):
         # at all of a gun that has already said it does not know the command.
         if (self.wiicam() and self.app.fit.supported
                 and now_m - self._fit_t > 2.5
-                and self.ask(now_m, self.FIT_REPLY_S)):
+                and self.ask(now_m, self.FIT_REPLY_S)
+                and self.app.link.send("~camfit?", poll=True)):
             self._fit_t = now_m
-            self.app.link.send("~camfit?")
         # The shape capture's counters, polled on their own clock and far
         # slower than anything else here. That answer is thirteen lines and up
         # to 2.6 KB, which is nearly a quarter of a second of a 115200 wire --
@@ -1765,9 +1850,9 @@ class Camera(RowScreen):
         # capture started from Studio, or one a '~camreset' has stopped.
         every_l = 5.0 if self.learn_on() else 8.0
         if (self.wiicam() and now_m - self._learn_t > every_l
-                and self.ask(now_m, self.LEARN_REPLY_S)):
+                and self.ask(now_m, self.LEARN_REPLY_S)
+                and self.app.link.send("~camlearn?", poll=True)):
             self._learn_t = now_m
-            self.app.link.send("~camlearn?")
         RowScreen.handle(self, acts, mouse)
 
     # How long each answer occupies the wire, in seconds, at 115200 8N1 --
@@ -1787,6 +1872,8 @@ class Camera(RowScreen):
     BLOB_REPLY_S = 0.05
     FIT_REPLY_S = 0.03
     LEARN_REPLY_S = 0.25
+    # One line, about 110 bytes at 115200 8N1.
+    LOOP_REPLY_S = 0.01
 
     def ask(self, now_m, answer_s):
         """May a question go out now? Claims the wire until then if it may."""
@@ -1890,7 +1977,7 @@ class Camera(RowScreen):
             # reading -- and it is the answer to the question the panel was
             # added to settle.
             gap = box_position_gap(parsed)
-            if gap is not None and gap > BOX_MATCH_PX:
+            if gap is not None and gap > SHAPE_OFF_MAX:
                 out.append("BOX AND POSITION DISAGREE by %.1f of 128 px -- "
                            "box units wrong, or a lens correction is moving "
                            "the position" % gap)
@@ -1951,6 +2038,15 @@ class Camera(RowScreen):
         # while these describe a standing state that will still be here on the
         # next draw -- a transient pushed off the bottom by a standing one is
         # a transient nobody ever sees.
+        # The loop, just above the gate's verdict (same question, other side
+        # of the wire). Absent, not '?', on a gun that never mentioned a loop
+        # or a tools/ too old to word it -- a '?' row would say nothing.
+        if _loop_line is not None:
+            on, state, _v = _loop_state_of(link.last,
+                                           getattr(link, "loop", {}))
+            if on is not None or state is not None:
+                out.append(_loop_line(link.last,
+                                      getattr(link, "loop", {}))[0])
         out.extend(self.gate_lines())
         keys = ("br4", "br3", "br2", "br1", "br0")
         now = [link.last.get(k) for k in keys]
@@ -1968,11 +2064,18 @@ class Camera(RowScreen):
                 # Over EVERY frame, the hopeless ones included: a percentage
                 # taken over only the frames that went well is not a measure
                 # of anything.
+                # bcold: no model yet, or the offered set was refused -- folded
+                # into "two or fewer" so a never-locked resolver cannot read
+                # as "saw all four" (R8 follow-up).
+                bc_cur = link.last.get("bcold", 0)
+                d_bcold = max(0, bc_cur - self._blob_ref.get("bcold", bc_cur))
+                tot += d_bcold
                 out.append("last %d frames: %d%% saw all four LEDs, %d%% "
-                           "three, %d%% two or fewer"
+                           "three, %d%% two or fewer, or no lock"
                            % (tot, 100 * d[0] // tot, 100 * d[1] // tot,
-                              100 * (d[2] + d[3] + d[4]) // tot))
+                              100 * (d[2] + d[3] + d[4] + d_bcold) // tot))
                 self._blob_ref = dict(zip(keys, now))
+                self._blob_ref["bcold"] = bc_cur
                 self._blob_last = out[-1]
             elif self._blob_last:
                 out.append(self._blob_last)
@@ -2047,11 +2150,11 @@ class Camera(RowScreen):
         # question this panel answers is how much of the frame one LED takes
         # up, and "a quarter of the way across" is something the eye can judge
         # against a line where it cannot judge it against nothing.
-        kx, ky = w / SENSOR_W, h / SENSOR_H
-        for gx in range(32, int(SENSOR_W), 32):
+        kx, ky = w / NATIVE_W, h / NATIVE_H
+        for gx in range(32, int(NATIVE_W), 32):
             pygame.draw.line(sc.s, (30, 36, 44), (xi + gx * kx, yi),
                              (xi + gx * kx, yi + hi))
-        for gy in range(32, int(SENSOR_H), 32):
+        for gy in range(32, int(NATIVE_H), 32):
             pygame.draw.line(sc.s, (30, 36, 44), (xi, yi + gy * ky),
                              (xi + wi, yi + gy * ky))
         pygame.draw.rect(sc.s, (48, 54, 61), panel, 1)
@@ -2062,7 +2165,7 @@ class Camera(RowScreen):
         # is the one thing the caption has to say: which array this is drawn
         # in, because that is what tells it apart from the camera view stacked
         # above it, and the two are different sizes for a real reason.
-        cap = "SENSOR %dx%d" % (SENSOR_W, SENSOR_H)
+        cap = "SENSOR %dx%d" % (NATIVE_W, NATIVE_H)
         if sc.f_xs.size(cap)[0] > w:
             # Measured against the panel it belongs to, every time. On a short
             # screen the stacked column is height-limited down to under a
@@ -2077,17 +2180,23 @@ class Camera(RowScreen):
         boxed = False
         for i, b in enumerate(blobs[:4]):
             tag = "ABCD"[i]
-            bx, by, box, npx, dens, placed = blob_shape(b)
+            s = blob_shape(b)
+            if s is None:
+                continue
+            (bx, by), box, dens = s["cross"], s["box"], s["density"]
+            placed, npx = s["origin"], (b[6] if len(b) >= 7 else None)
             # Kept or gate-dropped, on the outline, because that is the
             # question the gates are being tuned to answer. Never on the fill:
             # the fill is already carrying the density.
-            col = C_OK if b[3] == 1 else C_BAD
+            col = C_OK if s["kept"] else C_BAD
             cx, cy = x + bx * kx, y + by * ky
             if box is not None:
                 boxed = True
+                # Drawn w+1 by h+1, as Studio draws it: the wire's width is
+                # xmx-xmn, so a one-pixel blob arrives as 0x0.
                 r = pygame.Rect(int(x + box[0] * kx), int(y + box[1] * ky),
-                                max(2, int(box[2] * kx)),
-                                max(2, int(box[3] * ky))).clip(panel)
+                                max(2, int((box[2] + 1) * kx)),
+                                max(2, int((box[3] + 1) * ky))).clip(panel)
                 pygame.draw.rect(sc.s, heat(dens), r)
                 # Dashed would be better for a box whose origin was never
                 # sent, but at 30 px across a dash is noise; one pixel of
@@ -2097,13 +2206,11 @@ class Camera(RowScreen):
                         max(yi + 7, r.top - 7), tag, sc.f_xs, col)
             if panel.collidepoint(int(cx), int(cy)):
                 sc.crosshair(cx, cy, 3, C_FG, dot=True)
-            gap = None
-            if box is not None and placed:
+            gap = s["off"]
+            if gap is not None:
                 mx = x + (box[0] + box[2] / 2.0) * kx
                 my = y + (box[1] + box[3] / 2.0) * ky
-                gap = math.hypot(box[0] + box[2] / 2.0 - bx,
-                                 box[1] + box[3] / 2.0 - by)
-                if gap > BOX_MATCH_PX:
+                if gap > SHAPE_OFF_MAX:
                     # Loud on purpose. This is the panel failing its own
                     # check, and a faint hairline would be read as decoration
                     # by the one person who needs to see it.
@@ -2120,7 +2227,7 @@ class Camera(RowScreen):
                                             round(100 * dens))
             if not placed:
                 txt += "  no origin"
-            elif gap is not None and gap > BOX_MATCH_PX:
+            elif gap is not None and gap > SHAPE_OFF_MAX:
                 txt += "  off %.1f" % gap
             told.append((txt, col))
         if not blobs:
@@ -2216,9 +2323,9 @@ class Camera(RowScreen):
         # 128x96 is 4:3 and the pipeline's 240x176 is wider, so the sensor
         # panel is the one that binds.
         each = max(sc.h * 0.06, room / 2.0)
-        w = min(sc.w * 0.30, max(sc.w * 0.13, each * SENSOR_W / SENSOR_H))
+        w = min(sc.w * 0.30, max(sc.w * 0.13, each * NATIVE_W / NATIVE_H))
         vh = w * FRAME_H / FRAME_W
-        ph = w * SENSOR_H / SENSOR_W
+        ph = w * NATIVE_H / NATIVE_W
         # Centred in what is left beside the rows, which draw_rows ends at
         # 0.62 w whenever a preview is up.
         px = (sc.w * 0.62 + sc.w) / 2 - w / 2
@@ -2837,7 +2944,7 @@ class RoomSweep:
         elif (not self.done and fit.supported
                 and now - self._poll > self.POLL_S):
             self._poll = now
-            self.app.link.send("~camfit?")
+            self.app.link.send("~camfit?", poll=True)
         for a in acts:
             if a == "back":
                 self.leave()
@@ -3517,7 +3624,7 @@ class Recoil(RowScreen):
         # ARMED long after the gun had disarmed itself.
         if time.time() - self._poll_t > 2.0:
             self._poll_t = time.time()
-            self.app.link.send("~fx?")
+            self.app.link.send("~fx?", poll=True)
         RowScreen.handle(self, acts, mouse)
 
     def test(self):
@@ -3647,6 +3754,7 @@ class App:
         # the very data the calibration just gathered.
         self._cam_borrow = None
         self._cam_arm = None      # a borrow that has asked and not yet armed
+        self._calib_ask = None    # (callback, deadline) while '~aimcal?' is out
         # The gun's own clock as the last session saw it, kept across a
         # reconnect so a gun that RESTARTED can be told from a port that
         # merely re-enumerated. None once the question has been answered.
@@ -3888,6 +3996,15 @@ class App:
         # running is the user's, and one whose state the gun never reported
         # might be: disabling it does not destroy what it has measured, but it
         # does end a measurement somebody may be in the middle of.
+        #
+        # THE CAPTURE IS ARMED AT BOOT NOW, so on current firmware `running`
+        # reads True at every borrow and this branch never fires -- which is
+        # the right answer and not a coincidence to be tidied away. The rule
+        # was always "give back what you took"; what changed is that there is
+        # nothing to take. A restore that sent on:0 anyway would switch off a
+        # capture the gun starts for itself, and the next screen would show a
+        # feature that had silently stopped working the moment a calibration
+        # ran. The condition is pinned in the render test for exactly that.
         if running is False:
             self.link.send("~camlearn=on:0")
         if keep_full:
@@ -3930,6 +4047,13 @@ class App:
             self.t_open = time.time()
             self.link.send("~ping")
             self.link.send("~cam?")
+            self.link.send("~cam=res:2")  # R8: re-enable the resolver in case a prior session died mid-sweep and left it off
+            # What the loop is already doing. Asked at connect rather than
+            # left to the camera screen's own poll: the menu's readout and
+            # every screen that borrows the capture read this, and a blank
+            # there on a gun that is steering its own limit is the one thing
+            # an older firmware must never be confused with.
+            self.link.send("~camloop?")
             self.link.send("~fx?")     # fx_calm and the Recoil screen need it
             self.toast_now("connected on %s" % self.link.port)
         else:
@@ -4138,9 +4262,9 @@ class App:
         self.view = RoomSweep(self)
 
     def begin_finetune(self):
-        c = self.read_gun_calib()
-        if c is None:
-            return
+        self.read_gun_calib(self._finetune_with)
+
+    def _finetune_with(self, c):
         lead = int(self.link.last.get("lead", 0) or 0)
         smooth = int(self.link.last.get("smooth", 3) or 3)
         beta = int(self.link.last.get("beta", -1))
@@ -4151,9 +4275,9 @@ class App:
         self.view = view
 
     def begin_verify(self):
-        c = self.read_gun_calib()
-        if c is None:
-            return
+        self.read_gun_calib(self._verify_with)
+
+    def _verify_with(self, c):
         # Verify MEASURES the calibration, so the same rule applies: a strike
         # or a rumble during the nine shots is noise added to the number the
         # whole screen exists to report.
@@ -4163,44 +4287,51 @@ class App:
         self.link.trig_sink = lambda: view.handle(["trigger"], (0, 0))
         self.view = view
 
-    def read_gun_calib(self, timeout=2.5):
+    CALIB_WAIT_S = 2.5
+
+    def read_gun_calib(self, on_calib, timeout=CALIB_WAIT_S):
         """Ask the gun what calibration it holds; it is the source of truth.
 
-        The reply is taken from the reader thread's own buffer rather than by
-        reading the port here -- that thread already owns the port, and a
-        second reader would race it for the same bytes.
-        """
+        Nothing blocks: the answer is picked up by calib_tick from the frame
+        loop and handed to on_calib(c). The reply is read from the reader
+        thread's own buffer -- that thread owns the port, and a second reader
+        would race it for the same bytes."""
         src = self.link.src
         if src is None:
             self.toast_now("connect the gun first")
-            return None
-        try:
-            src.replies.clear()
-            src.ser.write(b"\n~aimcal?\n")
-        except Exception as e:
-            self.toast_now("could not ask the gun: %s" % e)
-            return None
-        t0 = time.time()
-        while (time.time() - t0) < timeout:
-            for r in list(src.replies):
-                if not r.startswith("AIM:") or "cx=" not in r:
+            return
+        if self._calib_ask is not None:
+            return                        # already asked; the answer is coming
+        replies_clear(src)
+        if not self.link.send("~aimcal?"):
+            self.toast_now("could not ask the gun")
+            return
+        self._calib_ask = (on_calib, time.monotonic() + timeout)
+        self.toast_now("reading the calibration from the gun...")
+
+    def calib_tick(self, now_m):
+        """Finish a read_gun_calib once the 'AIM: ... cx=' line is in, or say
+        so once the wait is up."""
+        if self._calib_ask is None:
+            return
+        on_calib, deadline = self._calib_ask
+        src = self.link.src
+        if src is not None:
+            for r in replies_snapshot(src):
+                g = parse_aimcal_reply(r)
+                if g is None or not all(k in g for k in ("cx", "cy", "w", "h",
+                                                         "bx", "by")):
                     continue
-                g = {}
-                for tok in r.replace("AIM:", "").split():
-                    if "=" in tok:
-                        k, _, v = tok.partition("=")
-                        try:
-                            g[k] = float(v)
-                        except ValueError:
-                            pass
-                if all(k in g for k in ("cx", "cy", "w", "h", "bx", "by")):
-                    return dict(magic=aim_fit.MAGIC, cx=g["cx"], cy=g["cy"],
-                                w=g["w"], h=g["h"], bx=g["bx"], by=g["by"],
-                                lever=g.get("lever", 0.0), rx=g.get("rx", 0.0),
-                                ry=g.get("ry", 0.0))
-            time.sleep(0.05)
-        self.toast_now("the gun has no calibration yet -- run step 4 first")
-        return None
+                self._calib_ask = None
+                self.toast = ""
+                on_calib(dict(magic=aim_fit.MAGIC, cx=g["cx"], cy=g["cy"],
+                              w=g["w"], h=g["h"], bx=g["bx"], by=g["by"],
+                              lever=g.get("lever", 0.0), rx=g.get("rx", 0.0),
+                              ry=g.get("ry", 0.0)))
+                return
+        if src is None or now_m >= deadline:
+            self._calib_ask = None
+            self.toast_now("the gun has no calibration yet -- run step 4 first")
 
     def on_trigger(self):
         if self.session and self.session.state != self.session.S_DONE:
@@ -4327,18 +4458,34 @@ class App:
         if dropping:
             sc.text(x + w / 2, y + sc.h * 0.022, "DROPPING OUT -- last good frame",
                     sc.f_xs, C_WARN)
-        for _, qq in link.hist[-60:]:
-            px, py = to_px(qq.mean(0))
+        for _, c in link.trail[-60:]:
+            px, py = to_px(c)
             if xi < px < xi + wi and yi < py < yi + hi:
                 sc.s.set_at((int(px), int(py)), (31, 111, 235))
-        q = aim_fit.canon(link.hist[-1][1])
+        # Pre-lead corners when the gun sends them; a corner the gun filled in
+        # (not measured this frame) is drawn hollow, the lead as an arrow.
+        q, real, lead = preview_quad(link)
         pts = [to_px(q[i]) for i in range(4)]
         for a, b in ((0, 1), (1, 3), (3, 2), (2, 0)):
             pygame.draw.line(sc.s, (58, 127, 191), pts[a], pts[b], 1)
         for i, nm in enumerate(("TL", "TR", "BL", "BR")):
-            pygame.draw.circle(sc.s, (255, 210, 74),
-                               (int(pts[i][0]), int(pts[i][1])), 4)
+            pygame.draw.circle(sc.s, C_CORNER,
+                               (int(pts[i][0]), int(pts[i][1])), 4,
+                               0 if real[i] else 1)
             sc.text(pts[i][0] + sc.w * 0.012, pts[i][1], nm, sc.f_xs, C_DIM)
+        if lead != (0.0, 0.0):
+            c0 = to_px(q.mean(0))
+            c1 = (c0[0] + lead[0] * kx, c0[1] + lead[1] * ky)
+            pygame.draw.line(sc.s, C_LEAD, c0, c1, 2)
+            # A small head: two short strokes back from the tip.
+            ang = math.atan2(c1[1] - c0[1], c1[0] - c0[0])
+            for da in (2.6, -2.6):
+                pygame.draw.line(sc.s, C_LEAD, c1,
+                                 (c1[0] + 6 * math.cos(ang + da),
+                                  c1[1] + 6 * math.sin(ang + da)), 2)
+        if not all(real) or lead != (0.0, 0.0):
+            sc.text(x + w / 2, y + h - sc.f_xs.get_height(), PREVIEW_LEGEND,
+                    sc.f_xs, C_DIM)
         pygame.draw.line(sc.s, C_RING, (ccx - 6, ccy), (ccx + 6, ccy), 1)
         pygame.draw.line(sc.s, C_RING, (ccx, ccy - 6), (ccx, ccy + 6), 1)
         return covered
@@ -4427,7 +4574,10 @@ class App:
         self._link_t = now
         bad = bool(self.link.src) and not self.link.alive()
         if bad and not self._link_bad:
-            self.toast_now("lost the gun on %s -- reconnecting" % self.link.port)
+            # The reader thread says why it stopped, when it can.
+            why = self.link.dead_reason()
+            self.toast_now("lost the gun on %s%s -- reconnecting"
+                           % (self.link.port, (" (%s)" % why) if why else ""))
         self._link_bad = bad
         if not bad:
             return
@@ -4450,6 +4600,8 @@ class App:
             self.t_open = now
             self.link.send("~ping")
             self.link.send("~cam?")
+            self.link.send("~cam=res:2")  # R8: re-enable the resolver in case a prior session died mid-sweep and left it off
+            self.link.send("~camloop?")   # see connect(): the loop's state is not guessable
             self.link.send("~fx?")
             self._link_bad = False
             self._gun_t0 = was_t if was_t > 0 else None
@@ -4514,6 +4666,9 @@ class App:
                     self.view.save_now()
         self.link_tick(now)
         self.link.pump()
+        # A calibration read that is waiting on the gun, before the view gets
+        # to act on this frame's keys.
+        self.calib_tick(time.monotonic())
         while self.link.replies:
             r = self.link.replies.pop(0)
             self.log(r)
@@ -4579,6 +4734,8 @@ class App:
         if self.session is not None and self.session.state == self.session.S_DONE:
             self.finish_calib()
         self.view.handle(acts, mouse)
+        # What the keys just queued goes out this frame, not next.
+        self.link.drain()
         if self.toast and (now - self.toast_t) > 5.0:
             self.toast = ""
         self.draw()
@@ -4680,6 +4837,8 @@ def run(stances=3, windowed=False, port=None):
             app.t_open = time.time()
             app.link.send("~ping")
             app.link.send("~cam?")
+            app.link.send("~cam=res:2")     # R8: resolver back on, whatever the last session left
+            app.link.send("~camloop?")
             app.link.send("~fx?")
     if not LINK_API_OK:
         # Also on stdout, because the launcher keeps that log and a photo of
@@ -4722,6 +4881,11 @@ def run(stances=3, windowed=False, port=None):
                       "back; check screen 7 on the gun")
         except Exception as e:
             print("pical: could not restore the recoil settings: %s" % e)
+        # R8: leave the resolver on -- a crash mid-sweep must not strand it off until a power cycle
+        try:
+            app.link.send("~cam=res:2")
+        except Exception:
+            pass
         app.link.close()
         pygame.quit()
     return 0

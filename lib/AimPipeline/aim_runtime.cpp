@@ -87,8 +87,7 @@ void  aim_filter_set(float min_cutoff, float beta)
     s_fc = min_cutoff; s_beta = beta; s_f_have = false;
 }
 // Discards the filter history.
-static void fir_reset(void);           // defined with the FIR state, below
-void  aim_filter_reset(void) { s_f_have = false; fir_reset(); }
+void  aim_filter_reset(void) { s_f_have = false; }
 float aim_filter_min_cutoff(void) { return s_fc; }
 float aim_filter_beta(void) { return s_beta; }
 
@@ -290,6 +289,7 @@ bool aim_dead_load(int* out_units)
 #define AIM_NVS_GATE "gate0"
 #define AIM_NVS_GATE2 "gate1"
 #define AIM_NVS_FIT  "fit0"
+#define AIM_NVS_HWL  "hwl0"
 #define AIM_GATE_TAG 0x6A000000u
 
 bool aim_gate_store(int fmt, int bmin, int bmax, int rtol)
@@ -483,243 +483,66 @@ bool aim_fit_clear(void)
 #endif
 }
 
-// ---- temporal mode ---------------------------------------------------------
-// Mode 0 is the shipped pair: One Euro here, latency lead on the quad in the
-// capture layer. Mode 1 replaces both with one causal least-squares fit.
-#define AIM_NVS_TMODE "tmod0"
-#define AIM_NVS_FIR   "fir0"
-#define AIM_FIR_KMIN  3
-#define AIM_FIR_KMAX  15
-#define AIM_FIR_MAX_STEP 0.35f   // normalised screen units, glitch backstop
-static int   s_tmode   = 0;
-static int   s_fir_k   = 7;      // window in samples
-static int   s_fir_pct = 100;    // horizon as a percentage of the lead
-// Written by the capture task, read by the solve. Scalar float writes, like
-// the confidence the capture layer already keeps for the dashboard.
-static volatile float s_lead_ms = 0.0f;
-static volatile float s_conf    = 1.0f;
-static float s_fir_x[AIM_FIR_KMAX], s_fir_y[AIM_FIR_KMAX];
-static int   s_fir_n = 0;        // samples held; index 0 is the OLDEST
-static float s_fir_dt = 0.0f;   // learned sample spacing, for gap detection
-
-static void fir_reset(void) { s_fir_n = 0; s_fir_dt = 0.0f; }
-
-// Ceiling matches aim_lead_store's, so a foreign or corrupt stored lead cannot
-// hand the FIR a horizon no capture layer would ever apply itself.
-void aim_lead_note(float ms)
+// ---- the hwmax loop's settled value ----------------------------------------
+// Three bytes under the same tag: val, lo, hi. hi is the lowest value known to
+// admit a stray and 256 means "never seen one" -- stored as 0, which cannot
+// collide with a real bound because hi is only ever set to a value the loop
+// actually wrote and 0 in MAXSIZE blinds the sensor, so the loop never writes it.
+bool aim_hwloop_store(int val, int lo, int hi)
 {
-    if (!(ms > 0.0f)) ms = 0.0f;
-    if (ms > 50.0f)   ms = 50.0f;
-    s_lead_ms = ms;
-}
-void aim_conf_note(float conf) { s_conf = conf; }
-
-int  aim_tmode_get(void) { return s_tmode; }
-
-// Mode 1 lost to mode 0 on hardware: a fixed-window fit cannot reproduce One
-// Euro's speed-adaptive cutoff, which is the property that makes the shipped
-// filter feel right. The code and its tests stay, because a measured negative
-// result is worth keeping, but selecting it needs -D AIM_FIR_MODE. A gun with
-// tmode=1 left in NVS from testing falls back to 0 on the next boot.
-void aim_tmode_set(int mode)
-{
-#if defined(AIM_FIR_MODE)
-    const int m = (mode == 1) ? 1 : 0;
-#else
-    const int m = 0;
-    (void)mode;
-#endif
-    if (m != s_tmode) { s_tmode = m; fir_reset(); s_f_have = false; }
-}
-
-int aim_fir_k(void)   { return s_fir_k; }
-int aim_fir_pct(void) { return s_fir_pct; }
-
-// Clamps and applies the FIR shape. Changing the window invalidates the
-// buffer: a shorter window would otherwise fit over samples left from the
-// longer one.
-void aim_fir_set(int k, int pct)
-{
-    if (k < AIM_FIR_KMIN) k = AIM_FIR_KMIN;
-    if (k > AIM_FIR_KMAX) k = AIM_FIR_KMAX;
-    if (pct < 0)   pct = 0;
-    if (pct > 140) pct = 140;
-    s_fir_k = k; s_fir_pct = pct;
-    fir_reset();          // any shape change invalidates the window it fitted
-}
-
-// Weights of a causal degree-1 least-squares fit over k samples, evaluated tf
-// frames past the newest. Closed form, so the horizon can be a live parameter:
-//   w_i = 1/k + (i - (k-1)/2) * (tf + (k-1)/2) * 12/(k^3 - k)
-// index 0 = oldest. They sum to 1 by construction, so a static aim cannot
-// drift, and a constant-velocity ramp is extrapolated exactly.
-static void fir_weights(int k, float tf, float* w)
-{
-    if (k < 2) { for (int i = 0; i < k; ++i) w[i] = 1.0f; return; }  // k^3-k = 0
-    const float kf   = (float)k;
-    const float half = 0.5f * (kf - 1.0f);
-    const float g    = (tf + half) * 12.0f / (kf * kf * kf - kf);
-    for (int i = 0; i < k; ++i) w[i] = 1.0f / kf + ((float)i - half) * g;
-}
-
-// One fit does the smoothing and the prediction. Replaces One Euro AND the
-// capture-side lead when mode 1 is selected.
-static void fir_filter(float* x, float* y, float dt)
-{
-    // !(dt > 0) also catches NaN, which fails every ordinary comparison.
-    if (!(dt > 0.0f) || dt > 0.25f) dt = AIM_NOMINAL_DT;  // stall or first frame
-    if (!(*x == *x) || !(*y == *y)) return;               // never buffer a NaN
-    int k = s_fir_k;
-    if (k < AIM_FIR_KMIN) k = AIM_FIR_KMIN;
-    if (k > AIM_FIR_KMAX) k = AIM_FIR_KMAX;
-    if (s_fir_n > k) s_fir_n = 0;                        // window was shortened
-
-    // The fit assumes evenly spaced samples, so a gap invalidates it: losing
-    // lock and re-acquiring elsewhere would otherwise be fitted as one huge
-    // velocity and fling the cursor off-screen for k frames. The expected
-    // spacing is learned rather than assumed, so this works at any frame rate.
-    if (s_fir_dt <= 0.0f) s_fir_dt = dt;
-    if (dt > 2.5f * s_fir_dt) s_fir_n = 0;
-    s_fir_dt += 0.05f * (dt - s_fir_dt);
-
-    if (s_fir_n < k) {
-        s_fir_x[s_fir_n] = *x; s_fir_y[s_fir_n] = *y;
-        ++s_fir_n;
-    } else {
-        for (int i = 1; i < k; ++i) {
-            s_fir_x[i-1] = s_fir_x[i]; s_fir_y[i-1] = s_fir_y[i];
-        }
-        s_fir_x[k-1] = *x; s_fir_y[k-1] = *y;
-    }
-    // Until the window is full there is nothing to fit. Passing the sample
-    // through beats fitting two points, which would extrapolate wildly at the
-    // exact moment the pipeline comes up.
-    if (s_fir_n < k) return;
-
-    // The capture layer reports the fraction of corners actually MEASURED this
-    // frame, not the resolver's miss-damped confidence: a wide lens can leave
-    // one LED dim for a long run, and the damped figure charged that against
-    // the lead for as long as it lasted. Three measured corners already pin
-    // the velocity, so only a genuine dropout shortens the horizon.
-    float conf = s_conf;
-    if (!(conf > 0.0f)) conf = 0.0f;                     // also catches NaN
-    conf *= (1.0f / 0.75f);                              // 3 of 4 = full lead
-    if (conf > 1.0f) conf = 1.0f;
-    float tf = ((float)s_lead_ms * 1e-3f / dt)
-             * ((float)s_fir_pct * 0.01f) * conf;
-    if (!(tf > 0.0f)) tf = 0.0f;
-    // Horizon ceiling: the window's own span. Never extrapolate further than
-    // the samples the fit can actually see. A tighter ceiling than this makes
-    // the prediction knob depend on the smoothing knob, which is precisely the
-    // coupling this mode exists to remove -- at half a span, a 30 ms lead was
-    // silently clipped to 22 and could never match mode 0.
-    const float tf_max = (float)(k - 1);
-    if (tf > tf_max) tf = tf_max;
-
-    float w[AIM_FIR_KMAX];
-    fir_weights(k, tf, w);
-    float ax = 0.0f, ay = 0.0f, lox = s_fir_x[0], hix = s_fir_x[0];
-    float loy = s_fir_y[0], hiy = s_fir_y[0];
-    for (int i = 0; i < k; ++i) {
-        ax += w[i] * s_fir_x[i];
-        ay += w[i] * s_fir_y[i];
-        if (s_fir_x[i] < lox) lox = s_fir_x[i];
-        if (s_fir_x[i] > hix) hix = s_fir_x[i];
-        if (s_fir_y[i] < loy) loy = s_fir_y[i];
-        if (s_fir_y[i] > hiy) hiy = s_fir_y[i];
-    }
-    // Excursion cap, the counterpart of mode 0's LEAD_PX_MAX. A line fitted to
-    // a noisy window can leave the range of its own inputs; let it leave only
-    // in proportion to how far ahead it is projecting. At rest the window
-    // spans only noise, so the cap is tight; in motion it spans real travel,
-    // so real prediction passes untouched.
-    const float g = tf / (float)(k - 1);
-    const float mx = (hix - lox) * g, my = (hiy - loy) * g;
-    if (ax < lox - mx) ax = lox - mx; else if (ax > hix + mx) ax = hix + mx;
-    if (ay < loy - my) ay = loy - my; else if (ay > hiy + my) ay = hiy + my;
-    // Absolute backstop, the counterpart of mode 0's LEAD_PX_MAX. A third of
-    // the screen is far past any legitimate prediction (a 4 m/s swipe leads
-    // 0.10 screen widths at 30 ms) but bounds a glitch to something survivable.
-    const float nx = s_fir_x[k-1], ny = s_fir_y[k-1];
-    if (ax > nx + AIM_FIR_MAX_STEP) ax = nx + AIM_FIR_MAX_STEP;
-    else if (ax < nx - AIM_FIR_MAX_STEP) ax = nx - AIM_FIR_MAX_STEP;
-    if (ay > ny + AIM_FIR_MAX_STEP) ay = ny + AIM_FIR_MAX_STEP;
-    else if (ay < ny - AIM_FIR_MAX_STEP) ay = ny - AIM_FIR_MAX_STEP;
-    *x = ax; *y = ay;
-}
-
-// Persists the temporal mode, clamped to 0..1.
-bool aim_tmode_store(int mode)
-{
-    const int m = (mode == 1) ? 1 : 0;
+    if (val < 0)   val = 0;
+    if (val > 255) val = 255;
+    if (lo  < 0)   lo  = 0;
+    if (lo  > 255) lo  = 255;
+    if (hi  < 0)   hi  = 0;
+    if (hi  > 255) hi  = 0;              // 256 (unknown) and anything above it
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)val << 16)
+                     | ((uint32_t)lo << 8) | (uint32_t)hi;
 #if defined(AIM_HAVE_STORE)
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    const bool ok = (nvs_set_i16(h, AIM_NVS_TMODE, (int16_t)m) == ESP_OK);
+    const bool ok = (nvs_set_u32(h, AIM_NVS_HWL, v) == ESP_OK);
     if (ok) nvs_commit(h);
     nvs_close(h);
     return ok;
 #else
-    (void)m; return true;
+    (void)v; return true;
 #endif
 }
 
-// Reads the persisted temporal mode; false if nothing is stored.
-bool aim_tmode_load(int* out_mode)
+bool aim_hwloop_load(int* out_val, int* out_lo, int* out_hi)
 {
 #if defined(AIM_HAVE_STORE)
-    if (!out_mode) return false;
+    if (!out_val || !out_lo || !out_hi) return false;
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
-    int16_t v = 0;
-    const esp_err_t e = nvs_get_i16(h, AIM_NVS_TMODE, &v);
+    uint32_t v = 0;
+    const esp_err_t e = nvs_get_u32(h, AIM_NVS_HWL, &v);
     nvs_close(h);
     if (e != ESP_OK) return false;
-    *out_mode = (v == 1) ? 1 : 0;
+    if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
+    *out_val = (int)((v >> 16) & 0xFF);
+    *out_lo  = (int)((v >> 8) & 0xFF);
+    const int hi = (int)(v & 0xFF);
+    *out_hi  = hi ? hi : 256;            // 0 is the "never seen a stray" encoding
     return true;
 #else
-    (void)out_mode; return false;
+    (void)out_val; (void)out_lo; (void)out_hi; return false;
 #endif
 }
 
-// Persists the FIR shape. Window and horizon share one key: pct never exceeds
-// 140, so the pair packs into the low and high bytes of a single int16.
-bool aim_fir_store(int k, int pct)
+bool aim_hwloop_clear(void)
 {
-    if (k < AIM_FIR_KMIN) k = AIM_FIR_KMIN;
-    if (k > AIM_FIR_KMAX) k = AIM_FIR_KMAX;
-    if (pct < 0)   pct = 0;
-    if (pct > 140) pct = 140;
 #if defined(AIM_HAVE_STORE)
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    const int16_t packed = (int16_t)((k << 8) | pct);
-    const bool ok = (nvs_set_i16(h, AIM_NVS_FIR, packed) == ESP_OK);
+    const esp_err_t e = nvs_erase_key(h, AIM_NVS_HWL);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
     if (ok) nvs_commit(h);
     nvs_close(h);
     return ok;
 #else
-    (void)k; (void)pct; return true;
-#endif
-}
-
-// Reads the persisted FIR shape; false if nothing is stored or it is nonsense.
-bool aim_fir_load(int* out_k, int* out_pct)
-{
-#if defined(AIM_HAVE_STORE)
-    if (!out_k || !out_pct) return false;
-    nvs_handle_t h;
-    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
-    int16_t v = 0;
-    const esp_err_t e = nvs_get_i16(h, AIM_NVS_FIR, &v);
-    nvs_close(h);
-    if (e != ESP_OK) return false;
-    const int k = (v >> 8) & 0xFF, pct = v & 0xFF;
-    if (k < AIM_FIR_KMIN || k > AIM_FIR_KMAX || pct > 140) return false;
-    *out_k = k; *out_pct = pct;
     return true;
-#else
-    (void)out_k; (void)out_pct; return false;
 #endif
 }
 
@@ -1087,8 +910,7 @@ bool aim_runtime_solve(const aim_pt_t q[4], float frame_w, float frame_h,
 {
     if (!s_enabled || s_c.magic != AIM_CAL_MAGIC) return false;
     if (!aim_solve(&s_c, q, frame_w, frame_h, sx, sy)) return false;
-    if (s_tmode == 1)        fir_filter(sx, sy, dt_s);
-    else if (s_fc > 0.0f)   oe_filter(sx, sy, dt_s);
+    if (s_fc > 0.0f) oe_filter(sx, sy, dt_s);
     // A caller mapping this into integer screen units must never see a NaN.
     if (*sx != *sx || *sy != *sy) return false;
     return true;

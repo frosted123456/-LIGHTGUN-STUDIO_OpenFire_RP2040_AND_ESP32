@@ -25,7 +25,9 @@ class FakeSrc:
     def __init__(self): self.q = queue.Queue()
     def feed(self, dist):
         q = sim._quad(F.TARGET[0], F.TARGET[1], dist, 0.0, stance=0, dot=0)
-        self.q.put("Q,0,4," + ",".join(str(int(round(v*10))) for v in q.reshape(-1)))
+        # The wiicam's 14-field form: kind c, every corner measured, no lead.
+        self.q.put("Q,0,4," + ",".join(str(int(round(v*10))) for v in q.reshape(-1))
+                   + ",c,15,0,0")
 
 src = FakeSrc()
 # A calibration actually FITTED to this simulated gun: a hand-made dict would not

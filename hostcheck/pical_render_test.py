@@ -78,7 +78,7 @@ class FakeSer:
         if "camsave" in txt:
             self.replies.append(
                 "%s thr=110 aec=300 agc=4 boost=0 lead=%dms smooth=%d dead=%d "
-                "beta=%d lens=%d tmode=0 firk=7 firpct=100 fmt=%d bhmax=%d"
+                "beta=%d lens=%d fmt=%d bhmax=%d"
                 % ("CAM: SAVE FAILED" if self.save_fails else "CAM: saved",
                    self.state["lead"], self.state["smooth"],
                    self.state["dead"], self.state["beta"], self.state["lens"],
@@ -98,10 +98,35 @@ class FakeSrc:
         pass
 
 
+class JumpClock:
+    """Every look at the clock is a second later, so the wire's holds and
+    waits are always over and one pump drains the whole queue. The holds
+    themselves are timed in studio_render_test, on a clock that test owns."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        self.t += 1.0
+        return self.t
+
+
+# ONE clock for every Link this test attaches: a hold stamped off one clock
+# and read against a fresh one that starts at zero would never end.
+CLOCK = JumpClock()
+
+
 def attach(app):
     app.link.src = FakeSrc()
     app.link.port = "SIM"
+    app.link.clock = CLOCK
     app.t_open = 1e12                     # never trips the no-data screen
+
+
+def to_wire(app):
+    """Let what a direct call queued reach the fake port. A key press does
+    this inside step(); a handler called straight from the test does not."""
+    app.link.pump()
 
 
 def key(k):
@@ -130,6 +155,21 @@ def main():
            "%s without a gun refuses and says so" % name)
 
     attach(app)
+
+    # ---- R8: connect must turn the resolver back on -----------------------
+    # A prior session that died mid lens-sweep leaves res:0 on the gun; only
+    # a fresh connect can put it right again.
+    conn_app = pical.App(surf, stances=2)
+    def fake_connect_ac(port=None):
+        conn_app.link.src = FakeSrc()
+        conn_app.link.port = port or "SIM"
+        conn_app.link.clock = CLOCK
+        return True
+    conn_app.link.connect = fake_connect_ac
+    conn_app.connect()
+    to_wire(conn_app)
+    ck(any(b"cam=res:2" in w for w in conn_app.link.src.ser.written),
+       "connect turns the resolver back on (R8)")
 
     # ---- 2 camera tuning -------------------------------------------------
     cam = pical.Camera(app)
@@ -170,6 +210,7 @@ def main():
     ck("pinhole" in app.toast, "a narrow FOV preset is refused with a reason")
     lens.fov = 160
     lens.preset()
+    to_wire(app)
     ck(any(b"lens:2" in w for w in app.link.src.ser.written),
        "a wide FOV preset sends a fisheye correction")
     lens.sweeping = True
@@ -206,6 +247,7 @@ def main():
             break
         time.sleep(0.01)
     lens2.handle([], (0, 0))
+    to_wire(app)
     ck(not lens2.fitting and lens2.report, "a starved sweep produces a report")
     ck(not lens2.report_ok and any("REFUSED" in l for l in lens2.report),
        "the report says it was refused, and why")
@@ -235,7 +277,8 @@ def main():
         d, rl = sim.stance_state()
         q = sim._quad(*sess.target(), d, rl, stance=sess.stance, dot=sess.idx)
         v = np.rint(np.asarray(q).reshape(-1) * 10).astype(int)
-        app.link.src.q.put("Q,%d,4,%d,%d,%d,%d,%d,%d,%d,%d"
+        # The wiicam's 14-field form: kind c, all four measured, no lead.
+        app.link.src.q.put("Q,%d,4,%d,%d,%d,%d,%d,%d,%d,%d,c,15,0,0"
                            % (int(t * 1000), *v))
         t += 1.0 / 60.0
         app.step([], t)
@@ -256,7 +299,48 @@ def main():
     app.to_menu()
     app.link.last["lead"] = 20
     app.link.last["smooth"] = 7
+    # Reading the calibration is a pending job, not a wait: the key press
+    # returns with the menu still up and the frame loop still running, and
+    # the gun's answer is picked up by the next frame.
+    frames0 = app._t_frame
     app.begin_finetune()
+    ck(isinstance(app.view, pical.Menu) and app._calib_ask is not None,
+       "asking the gun for its calibration does not block the menu")
+    app.step([], t)
+    ck(app._t_frame == t and app._calib_ask is None,
+       "the frame loop ran on while the answer was awaited (%r -> %r)"
+       % (frames0, app._t_frame))
+    ck(isinstance(app.view, pical.FineTune), "fine tune reads the gun's calibration")
+    # And a gun that never answers is said so, once the wait is up, with the
+    # loop still drawing frames in between.
+    app.to_menu()
+    fake_ser = app.link.src.ser
+    quiet, fake_ser.replies = fake_ser.replies, []     # answers go nowhere
+    app.toast = ""
+    app.begin_finetune()
+    app.step([], t + 0.1)
+    ck(isinstance(app.view, pical.Menu) and app._calib_ask is not None
+       and "calibration" in app.toast,
+       "with no answer yet the menu stays, and says what it is waiting for: %r"
+       % app.toast)
+    app.calib_tick(time.monotonic() + pical.App.CALIB_WAIT_S + 1.0)
+    ck(app._calib_ask is None and "no calibration yet" in app.toast,
+       "past the wait it gives up and says so: %r" % app.toast)
+    fake_ser.replies = quiet
+    app.link.last["lead"] = 20
+    app.link.last["smooth"] = 7
+    # Asked twice before the answer lands: one question on the wire, not two.
+    wr = app.link.src.ser.written
+    n0 = len(wr)
+    app.begin_finetune()
+    ask0 = app._calib_ask
+    app.begin_finetune()
+    ck(app._calib_ask is ask0 and app.link.pending() == 1,
+       "a second calibration read while one is pending is a no-op")
+    app.step([], t + 0.2)
+    ck(sum(1 for w in wr[n0:] if b"aimcal?" in w) == 1,
+       "so '~aimcal?' went out once (%d)"
+       % sum(1 for w in wr[n0:] if b"aimcal?" in w))
     ck(isinstance(app.view, pical.FineTune), "fine tune reads the gun's calibration")
     ft = app.view
     ck(ft.t.lead == 20 and ft.t.smooth == 7,
@@ -335,16 +419,19 @@ def main():
     app.to_menu()
     app.link.last["beta"] = 9
     app.begin_finetune()
+    app.step([], t + 5.3)
     ft2 = app.view
     ft2.sel = 3
     app.step([key(pygame.K_RIGHT)], t + 5.4)
     ck(ser.state["beta"] == 12, "beta steps from the value the gun reported")
     ft2.handle(["back"], (0, 0))
+    to_wire(app)
     ck(ser.state["beta"] == 9, "cancelling puts the gun's own beta back")
 
     # and the two-thing save: calibration AND feel settings, each reported
     app.to_menu()
     app.begin_finetune()
+    app.step([], t + 5.5)
     ft3 = app.view
     ft3.sel = 0
     app.step([key(pygame.K_LEFT)], t + 5.6)
@@ -358,6 +445,7 @@ def main():
     # ---- 6 verify --------------------------------------------------------
     app.to_menu()
     app.begin_verify()
+    app.step([], t + 4.9)
     ck(isinstance(app.view, pical.Verify), "verify reads the gun's calibration")
     vf = app.view
     app.step([], t + 5)
@@ -418,6 +506,77 @@ def main():
         cov.set_at((i, i % 176), (36, 84, 144))
     app.draw_preview(sc, 100, 100, 320, 235, rings=True, trail=cov)
     ck(lit(surf) > empty + 200, "the camera view draws the LEDs, quad and rings")
+
+    # ---- which corners are real, and the lead (C1 C2 C3) ------------------
+    # The wiicam's 14-field Q line names the corners the gun filled in and the
+    # lead it added. A filled-in corner is drawn hollow, the lead as an arrow
+    # in its own colour; the OV gun's 10-field line still draws four filled
+    # corners and no arrow.
+    QUAD = "1000,600,1800,610,1010,1300,1810,1310"
+    PV = (100, 100, 320, 235)
+
+    def corner_px(q):
+        """The pixel under each corner centre, in the preview's own mapping."""
+        kx, ky = (PV[2] - 8) / pical.FRAME_W, (PV[3] - 8) / pical.FRAME_H
+        return [tuple(surf.get_at((int(PV[0] + 4 + p[0] * kx),
+                                   int(PV[1] + 4 + p[1] * ky)))[:3]) for p in q]
+
+    def lead_px():
+        a = pygame.surfarray.array3d(surf).astype(int)
+        sub = a[PV[0]:PV[0] + PV[2], PV[1]:PV[1] + PV[3]]
+        return int((abs(sub - np.asarray(pical.C_LEAD)).sum(axis=2) <= 6).sum())
+
+    def preview_of(line):
+        app.link.hist = []
+        app.link.src.q.put(line)
+        app.link.pump()
+        app.link.full_t = time.time()
+        said = []
+        real_text = pical.Screen.text
+
+        def spy(self, x, y, msg, font=None, colour=pical.C_FG, centre=True):
+            said.append(str(msg))
+            return real_text(self, x, y, msg, font, colour, centre)
+        pical.Screen.text = spy
+        try:
+            surf.fill(pical.C_BG)
+            app.draw_preview(sc, *PV)
+        finally:
+            pical.Screen.text = real_text
+        q, real, lead = pical.preview_quad(app.link)
+        return corner_px(q), real, lead, lead_px(), said
+
+    px, real, lead, arrow, said = preview_of("Q,5000,4,%s,c,11,30,0" % QUAD)
+    filled = [c == pical.C_CORNER for c in px]
+    ck(real == [True, True, False, True] and filled == real,
+       "kind c with real=11: the one corner the gun filled in (BL) is drawn "
+       "hollow, the three it measured are filled (%s)" % (filled,))
+    ck(lead == (3.0, 0.0) and arrow > 0,
+       "a lead of 30 (3 px) is drawn as an arrow in its own colour (%d px)"
+       % arrow)
+    ck(any("hollow corner" in m for m in said),
+       "and a legend says what hollow and the arrow mean, in plain words")
+    ck(abs(app.link.hist[-1][1][0][0] - 103.0) < 1e-6,
+       "the quad the stats use has the lead added back (the cursor's quad)")
+    # The hollow dot must follow its corner through the TL,TR,BL,BR sort:
+    # the same quad with BR first on the wire and real naming slot 0.
+    PERM = "1810,1310,1000,600,1800,610,1010,1300"
+    px, real, lead, arrow, said = preview_of("Q,5500,4,%s,c,14,0,0" % PERM)
+    ck(real == [True, True, True, False]
+       and [c == pical.C_CORNER for c in px] == [True, True, True, False],
+       "with BR sent first and real clearing slot 0, the hollow dot lands on "
+       "BR after the sort (%s)" % ([c == pical.C_CORNER for c in px],))
+    px, real, lead, arrow, said = preview_of("Q,6000,4,%s,c,15,0,0" % QUAD)
+    ck(all(c == pical.C_CORNER for c in px) and arrow == 0
+       and not any("hollow corner" in m for m in said),
+       "all four measured, no lead: four filled corners, no arrow, no legend")
+    px, real, lead, arrow, said = preview_of("Q,7000,4,%s" % QUAD)
+    ck(all(c == pical.C_CORNER for c in px) and arrow == 0
+       and app.link.qmeta["kind"] is None,
+       "the OV gun's 10-field line still draws four filled corners and no "
+       "arrow (%s)" % (px,))
+    app.link.hist = []
+    app.link.qmeta = None
 
     real_pos = pygame.mouse.get_pos
     pygame.mouse.get_pos = lambda: (640, 360)
@@ -570,6 +729,7 @@ def main():
     app.to_menu()
     app.view = pical.Recoil(app)
     ser = app.link.src.ser
+    to_wire(app)
     ck(any(b"fx?" in w for w in ser.written),
        "opening the recoil screen asks the gun for its state")
     app.step([], t + 8)
@@ -605,17 +765,20 @@ def main():
     app.link.last["fxon"] = 1
     n0 = len(ser.written)
     app.fx_quiet(True)
+    to_wire(app)
     sent = b"".join(ser.written[n0:])
     ck(b"fx=quiet:1" in sent, "new firmware is quieted with one switch")
     ck(app._fx_saved is None,
        "and nothing is saved and restored -- the state that used to get stuck")
     n0 = len(ser.written)
     app.fx_tick(time.time() + pical.QUIET_REARM_S + 1)
+    to_wire(app)
     ck(b"fx=quiet:1" in b"".join(ser.written[n0:]),
        "quiet is re-armed while it is wanted: it expires by itself, so a "
        "crashed app can never mute a gun for good")
     n0 = len(ser.written)
     app.fx_quiet(False)
+    to_wire(app)
     ck(b"fx=quiet:0" in b"".join(ser.written[n0:]), "and released on the way out")
 
     # Older firmware: the best imitation available, and it must never write
@@ -625,6 +788,7 @@ def main():
                           "fxpulse": 1, "fxrumms": 0})
     n0 = len(ser.written)
     app.fx_quiet(True)
+    to_wire(app)
     sent = b"".join(ser.written[n0:])
     ck(b"rumms:1" in sent and b"rumms:0" not in sent,
        "old firmware keeps the motor with a 1 ms window, never a 0 that "
@@ -633,6 +797,7 @@ def main():
        "the user's real settings are saved first")
     n0 = len(ser.written)
     app.fx_quiet(False)
+    to_wire(app)
     sent = b"".join(ser.written[n0:])
     ck(b"drive:45" in sent and b"on:0" in sent, "and put back afterwards")
     ck(b"fx?" in sent, "with a read-back asked for, so a restore that went "
@@ -691,6 +856,7 @@ def main():
     app.link.src = saved_src
     n0 = len(ser.written)
     app.fx_tick(time.time() + pical.QUIET_REARM_S + 1)
+    to_wire(app)
     ck(not app._fx_quiet_want
        and b"quiet:1" not in b"".join(ser.written[n0:]),
        "leaving while the gun is away still ends the wanting of silence")
@@ -735,7 +901,13 @@ def main():
             cam.enter_advanced() if advanced else cam.leave_advanced()
         return [r.label for r in cam.rows]
 
+    # 'Auto light limit' sits directly under the height gate on purpose: they
+    # are the same question on the two sides of the wire, and the loop is the
+    # only one of the two that can act before the sensor has already dropped
+    # the corner. A pass that moved it onto the second page would put the one
+    # control that prevents the fault behind a disclosure.
     FRONT = ["Sensitivity", "Blob detail (sizes)", "Biggest blob (height)",
+             "Auto light limit",
              "Learn LED shape", "Log blobs to the stick",
              "Write shape CSV to the stick", "Save to gun", "Advanced", "Back"]
     ADV = ["Smallest blob kept", "Largest blob kept",
@@ -811,6 +983,11 @@ def main():
     ck("saw all four LEDs" in lines,
        "and what share of frames is losing a corner -- the number that says "
        "how much the light is actually costing")
+    # R8 follow-up: an older gun that has never sent bcold still renders the
+    # renamed bucket -- the fold treats an absent counter as zero.
+    ck("5% two or fewer, or no lock" in lines,
+       "an older gun with no bcold still shows the renamed bucket: %s"
+       % [l for l in lines.split("\n") if "saw all four" in l])
     # The gun's counters restart at zero when it reboots. A negative delta
     # never reaches the sample threshold, so the readout used to freeze on
     # stale numbers for the rest of the session.
@@ -819,6 +996,12 @@ def main():
     app.link.last.update({"br4": 300, "br3": 20, "br2": 5, "br1": 0, "br0": 0})
     ck("saw all four LEDs" in "\n".join(cam3.blob_lines()),
        "and it recovers by itself after the gun reboots its counters")
+    # And a gun new enough to send bcold (no model yet, or a refused seed)
+    # folds it into the same bucket rather than counting it as a lock.
+    app.link.last.update({"br4": 900, "br3": 21, "br2": 5, "br1": 0, "br0": 0,
+                          "bcold": 20})
+    ck("3% two or fewer, or no lock" in "\n".join(cam3.blob_lines()),
+       "bcold folds into the two-or-fewer bucket on a newer gun")
     app.step([], t + 9.4)
     ck(True, "camera screen renders with the blob readout")
 
@@ -1190,32 +1373,41 @@ def main():
         """A nine-field blob whose box sits, by construction, exactly where
         the reported position says it should -- offset by dx,dy when the test
         wants the two to disagree."""
-        xn = xp * pical.SENSOR_W / pical.FRAME_W
-        yn = yp * pical.SENSOR_H / pical.FRAME_H
+        xn = xp * pical.NATIVE_W / pical.FRAME_W
+        yn = yp * pical.NATIVE_H / pical.FRAME_H
         return "%d,%d,%d,%d,%d,%d,%d,%d,%d" % (
             xp, yp, size, keep, w, h, px,
             int(round(xn - (w + 1) / 2.0)) + dx,
             int(round(yn - (h + 1) / 2.0)) + dy)
 
     # The conversion first, on its own, because everything drawn rests on it.
-    x9, y9, box9, px9, dens9, placed9 = pical.blob_shape(
-        (120, 88, 3, 1, 11, 9, 84, 58, 43))
+    # blob_shape is gun_studio's now (a dict), so both front ends convert
+    # the same blob the same way; the +1 on w and h is applied when drawing.
+    ck(pical.blob_shape is pical.gun_studio.blob_shape,
+       "pical draws blobs through gun_studio's blob_shape, not a copy of it")
+    s9 = pical.blob_shape((120, 88, 3, 1, 11, 9, 84, 58, 43))
+    x9, y9 = s9["cross"]
     ck(abs(x9 - 64.0) < 0.01 and abs(y9 - 48.0) < 0.01,
        "the reported position converts out of the pipeline's 240x176 into "
        "the sensor's own 128x96 (%.2f, %.2f, want 64, 48)" % (x9, y9))
-    ck(box9 == (58.0, 43.0, 12, 10) and placed9,
-       "the box is placed by its own origin and sized w+1 by h+1 -- the gun "
-       "sends xmx-xmn, so a one-pixel blob reports 0 and a box drawn 0 wide "
-       "is an LED that vanishes: %s" % (box9,))
-    ck(px9 == 84 and abs(dens9 - 84 / 120.0) < 1e-9,
-       "and density is the pixel count over the box it fills (%.3f)" % dens9)
-    x7, y7, box7, _p7, _d7, placed7 = pical.blob_shape((120, 88, 3, 1, 11, 9, 84))
-    ck(not placed7 and box7 is not None
-       and abs(box7[0] + box7[2] / 2.0 - x7) < 1e-9,
+    ck(s9["box"] == (58.0, 43.0, 11.0, 9.0) and s9["origin"],
+       "the box is placed by its own origin, w and h as the gun sent them "
+       "(xmx-xmn; the drawing adds the +1 that stops a one-pixel blob "
+       "vanishing): %s" % (s9["box"],))
+    ck(abs(s9["density"] - 84 / 120.0) < 1e-9,
+       "and density is the pixel count over the box it fills, w+1 by h+1 "
+       "(%.3f)" % s9["density"])
+    s7 = pical.blob_shape((120, 88, 3, 1, 11, 9, 84))
+    ck(not s7["origin"] and s7["box"] is not None
+       and abs(s7["box"][0] + s7["box"][2] / 2.0 - s7["cross"][0]) < 1e-9,
        "a seven-field blob has no origin, so its box is hung on the position "
-       "and says so rather than being dropped: %s" % (box7,))
-    ck(pical.blob_shape((120, 88, 3, 1))[2] is None,
+       "and says so rather than being dropped: %s" % (s7["box"],))
+    ck(pical.blob_shape((120, 88, 3, 1))["box"] is None,
        "and a four-field blob has no box at all, rather than a measured 0x0")
+    # One threshold for both tools: SHAPE_OFF_MAX, 3.0, the value Studio's
+    # shape panel has always been read against (pical used its own 2.0).
+    ck(pical.SHAPE_OFF_MAX == pical.gun_studio.SHAPE_OFF_MAX == 3.0,
+       "the box/position threshold is gun_studio's 3.0, not a second number")
     ck(pical.box_position_gap([(120, 88, 3, 1, 11, 9, 84)]) is None,
        "with nothing to compare, the box/position check answers None rather "
        "than a made-up zero -- 'they agree' is a claim, not a default")
@@ -1516,9 +1708,17 @@ def main():
     # gates and nothing else, so a hint that says "these settings" flatly
     # sends people away believing an hwmax they spent an evening on will
     # still be there in the morning.
+    #
+    # 'set by hand' rather than 'the two sensor thresholds': the loop saves
+    # the ceiling it settled on ITSELF, so the flat old wording is now false
+    # about the one limit most likely to be in force -- and false in the
+    # direction that sends somebody hunting for a number by hand.
     save_hint = cam3.rows[labels.index("Save to gun")].tip()
-    ck("full-mode register" in save_hint and "sensor thresholds" in save_hint,
+    ck("full-mode register" in save_hint and "set by hand" in save_hint,
        "the Save hint names what does NOT persist: %r" % save_hint)
+    ck("sensor thresholds" not in save_hint,
+       "and no longer says the sensor thresholds are never kept -- the loop "
+       "saves the one it settles on: %r" % save_hint)
     adv_labels = page(cam3, True)
     ck("NOT saved" in cam3.rows[
            adv_labels.index("Full-mode register (0x33)")].tip(),
@@ -1529,6 +1729,176 @@ def main():
        "the second page's Back row says where Save is: %r"
        % cam3.rows[adv_labels.index("Back")].tip())
     labels = page(cam3, False)
+
+    # ---- the loop that steers the sensor's own limit ----------------------
+    # It acts BEFORE the sensor hands out its four slots, which is what makes
+    # it the only control on this screen that can stop a corner from being
+    # lost rather than notice afterwards that it was. Three things have to
+    # hold: the poll goes out under the same arbitration as everything else,
+    # the readout says what the gun is doing in words a player can act on, and
+    # an older gun -- which sends none of it -- costs a line rather than a
+    # screen.
+    def loop_reply(state, **kw):
+        d = dict(on=1, val=63, lo=48, hi=80, dwell=10, dwelln=50, clean=44,
+                 stray=1, cut=0, settled=1, saved=1)
+        d.update(kw)
+        app.link.src.q.put(
+            "CAM: loop on=%d state=%s val=%d lo=%d hi=%d dwell=%d/%d "
+            "clean=%d stray=%d cut=%d settled=%d saved=%d\n"
+            % (d["on"], state, d["val"], d["lo"], d["hi"], d["dwell"],
+               d["dwelln"], d["clean"], d["stray"], d["cut"], d["settled"],
+               d["saved"]))
+        app.link.pump()
+
+    # THROUGH ask(). Only one thing comes down this wire, so an answer being
+    # sent is a camera frame that is not -- and a poll that ignored the
+    # arbitration would line up with the blob poll and the histogram poll and
+    # hand the gun three questions in one breath. Proved by claiming the wire
+    # and watching the poll NOT go out.
+    cam3._loop_t = 0.0
+    cam3._ask_t = time.monotonic() + 30.0
+    n0 = len(ser.written)
+    app.step([], t + 12.4)
+    ck(b"camloop?" not in b" ".join(ser.written[n0:]),
+       "the loop poll went out while another answer was still on the wire -- "
+       "it must go through ask() like every other question on this screen")
+    cam3._ask_t = 0.0
+    cam3._loop_t = 0.0
+    n0 = len(ser.written)
+    app.step([], t + 12.5)
+    ck(b"camloop?" in b" ".join(ser.written[n0:]),
+       "...and does go out once the wire is free")
+    # ...and not again inside the same second.
+    n0 = len(ser.written)
+    app.step([], t + 12.6)
+    ck(b"camloop?" not in b" ".join(ser.written[n0:]),
+       "the loop poll ran twice inside one second")
+
+    # The five states, in the readout, in words. Each one asks for something
+    # different from the reader, and the two that are NOT a running search
+    # are the two most likely to be read as a fault.
+    # Every state's line has to fit the readout at 640x480 -- 89 columns --
+    # because a wrapped line costs one of the readout's few rows. Measured at
+    # the widest numbers the line can carry, not the friendly ones.
+    small_cols = pical.readout_cols(pical.Screen(pygame.Surface((640, 480))))
+    for state, wants in (("HOLD", ("holding at 63", "clean 44 stray 1 cut 0",
+                                   "saved")),
+                         ("LOWER", ("searching down", "48..80")),
+                         ("RAISE", ("raising", "LED cut")),
+                         ("NOSAFE", ("NO SAFE LIMIT",
+                                     "tell your LEDs from the room light")),
+                         ("OFF", ("off - limit 63",))):
+        loop_reply(state, on=0 if state == "OFF" else 1)
+        txt = "\n".join(cam3.blob_lines())
+        for w in wants:
+            ck(w in txt, "the %s state says %r on the camera readout"
+               % (state, w))
+        ck("None" not in txt, "and nothing on it reads 'None' (%s)" % state)
+        loop_reply(state, on=0 if state == "OFF" else 1, val=255, lo=100,
+                   hi=256, clean=100, stray=100, cut=100, saved=0)
+        wide = [ln for ln in cam3.blob_lines() if "Auto light limit" in ln]
+        ck(wide and len(wide[0]) <= small_cols,
+           "the %s line fits the 640x480 readout: %d of %d columns (%r)"
+           % (state, len(wide[0]) if wide else -1, small_cols,
+              wide[0] if wide else None))
+    # A limit the loop has not saved yet is not a failure and must not read
+    # as one.
+    loop_reply("LOWER", saved=0)
+    ck("not saved yet" in "\n".join(cam3.blob_lines()),
+       "a limit the loop is still hunting says so as a WORD, not as saved=0")
+    # 256 is the firmware saying it has no ceiling yet -- one past the top of
+    # the byte it searches in, and never a limit anybody set.
+    loop_reply("LOWER", hi=256)
+    ck("48..?" in "\n".join(cam3.blob_lines()),
+       "an unknown upper bound reads '?', not 256")
+
+    # The row itself: a spin with two rungs, so it SHOWS what the gun is
+    # doing without being selected -- a button would have to put the state in
+    # its hint, and a hint is only drawn for the row the cursor is on.
+    loop_reply("HOLD")
+    lrow = cam3.rows[labels.index("Auto light limit")]
+    ck(lrow.show(lrow.value()) == "on, holding",
+       "the loop row shows the gun's own state: %r"
+       % lrow.show(lrow.value()))
+    n0 = len(ser.written)
+    cam3.sel = labels.index("Auto light limit")
+    app.step([key(pygame.K_LEFT)], t + 12.7)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=loop:0" in sent and b"camloop?" in sent,
+       "left turns the loop off and asks straight back (%s)" % sent)
+    loop_reply("OFF", on=0, val=120, saved=0)
+    ck(lrow.show(lrow.value()) == "off",
+       "and the row follows the gun into off: %r" % lrow.show(lrow.value()))
+    # No reason for 'off': a hand-set limit and this row's own left press both
+    # get there, and the gun does not say which it was.
+    off_txt = "\n".join(cam3.blob_lines())
+    ck("off - limit 120" in off_txt and "set by hand" not in off_txt,
+       "the readout says it is off and what the sensor keeps, without "
+       "claiming a reason: %r"
+       % [ln for ln in off_txt.splitlines() if "Auto light" in ln])
+    ck("set by hand" not in lrow.tip() and "right" in lrow.tip(),
+       "and the row's hint says how to turn it back on, not why it is off: "
+       "%r" % lrow.tip())
+    n0 = len(ser.written)
+    app.step([key(pygame.K_RIGHT)], t + 12.8)
+    ck(b"cam=loop:1" in b" ".join(ser.written[n0:]),
+       "right turns it back on")
+
+    # The hwmax row, on the second page: setting it by hand switches the loop
+    # off, and the hint no longer says the value is never saved -- the loop
+    # saves the one it settled on, and only a hand-set one is thrown away.
+    loop_reply("HOLD")
+    adv_labels = page(cam3, True)
+    hwrow = cam3.rows[adv_labels.index("Sensor max size (0x06)")]
+    ck("loop" in hwrow.tip() and "turns the loop off" in hwrow.tip(),
+       "with the loop running, the sensor-max hint says setting it by hand "
+       "stops it: %r" % hwrow.tip())
+    ck("never" not in hwrow.tip(),
+       "and no longer claims the value is never saved: %r" % hwrow.tip())
+    n0 = len(ser.written)
+    app.toast = ""
+    cam3.sel = adv_labels.index("Sensor max size (0x06)")
+    app.step([key(pygame.K_RIGHT)], t + 12.9)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=hwmax:" in sent and b"camloop?" in sent,
+       "setting it by hand asks the gun what that did to the loop (%s)"
+       % sent)
+    ck("OFF" in app.toast and "NOT saved" in app.toast,
+       "and says both halves out loud: the loop is off, and a hand-set one "
+       "is the kind that is not kept: %r" % app.toast)
+    loop_reply("OFF", on=0, val=120, saved=0)
+    ck("not saved" in hwrow.tip() and "the loop settled on" in hwrow.tip(),
+       "with the loop off the hint names the one kind that IS kept: %r"
+       % hwrow.tip())
+    labels = page(cam3, False)
+
+    # AN OLDER GUN sends none of it and never answers '~camloop?'. That costs
+    # the line, not the screen -- and it must not spend one of the readout's
+    # few rows saying '?' about a feature that gun never had.
+    app.link.loop = {}
+    for k in ("loop", "hwv", "hwlo", "hwhi", "hws"):
+        app.link.last.pop(k, None)
+    old_lines = cam3.blob_lines()
+    ck(not any("Auto light limit" in ln for ln in old_lines),
+       "a gun with no loop gets no loop line at all: %s" % old_lines[:3])
+    ck(cam3.rows[labels.index("Auto light limit")].show(
+           cam3.rows[labels.index("Auto light limit")].value()) == "--",
+       "and the row reads '--', never 'off' -- 'off' is a claim about a "
+       "feature this gun does not have")
+    # With the state UNKNOWN a right-press must not guess: 'loop:1' at a loop
+    # that is already running wipes its search and its saved limit. It asks
+    # the gun instead and says so.
+    n0 = len(ser.written)
+    app.toast = ""
+    cam3.sel = labels.index("Auto light limit")
+    app.step([key(pygame.K_RIGHT)], t + 12.95)
+    sent = b" ".join(ser.written[n0:])
+    ck(b"cam=loop:" not in sent and b"camloop?" in sent,
+       "an unknown loop state sends no loop command, only the question (%s)"
+       % sent)
+    ck("press again" in app.toast,
+       "and tells the user to press again in a moment: %r" % app.toast)
+    loop_reply("HOLD")
 
     # The camera's true frame rate, from the gun's own clock. Nobody has ever
     # measured it on this sensor, and it decides whether full mode is
@@ -1545,17 +1915,45 @@ def main():
     cam3.log_toggle()
     ck(cam3._log is not None, "logging starts")
     app.link.last["bframes"] = 1101
+    cam3._blob_t = 0.0                    # the wire is free: the key presses
+    cam3._ask_t = 0.0                     # above may have just claimed it
     app.step([], t + 12.0)                # poll + sample happen in handle()
     logpath = cam3._log.path
     ck("LOGGING" in "\n".join(cam3.blob_lines()),
        "and says so on screen while it runs")
+    # The loop columns follow the '~camloop?' answers that arrive DURING the
+    # capture. The logger reads hwv/hws off link.last, which 'cam?' fills only
+    # on connect; if the loop poll did not land there too, every row of a
+    # capture would carry the limit the gun had when the screen was opened.
+    loop_reply("LOWER", val=41, saved=0)
+    app.link.last["bframes"] = 1102
+    cam3._blob_t = 0.0
+    cam3._ask_t = 0.0
+    app.step([], t + 12.35)
     cam3.log_toggle()
     ck(cam3._log is None and os.path.isfile(logpath),
        "stopping closes the file, and the file is really there")
     with open(logpath) as f:
         head = f.readline().strip()
+        body = [ln for ln in f.read().splitlines() if ln]
     ck(head.startswith("wall,gun_ms,bframes,hz"),
        "with a header a PC can read months later")
+    # ...and every row exactly as wide as that header. This file is read
+    # months later in a spreadsheet BY COLUMN INDEX, so a row one field short
+    # shifts every column after it and nothing about the file looks wrong.
+    # The loop's two are the newest and therefore the last: the limit it is
+    # holding and what it is doing, which is the only thing in the file that
+    # explains why a capture's blob sizes changed half way through.
+    ck(head.endswith(",loopv,loops"),
+       "the loop columns are on the END, where every addition has to go or "
+       "every capture already on a stick reads shifted: %r" % head[-40:])
+    ck(all(len(ln.split(",")) == len(head.split(",")) for ln in body),
+       "COLS and sample() are the same width: header %d, rows %s"
+       % (len(head.split(",")), sorted({len(ln.split(",")) for ln in body})))
+    ck(len(body) >= 2 and body[-1].split(",")[-2:] == ["41", "LOWER"],
+       "a row written after a '~camloop?' answer carries that answer's limit "
+       "and state, not the ones from connect: %r"
+       % [ln.split(",")[-2:] for ln in body])
     # And a screen that was logging must not keep the file open once it is gone.
     cam3.log_toggle()
     app.to_menu()
@@ -1650,13 +2048,25 @@ def main():
     cam4.log_toggle()
 
     # The CSV. Written from a set the gun sent AFTER the asking, so the queue
-    # is loaded first -- shape_save pumps the link itself.
+    # is loaded first. shape_save no longer waits inside the key press: it
+    # asks, and the frame loop finishes the job when the set is in.
     feed([])                                   # drain anything left over
     for ln in learn_lines(1, 1200, 4800, 90,
                           {(0, "sz"): sz0, (1, "sz"): sz1}):
         app.link.src.q.put(ln)
     app.toast = ""
+    n0 = len(ser.written)
+    t_press = time.monotonic()
     cam4.shape_save()
+    ck(time.monotonic() - t_press < 0.2 and cam4._shape_pending is not None
+       and not [f for f in os.listdir(pical.OUT_DIR) if f.startswith("shape-")],
+       "the key press returns at once with the CSV still pending")
+    # The frame loop runs on meanwhile: this frame is drawn and pumped, and
+    # it is the frame that carries the gun's answer in and writes the file.
+    app.step([], t + 13.5)
+    ck(app._t_frame == t + 13.5 and b"camlearn?" in b" ".join(ser.written[n0:]),
+       "the loop drew a frame while the CSV waited, and the question went out")
+    ck(cam4._shape_pending is None, "and the set arriving finished the job")
     shapes = sorted(f for f in os.listdir(pical.OUT_DIR)
                     if f.startswith("shape-"))
     ck(len(shapes) == 1, "the CSV lands on the stick beside the blob logs "
@@ -1699,6 +2109,7 @@ def main():
     # wait out a second to see two of them -- which is precisely the collision
     # a Pi with no RTC hits on every boot, at every second of the day.
     cam4.shape_save()
+    app.step([], t + 13.6)
     shapes = sorted(f for f in os.listdir(pical.OUT_DIR)
                     if f.startswith("shape-"))
     ck(len(shapes) == 2, "a second capture written in the SAME second is a "
@@ -1814,6 +2225,10 @@ def main():
        % (app.link.hists.counts(),))
     app.toast = ""
     cam4.shape_save()                          # nothing fresh in the queue
+    app.step([], t + 13.7)                     # a frame passes; still waiting
+    ck(cam4._shape_pending is not None and not app.toast,
+       "with no fresh set yet it keeps waiting, the screen still drawing")
+    cam4.shape_tick(time.monotonic() + pical.Camera.SHAPE_WAIT_S + 1.0)
     ck("nothing written" in app.toast,
        "and the CSV refuses rather than writing the old capture under "
        "today's date: %r" % app.toast)
@@ -2580,6 +2995,7 @@ def main():
     app.begin_room_sweep()
     rs = app.view
     ck(isinstance(rs, pical.RoomSweep), "the menu row opens the sweep")
+    to_wire(app)
     sent = b" ".join(ser.written[n0:])
     ck(b"camlearn?" in sent and b"camlearn=on:1" not in sent,
        "it ASKS what the gun is holding before it arms anything -- after "
@@ -2605,9 +3021,22 @@ def main():
     # A capture that was ALREADY running is the user's. It is still armed --
     # on:1 at a running capture is a no-op, the firmware clears on the off->on
     # edge only -- but it must not be STOPPED on the way out.
+    #
+    # THIS IS NOW THE NORMAL PATH, not the unusual one. The firmware arms the
+    # capture in begin(), so on current firmware the gun answers on=1 at every
+    # borrow and `running` is True every time -- which means cam_restore's
+    # 'only one we can prove we started' rule is the only thing standing
+    # between a calibration and a capture that silently stops the first time
+    # anybody runs one. Pinned with the borrowed state read directly, so a
+    # rewrite that started guessing OFF when the answer is True is caught here
+    # and not on somebody's rig.
     app.link.last["fmt"] = 2
     app.begin_room_sweep()
     arm(1, led=900)
+    ck(app._cam_borrow == (2, True),
+       "a gun whose capture was already running -- which is every gun on "
+       "firmware that arms it at boot -- is remembered as running (%s)"
+       % (app._cam_borrow,))
     n0 = len(ser.written)
     app.to_menu()
     sent = b" ".join(ser.written[n0:])
@@ -3070,6 +3499,9 @@ def main():
         app.link_tick(time.time())
     finally:
         app.link.connect = real_connect
+    to_wire(app)
+    ck(any(b"cam=res:2" in w for w in app.link.src.ser.written),
+       "reconnecting through link_tick turns the resolver back on (R8)")
     app.link.last["board"] = "rp2040-wiicam"    # the '~cam?' answer, arriving
     ck(app._gun_t0 == 400.0,
        "the clock the previous session ended on is kept across the reconnect, "
@@ -3359,6 +3791,7 @@ def main():
     cam9.log_toggle()                      # the fastest the blob poll ever runs
     app.link.hists.summary = {"on": 1, "frames": 9, "led": 9, "rej": 0}
     asked, worst = [], 0
+    not_polls = set()                      # a periodic question sent poll=False
     real_mono, fake = time.monotonic, {"t": 9000.0}
     time.monotonic = lambda: fake["t"]
     real_send = app.link.send
@@ -3366,9 +3799,16 @@ def main():
         for i in range(1800):              # thirty seconds at the real 60 fps
             fake["t"] = 9000.0 + i / 60.0
             batch = []
-            app.link.send = lambda ln, b=batch: (b.append(ln), real_send(ln))[1]
+
+            def spy_send(ln, poll=False, b=batch):
+                b.append(ln)
+                if ln.endswith("?") and not poll:
+                    not_polls.add(ln)
+                return real_send(ln, poll=poll)
+            app.link.send = spy_send
             try:
                 cam9.handle([], (0, 0))
+                app.link.pump()            # the frame loop drains the queue
             finally:
                 app.link.send = real_send
             qs = [ln for ln in batch if ln.endswith("?")]
@@ -3381,6 +3821,11 @@ def main():
     ck(worst <= 1,
        "no single frame ever asks the gun two questions -- sent together they "
        "come back as one burst, which is the whole failure (worst %d)" % worst)
+    # Every periodic question goes through Link's queue as a POLL, so it is
+    # dropped rather than piled up when the wire is held by a slow reply.
+    ck(not not_polls,
+       "the camera screen's periodic questions are all marked poll=True "
+       "(sent as commands: %s)" % sorted(not_polls))
     counts = {}
     for _tt, ln in asked:
         counts[ln] = counts.get(ln, 0) + 1
@@ -3405,6 +3850,41 @@ def main():
        "so its quarter-second of wire is never doubled (closest %.2f s, needs "
        "%.2f)" % (min(after_learn) if after_learn else -1, cam9.LEARN_REPLY_S))
     app.link.hists.summary = {}
+    app.to_menu()
+
+    # ---- the polls through the REAL queue, with its holds (B1) --------------
+    # Above, the link's clock jumps a second per look, so every hold is over
+    # before it matters. Here the link runs on the same simulated clock as
+    # the screen: the blob and loop polls both have a 1 s period, blob goes
+    # first, and the loop poll landing inside blob's 60 ms hold used to be
+    # DROPPED -- and re-tried a second later at the same phase, for ever.
+    # Measured on the wire, not on the screen's own bookkeeping.
+    app.link.last["board"] = "rp2040-wiicam"
+    cam10 = pical.Camera(app)
+    app.open(cam10)
+    # Started past the shared jump clock, so holds stamped off it are over.
+    t_base = CLOCK.t + 100.0
+    real_mono, fake = time.monotonic, {"t": t_base}
+    real_clock, app.link.clock = app.link.clock, (lambda: fake["t"])
+    time.monotonic = lambda: fake["t"]
+    n0 = len(ser.written)
+    skipped0 = app.link.polls_skipped
+    try:
+        for i in range(180):               # three seconds at 60 fps
+            fake["t"] = t_base + i / 60.0
+            app.step([], fake["t"])
+    finally:
+        time.monotonic = real_mono
+        app.link.clock = real_clock
+    sent = [w.decode().strip() for w in ser.written[n0:]]
+    n_blob, n_loop = sent.count("~camblob?"), sent.count("~camloop?")
+    ck(n_loop >= 2 and n_blob >= 2,
+       "over three real-paced seconds both polls reach the wire -- loop %d, "
+       "blob %d (a loop poll inside blob's hold is delayed, not dropped)"
+       % (n_loop, n_blob))
+    ck(app.link.polls_skipped - skipped0 <= 1,
+       "and nothing was thrown away to get there (%d skipped)"
+       % (app.link.polls_skipped - skipped0))
     app.to_menu()
 
     # ---- a gun on firmware older than the fit ------------------------------
@@ -3579,6 +4059,33 @@ def main():
     globmod.glob, builtins.open = real_glob, real_open
     ck(idx == "1", "picks the connected card, not the render node (got %s)" % idx)
     ck(picked and "card1" in picked, "and names the device it chose")
+
+    # ---- R8: shutdown must turn the resolver back on ----------------------
+    # A crash or a window close mid-sweep must not strand the gun at res:0.
+    # Drives the real run() loop for exactly one iteration (a synthetic QUIT
+    # event) so its finally clause -- the actual shutdown path -- runs.
+    real_link_connect = pical.Link.connect
+    shutdown_holder = {}
+    def fake_shutdown_connect(self, port=None):
+        self.src = FakeSrc()
+        shutdown_holder["src"] = self.src
+        self.port = port or "SIM"
+        return True
+    pical.Link.connect = fake_shutdown_connect
+    real_event_get = pygame.event.get
+    calls = {"n": 0}
+    def fake_event_get(*a, **k):
+        calls["n"] += 1
+        return [pygame.event.Event(pygame.QUIT)] if calls["n"] == 1 else []
+    pygame.event.get = fake_event_get
+    try:
+        pical.run(stances=2, windowed=True, port="SIM")
+    finally:
+        pical.Link.connect = real_link_connect
+        pygame.event.get = real_event_get
+    ck("src" in shutdown_holder
+       and any(b"cam=res:2" in w for w in shutdown_holder["src"].ser.written),
+       "shutdown turns the resolver back on (R8)")
 
     pygame.quit()
     print("\npical: %s (%d failures)" % ("ALL PASS" if not FAILS else "FAILED",

@@ -19,7 +19,8 @@ struct QuadPoint {
 // The four corners resolved for one frame.
 struct QuadResult {
     QuadPoint p[4];
-    int   count;      // 4 once locked; fewer only during cold start
+    int   count;      // 4 once locked; fewer during cold start, or under
+                      // veto_seed while no offered set is accepted
     bool  locked;     // model is trusted
     int   n_real;     // how many of the 4 were actually detected this frame
     float confidence; // 0..1 — n_real/4 damped by how long we have extrapolated
@@ -27,6 +28,9 @@ struct QuadResult {
     // For latency lead at publish time: consumers may publish p[] + (vx,vy)*lead.
     // Deliberately not applied to the resolver's own state.
     float vx, vy;
+    // Cold raw passthrough: no model yet, and no offered set accepted. p[] is
+    // the blobs as handed in, so a consumer must not count them as corners seen.
+    bool  passthrough;
 };
 
 // Tunables for association and model learning.
@@ -36,6 +40,13 @@ struct QuadConfig {
     int   lock_frames;  // consecutive all-4-real frames before trusting model
     float max_stretch;  // reject a similarity fit whose scale moves more than
                         // this factor in one frame (guards a bad association)
+    // Batch A, wiicam only. With the defaults the OV path is behaviourally
+    // identical, except `confidence` on the strict-reseed frame, which was
+    // wrong and is now 0; only a diagnostic line reads it. Level 5 (K6).
+    bool  veto_seed;    // refuse an implausible four-set at seed/reseed and
+                        // condemn a model the residual detector rejects
+    bool  partial_lock; // let 3-real frames advance the lock, at half rate
+    float cold_aniso_max;  // anisotropy ceiling before the rig has shown one
 };
 
 // Returns the defaults, tuned for a 240x176 sensor at ~135 fps.
@@ -43,6 +54,10 @@ QuadConfig quad_default_config(void);
 
 void       quad_reset(const QuadConfig* cfg);   // cfg may be NULL -> defaults
 QuadResult quad_update(const float* xs, const float* ys, int n);  // n <= QUAD_MAX_IN
+// State as of the last quad_update(). Both are for the CAMERA CORE only: they
+// read resolver state with no hold, so a serial-core caller can see it mid-update.
+bool       quad_locked(void);     // same flag the last QuadResult carried
+bool       quad_has_model(void);  // a rig shape has been learned
 
 // Telemetry, reset by the reader.
 struct QuadStats {
@@ -83,7 +98,8 @@ struct QuadDebugHook {
     float scr;               // any rung: h_scale(Heff)/h_scale(Hr)
     float d_hm[4];           // per reconstructed slot: |H-ladder place minus
                              // model-similarity place| in px; -1 = n/a
-    int   hr_valid, h_valid; // homography memory state after the frame
+    int   hr_valid;          // homography memory state after the frame
+    int   h_valid;           // always 0; legacy field kept so dumps stay put
     int   stuck, cbad;       // breaker / give-up clocks after the frame
 };
 extern QuadDebugHook quad_dbg;

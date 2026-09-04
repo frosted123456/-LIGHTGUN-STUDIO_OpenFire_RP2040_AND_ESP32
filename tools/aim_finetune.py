@@ -20,7 +20,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import aim_fit
 from aim_calib import (parse_q, find_gun, SerialSource, FRAME_W, FRAME_H,
-                       install_over_serial, aimcal_line, camsave_verified)
+                       install_over_serial, aimcal_line, camsave_verified,
+                       replies_clear, replies_snapshot)
 
 STEP_PX   = 4.0                 # screen px per nudge, at 1920 wide
 # 5 ms, not 2. Measured through the real resolver: on a fast sweep one 2 ms
@@ -485,11 +486,11 @@ def main():
     src = SerialSource(port, a.baud)
     src.start()
     time.sleep(0.6)
-    src.replies.clear()
+    replies_clear(src)
     src.ser.write(b"\n~aimcal?\n")
     time.sleep(1.0)
     cal = None
-    for r in src.replies:
+    for r in replies_snapshot(src):
         if r.startswith("AIM:") and "cx=" in r:
             g = {}
             for tok in r.replace("AIM:", "").split():
@@ -508,11 +509,11 @@ def main():
 
     # Seed lead and smoothing from the gun, so the first nudge steps from the
     # saved value instead of resetting it.
-    src.replies.clear()
+    replies_clear(src)
     src.ser.write(b"\n~cam?\n")
     time.sleep(0.8)
     lead0, smooth0, beta0 = 0, 3, -1
-    for r in src.replies:
+    for r in replies_snapshot(src):
         if "lead=" not in r:
             continue
         for tok in r.replace("CAM:", "").split():

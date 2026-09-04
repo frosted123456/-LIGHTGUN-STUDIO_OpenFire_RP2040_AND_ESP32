@@ -11,6 +11,9 @@ __pycache__/
 *.pyc
 *.orig
 
+# The host test suite stays local; it is run before every delivery, not in CI.
+hostcheck/
+
 # Local tool output.
 tools/aim_fit_cli
 tools/calib_out/

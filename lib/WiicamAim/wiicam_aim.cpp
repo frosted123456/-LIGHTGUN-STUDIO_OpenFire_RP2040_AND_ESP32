@@ -33,8 +33,10 @@ static void (*s_sens_set)(int) = 0;
 static int  (*s_sens_get)(void) = 0;
 static void (*s_sens_save)(void) = 0;
 static int  (*s_diag)(void) = 0;
+static void (*s_preflash)(void) = 0;   // run before the loop's own flash write
 
 void wiicam_set_diag_hook(int (*fn)(void)) { s_diag = fn; }
+void wiicam_set_preflash_hook(void (*fn)(void)) { s_preflash = fn; }
 
 void wiicam_set_line_sink(void (*fn)(const char*))  { s_line = fn; }
 void wiicam_set_reply_sink(void (*fn)(const char*)) { s_reply = fn; }
@@ -47,16 +49,10 @@ void wiicam_set_sens_hooks(void (*set_fn)(int), int (*get_fn)(void),
 __attribute__((format(printf, 1, 2)))
 static void reply(const char* fmt, ...)
 {
-    // Sized for the LONGEST reply at its widest, not for the typical one.
-    // '~camblob?' line 1 is the binding case: a ~109-byte prefix plus fourteen
-    // unsigned-long counters with their names. Those counters are not small
-    // forever -- bms is an uptime in milliseconds and reaches ten digits after
-    // 11.6 days, bframes reaches nine at 209 Hz in about eight weeks -- so the
-    // worst case is ~336 bytes and a 320-byte buffer truncates it SILENTLY,
-    // taking the br4..br0 frame buckets with it. Those buckets are what every
-    // percentage in the tools is drawn from, so the failure looks like a tool
-    // bug on a gun that has simply been left on. Measured worst observed today
-    // is 274 (a fitted-lens cam?); 512 covers the counters at full width.
+    // Sized for the LONGEST reply at its widest: '~camblob?' line 1 is a
+    // ~109-byte prefix plus fifteen unsigned-long counters at full width, about
+    // 350 bytes. A shorter buffer truncates it SILENTLY, taking the br4..br0
+    // buckets every percentage in the tools is drawn from.
     char b[512];
     va_list ap; va_start(ap, fmt);
     const int n = vsnprintf(b, sizeof(b), fmt, ap);
@@ -66,6 +62,20 @@ static void reply(const char* fmt, ...)
 }
 
 // ---- runtime state --------------------------------------------------------
+// The wiicam's resolver tuning: Batch A's vetoes on, which the OV path leaves
+// off. See /work/schema/pipeline_schematic.html, Level 5 and Order of work 1-3.
+static QuadConfig s_quad_cfg = []{
+    QuadConfig c = quad_default_config();
+    c.veto_seed    = true;
+    c.partial_lock = true;
+    // A 60 degree tilt foreshortens a rectangle to about 2:1; leave room.
+    c.cold_aniso_max = 2.6f;
+    return c;
+}();
+// quad_reset() must run on the camera core: the serial core raises this and
+// wiicam_aim_process_sz() performs it (S2).
+static volatile bool s_quad_reset_pending = false;
+
 static uint8_t  s_res  = 2;        // 0 = raw (lens sweeps), 2 = resolver
 static uint8_t  s_dash = 0;        // 0 = quiet, 2 = Q stream on
 static uint32_t s_dash_min_dt_us = 0;
@@ -260,6 +270,213 @@ static int (*s_blobreg)(int reg, int val) = 0;
 
 void wiicam_set_blobreg_hook(int (*fn)(int reg, int val)) { s_blobreg = fn; }
 
+// ---- the hwmax loop -------------------------------------------------------
+// MAXSIZE (0x06) acts before the sensor hands out its four slots, so it is the
+// only gate that can keep the sun from displacing an LED. The resolver says
+// each frame which side of it we are on; the loop moves the register on that
+// verdict and never needs its units. Shape doc Level 5, guardrails K1-K6.
+#define LOOP_DWELL      50    // frames in one dwell (about 1/4 s at 200 Hz)
+// Wall time, not frames: a parked gun's duplicate frames never reach here (K2).
+#define LOOP_RECENT_US 500000u   // 0.5 s since the last lock still counts
+#define LOOP_SETTLE      8    // frames ignored after a write, for it to land
+#define LOOP_SETTLED     4    // consecutive HOLD dwells before the value is kept
+#define LOOP_RAISE_N     5    // consecutive V_CUT frames that raise immediately (K3)
+#define LOOP_HI_UNKNOWN 256   // no value is known to admit a stray yet
+// What each sensitivity preset writes into 0x06; the loop never goes above it.
+#define LOOP_PRESET_MAX 255   // sensitivity 2
+#define LOOP_PRESET_LOW 144   // sensitivity 0 and 1
+
+enum { V_NONE = 0, V_CLEAN, V_STRAY, V_CUT };
+enum { LOOP_HOLD = 0, LOOP_LOWER, LOOP_RAISE, LOOP_NOSAFE, LOOP_OFF };
+
+// Loop state is owned by the camera core. The two flags the pump core also
+// reads/writes are volatile; a handler switching the loop off clears s_loop_on
+// FIRST so a write in flight is at worst one stale byte cam? still shows.
+static volatile bool s_loop_on = true;
+static volatile bool s_loop_store_req = false;  // settled: store hwl0 from the pump core
+static int  s_loop_preset_seen = LOOP_PRESET_MAX; // preset the current search is about
+static int  s_loop_lo    = 0;                 // highest value known to cut an LED
+static int  s_loop_hi    = LOOP_HI_UNKNOWN;   // lowest known to admit a stray
+static int  s_loop_val   = LOOP_PRESET_MAX;   // what we last asked 0x06 for
+static int  s_loop_state = LOOP_HOLD;
+static int  s_loop_dwell = 0;                 // frames into the current dwell
+static int  s_loop_settle = 0;                // frames left to ignore after a write
+static int  s_loop_cut_run = 0;               // consecutive V_CUT frames
+static int  s_loop_hold_run = 0;              // consecutive HOLD dwells
+static int  s_loop_nclean = 0, s_loop_nstray = 0, s_loop_ncut = 0;
+static volatile bool s_loop_saved = false;    // this value is in flash (set by the pump core)
+static uint64_t s_loop_last_lock_us = 0;      // last lock, caller's clock (K2)
+static bool     s_loop_ever_lock = false;
+// Boot value came from flash and no lock has vouched for it yet: a value that
+// cuts an LED never locks, so a whole dwell without a lock is the K4 evidence.
+static bool     s_loop_from_flash = false;
+
+// The value the sensitivity preset puts in 0x06, and the loop's own ceiling.
+static int loop_preset(void)
+{
+    const int lv = s_sens_get ? s_sens_get() : 2;
+    return (lv >= 2) ? LOOP_PRESET_MAX : LOOP_PRESET_LOW;
+}
+
+static void loop_new_dwell(void)
+{
+    s_loop_dwell = 0;
+    s_loop_nclean = 0; s_loop_nstray = 0; s_loop_ncut = 0;
+    s_loop_cut_run = 0;
+}
+
+// Through the existing path: the pump core does the bus write. loop_tick
+// waits for it to land, then the settle counter skips the frames still taken
+// under the old value.
+static void loop_write(int v)
+{
+    if (v < 1) v = 1;                    // 0 in MAXSIZE blinds the sensor
+    const int preset = loop_preset();
+    if (v > preset) v = preset;          // never above what the preset writes
+    s_loop_val = v;
+    s_hwmax = (int16_t)v;
+    s_hw_dirty = true;
+    s_loop_settle = LOOP_SETTLE;
+    s_loop_saved = false;                // a new value is not the saved one
+}
+
+// lo cuts an LED, hi admits a stray, nothing in between: a room problem, not
+// a threshold problem (K5). Back to the preset, which protects the LEDs.
+static void loop_nosafe(void)
+{
+    loop_write(loop_preset());
+    s_loop_state = LOOP_NOSAFE;
+    s_loop_hold_run = 0;
+    loop_new_dwell();
+}
+
+// RAISE, immediate (K3): lo moves up to the value that cut an LED, and we jump
+// to the highest value not yet known to admit a stray.
+static void loop_raise(void)
+{
+    const int preset = loop_preset();
+    // At the preset MAXSIZE cannot be what cut the LED; recording lo = preset
+    // from an off-screen glance would poison the bounds.
+    if (s_loop_val >= preset) { loop_new_dwell(); return; }
+    s_loop_lo = s_loop_val;
+    if (s_loop_hi < LOOP_HI_UNKNOWN && s_loop_hi - 1 <= s_loop_lo) {
+        loop_nosafe();
+        return;
+    }
+    int nv = (s_loop_hi < LOOP_HI_UNKNOWN) ? s_loop_hi - 1 : preset;
+    if (nv < s_loop_lo + 1) nv = s_loop_lo + 1;
+    loop_write(nv);
+    s_loop_state = LOOP_RAISE;
+    s_loop_hold_run = 0;
+    loop_new_dwell();
+}
+
+// End of a dwell: LOWER if strays got in and nothing was cut, otherwise HOLD.
+static void loop_dwell_end(void)
+{
+    if (s_loop_state == LOOP_NOSAFE) {
+        // Only a clean dwell leaves NOSAFE; the bounds are cleared because the
+        // room, not the threshold, is what changed.
+        if (s_loop_nclean >= LOOP_DWELL / 2) {
+            s_loop_lo = 0; s_loop_hi = LOOP_HI_UNKNOWN;
+            s_loop_state = LOOP_HOLD;
+            s_loop_hold_run = 0;
+            s_loop_saved = false;
+        }
+        loop_new_dwell();
+        return;
+    }
+    // K4: a saved value that never locked in a whole dwell cuts an LED. Back
+    // to the preset and record it as lo -- unless it IS the preset (a lens cap
+    // or a gun pointed away must not leave the loop NOSAFE all session).
+    if (s_loop_from_flash && !s_loop_ever_lock) {
+        s_loop_from_flash = false;
+        if (s_loop_val < loop_preset()) {
+            s_loop_lo = s_loop_val;
+            loop_write(loop_preset());
+            s_loop_state = LOOP_RAISE;
+            s_loop_hold_run = 0;
+        }
+        loop_new_dwell();
+        return;
+    }
+    if (s_loop_ncut == 0 && s_loop_nstray >= LOOP_DWELL / 2) {
+        if (s_loop_val > s_loop_lo + 1) {
+            s_loop_hi = s_loop_val;
+            loop_write((s_loop_lo + s_loop_val) / 2);
+            s_loop_state = LOOP_LOWER;
+            s_loop_hold_run = 0;
+            loop_new_dwell();
+            return;
+        }
+        // val == lo+1: the stray gets in one step above the cut, bounds met.
+        s_loop_hi = s_loop_val;
+        loop_nosafe();
+        return;
+    }
+    s_loop_state = LOOP_HOLD;
+    // Only a clean dwell counts toward settling; an indecisive one (nothing in
+    // frame) is not evidence, so flash only ever gets a value this gun aimed with.
+    if (s_loop_nclean >= LOOP_DWELL / 2 && s_loop_hold_run < LOOP_SETTLED)
+        ++s_loop_hold_run;
+    // Settled: keep it, never below what an LED has needed (K4). The flash
+    // write itself is done by the pump core (wiicam_aim_hw_tick).
+    if (s_loop_hold_run >= LOOP_SETTLED && !s_loop_saved
+        && s_loop_val > s_loop_lo)
+        s_loop_store_req = true;
+    loop_new_dwell();
+}
+
+// One judged frame: count it, then decide whether to move the register.
+static void loop_tick(int verdict)
+{
+    if (!s_loop_on) return;
+    // A write still waiting for the pump core has not landed; the frames after
+    // it lands were still taken under the old value. Neither is evidence.
+    if (s_hw_dirty) return;
+    if (s_loop_settle > 0) { --s_loop_settle; return; }
+    if      (verdict == V_CLEAN) ++s_loop_nclean;
+    else if (verdict == V_STRAY) ++s_loop_nstray;
+    else if (verdict == V_CUT)   ++s_loop_ncut;
+    ++s_loop_dwell;
+    if (verdict == V_CUT) ++s_loop_cut_run;
+    else                  s_loop_cut_run = 0;
+    // NOSAFE ignores a cut: it is sitting at the preset, where a missing
+    // corner is an off-screen gun and not something MAXSIZE can fix.
+    if (s_loop_state != LOOP_NOSAFE && s_loop_cut_run >= LOOP_RAISE_N) {
+        loop_raise();
+        return;
+    }
+    if (s_loop_dwell >= LOOP_DWELL) loop_dwell_end();
+}
+
+// A new preset, a new search: the register the loop was tuning has just been
+// rewritten under it, so every bound it found is about a sensor that no longer
+// exists. Also used by camreset and 'loop:1'.
+static void loop_reset(int val)
+{
+    s_loop_lo = 0;
+    s_loop_hi = LOOP_HI_UNKNOWN;
+    s_loop_val = val;
+    s_loop_state = LOOP_HOLD;
+    s_loop_hold_run = 0;
+    s_loop_saved = false;
+    s_loop_from_flash = false;
+    s_loop_settle = 0;
+    loop_new_dwell();
+}
+
+static const char* loop_state_name(void)
+{
+    switch (s_loop_state) {
+        case LOOP_LOWER:  return "LOWER";
+        case LOOP_RAISE:  return "RAISE";
+        case LOOP_NOSAFE: return "NOSAFE";
+        case LOOP_OFF:    return "OFF";
+        default:          return "HOLD";
+    }
+}
+
 // ---- full mode -------------------------------------------------------------
 // Kept out of the vendored driver on purpose: its receive union is 13 bytes,
 // a full report is 37, and widening a library the working build depends on to
@@ -395,6 +612,12 @@ static uint32_t s_bdrop   = 0;   // frames the resolver could not turn into a qu
 // before the symptom does. The size window's own too-tight signal is bvalve.
 static uint32_t s_bfar    = 0;
 static uint32_t s_bnear   = 0;
+// Frames where a blob far larger than the rest was held back from an unlocked
+// resolver -- a size outlier in the set, which is not a corner.
+static uint32_t s_bseedveto = 0;
+// Frames the resolver handed straight back: no model yet, or the set was
+// refused -- not a corner count, so they stay out of the buckets below.
+static uint32_t s_bcold   = 0;
 static uint32_t s_breal[5] = {0, 0, 0, 0, 0};   // frames by corners actually SEEN
 // Last frame's blobs, for '~camblob?': pipeline space, size, and whether the
 // gate kept it. Evidence first -- a gate set from a guess is worth nothing.
@@ -461,14 +684,17 @@ void wiicam_aim_format_dirty(void)
 // the sensor's settling delays and the camera poll cannot.
 void wiicam_aim_hw_tick(void)
 {
+    // The loop's settled value goes to flash from here, not from the camera
+    // poll: a flash write parks both cores, so the recoil outputs are dropped
+    // first the way camsave does it.
+    if (s_loop_store_req) {
+        s_loop_store_req = false;
+        if (s_preflash) s_preflash();
+        s_loop_saved = aim_hwloop_store(s_loop_val, s_loop_lo, s_loop_hi);
+    }
     if (!s_hw_dirty || !s_blobreg) return;
-    // Both pump sites can run this -- core 1 in Run mode, core 0 when the gun
-    // is paused or docked. A careful trace of every call site could not
-    // actually produce an interleaving where both are inside at once, so this
-    // guard may well be unnecessary; it stays because the cost is one branch
-    // and the thing it would prevent -- two masters clocking the same bus --
-    // is how a bus locks up,
-    // so the second one leaves and the request stays pending.
+    // Two masters clocking one bus is how a bus locks up; the second caller
+    // leaves and the request stays pending.
     if (s_hw_busy) return;
     s_hw_busy = true;
     // Cleared BEFORE the work, so a mark raised while this tick is running --
@@ -511,10 +737,17 @@ void wiicam_aim_hw_tick(void)
     s_hw_busy = false;
 }
 
-// Only the sensor thresholds, without disturbing the data format. Used by the
-// firmware after anything that rewrites register 0x06 behind our back -- a
-// sensitivity change from the pause menu or a profile switch does exactly that.
-void wiicam_aim_hw_dirty(void) { s_hw_dirty = true; }
+// Called by the firmware after the preset rewrote register 0x06 (the pause
+// menu, a profile switch, '~cam=sens:'). A changed preset restarts the loop's
+// search from it; the same preset re-applied gets the loop's value put back.
+void wiicam_aim_hw_dirty(void)
+{
+    s_hw_dirty = true;
+    const int p = loop_preset();
+    if (p == s_loop_preset_seen) return;
+    s_loop_preset_seen = p;
+    if (s_loop_on) { loop_reset(p); s_hwmax = WIICAM_HW_LEAVE; }
+}
 
 // ---- the relative gate ----------------------------------------------------
 // The four emitters are the same hardware driven the same way, so in any ONE
@@ -572,7 +805,7 @@ static int size_consensus_drop(const int* sz, int* keep, int n)
 
 void wiicam_aim_begin(void)
 {
-    quad_reset(0);                 // defaults are tuned for exactly this space
+    quad_reset(&s_quad_cfg);       // single-threaded at boot, so direct
     int lead = 0;
     if (aim_lead_load(&lead)) s_lead_ms = (float)lead;
     int smooth = 0;
@@ -581,10 +814,6 @@ void wiicam_aim_begin(void)
     if (aim_dead_load(&dead)) aim_dead_set(dead);
     int beta = -1;
     if (aim_beta_load(&beta)) aim_beta_set(beta);
-    int tmode = 0;
-    if (aim_tmode_load(&tmode)) aim_tmode_set(tmode);
-    int fk = 0, fp = 0;
-    if (aim_fir_load(&fk, &fp)) aim_fir_set(fk, fp);
     // The blob gate, as one unit. ext_set() rather than a bare assignment so
     // the epoch moves with it and the camera poll applies the format on its
     // first tick -- a stored format that never reaches the sensor is a read
@@ -620,6 +849,24 @@ void wiicam_aim_begin(void)
         s_lk1 = ls.k1; s_lk2 = ls.k2; s_lfpx = ls.fpx; s_lfeq = ls.feq;
         s_lcx = ls.cx; s_lcy = ls.cy;
     }
+    // G3: the capture is armed at boot, so the gun learns as you play.
+    wl_enable(1);
+    // The loop. Bounds start UNKNOWN even with a saved value: the first
+    // dwell's RAISE rule protects the LEDs (K4), not a bound from another room.
+    s_loop_on = true;
+    s_loop_last_lock_us = 0; s_loop_ever_lock = false;
+    s_loop_store_req = false;
+    s_loop_preset_seen = loop_preset();
+    loop_reset(s_loop_preset_seen);
+    {
+        int lv = 0, llo = 0, lhi = LOOP_HI_UNKNOWN;
+        if (aim_hwloop_load(&lv, &llo, &lhi) && lv > 0) {
+            loop_write(lv);
+            s_loop_state = LOOP_HOLD;
+            s_loop_saved = true;      // it came from flash, so it is still there
+            s_loop_from_flash = true; // ...but nothing has vouched for it yet
+        }
+    }
     s_prev_us = 0;
     s_cache_seen = 0xFFFFFFFFu;
     s_cache_ret = false;
@@ -654,7 +901,11 @@ static void lens_undistort(float* px, float* py)
     *px = cx + dx*k; *py = cy + dy*k;
 }
 
-static void emit_q(uint64_t now_us, const float* xs, const float* ys, int n)
+// Q,<ms>,<n>,x0,y0,..,x3,y3,<kind>,<real>,<ldx>,<ldy>: always four pairs (x10,
+// 240x176 space, -1,-1 = unused); kind r raw / p partial / c corners PRE-lead;
+// real = bit mask of pairs measured this frame; ld = the lead vector, x10.
+static void emit_q(uint64_t now_us, const float* xs, const float* ys, int n,
+                   char kind, unsigned real, float ldx, float ldy)
 {
     if (s_dash != 2 || !s_line) return;
     if (s_dash_min_dt_us && (now_us - s_dash_last_us) < s_dash_min_dt_us) return;
@@ -662,10 +913,18 @@ static void emit_q(uint64_t now_us, const float* xs, const float* ys, int n)
     char b[128];
     int o = snprintf(b, sizeof(b), "Q,%lu,%d",
                      (unsigned long)(now_us / 1000ull), n);
-    for (int i = 0; i < n && o > 0 && o < (int)sizeof(b) - 14; ++i)
-        o += snprintf(b + o, sizeof(b) - o, ",%d,%d",
-                      (int)lroundf(xs[i] * 10.0f), (int)lroundf(ys[i] * 10.0f));
-    if (o > 0 && o < (int)sizeof(b) - 2) { b[o++] = '\n'; b[o] = 0; s_line(b); }
+    for (int i = 0; i < 4 && o > 0 && o < (int)sizeof(b); ++i) {
+        if (i < n)
+            o += snprintf(b + o, sizeof(b) - o, ",%d,%d",
+                          (int)lroundf(xs[i] * 10.0f), (int)lroundf(ys[i] * 10.0f));
+        else
+            o += snprintf(b + o, sizeof(b) - o, ",-1,-1");
+    }
+    if (o > 0 && o < (int)sizeof(b))
+        o += snprintf(b + o, sizeof(b) - o, ",%c,%u,%d,%d\n", kind, real & 15u,
+                      (int)lroundf(ldx * 10.0f), (int)lroundf(ldy * 10.0f));
+    // snprintf reports the would-be length, so a truncated line is dropped whole.
+    if (o > 0 && o < (int)sizeof(b)) s_line(b);
 }
 
 bool wiicam_aim_process(const int* px, const int* py, unsigned seen,
@@ -678,6 +937,10 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
                            unsigned seen, uint64_t now_us,
                            float* sx, float* sy)
 {
+    // The serial core's quad_reset, performed here on the camera core -- and
+    // BEFORE the duplicate check, or a cached return would swallow it.
+    if (s_quad_reset_pending) { s_quad_reset_pending = false; quad_reset(&s_quad_cfg); }
+
     // A byte-identical report is the previous camera frame seen again: return
     // the cached answer and leave every stateful stage untouched.
     bool same = (seen == s_cache_seen);
@@ -806,6 +1069,8 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     s_brrej += (uint32_t)size_consensus_drop(asz, keep, an);
 
     float xs[4], ys[4];
+    int   osz[4];                        // size of each OFFERED blob, -1 = unknown
+    int   oidx[4];                       // and which s_b* entry it came from
     int n = 0;
     for (int i = 0; i < an; ++i) {
         s_bx[i]   = (int16_t)lroundf(ax[i]);
@@ -818,7 +1083,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         s_bxm[i] = s_fxm[aslot[i]];
         s_bym[i] = s_fym[aslot[i]];
         if (!keep[i]) continue;              // already tallied by its own gate
-        xs[n] = ax[i]; ys[n] = ay[i]; ++n;
+        xs[n] = ax[i]; ys[n] = ay[i]; osz[n] = asz[i]; oidx[n] = i; ++n;
     }
     // Count LAST. '~camblob?' is answered on the other core, and publishing
     // the count before the entries are written let it print a tail left over
@@ -837,15 +1102,55 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         // not, so the percentages drawn from them stopped adding up and the
         // readout froze exactly when the gun is being waved around.
         s_breal[n > 4 ? 4 : n]++;
-        emit_q(now_us, xs, ys, n);
+        emit_q(now_us, xs, ys, n, 'r', (1u << n) - 1u, 0.0f, 0.0f);
+        // This return is also what pauses the hwmax loop: with no resolver
+        // there is no verdict to read, so loop_tick does not run until 'res:2'
+        // brings the resolver back. K2's window is wall time and keeps ageing,
+        // which is right -- a lens sweep is not evidence about anything.
         return false;
     }
 
+    // Level 5's fourth check, caller-side because the sizes are: a 15 among 2s
+    // is not a corner, and the resolver is never told the sizes. Only with NO
+    // learned model -- with one, the reseed has its own vetoes -- and only the
+    // single worst offender, so three points always reach the resolver.
+    // The Batch B oracle counts what the SENSOR gave: read bn, not bsv.
+    if (an == 4 && n == 4 && !quad_has_model()
+        && osz[0] >= 0 && osz[1] >= 0 && osz[2] >= 0 && osz[3] >= 0) {
+        int v[4];
+        for (int i = 0; i < 4; ++i) v[i] = osz[i];
+        for (int i = 1; i < 4; ++i) {          // insertion sort, four values
+            const int tv = v[i];
+            int j = i - 1;
+            while (j >= 0 && v[j] > tv) { v[j + 1] = v[j]; --j; }
+            v[j + 1] = tv;
+        }
+        const int med = (v[1] + v[2]) / 2;
+        int worst = 0;
+        for (int i = 1; i < 4; ++i) if (osz[i] > osz[worst]) worst = i;
+        if (osz[worst] > med + 6) {
+            s_bkeep[oidx[worst]] = 0;      // not offered, so not 'kept' in camblob?
+            for (int i = worst; i < 3; ++i) {
+                xs[i] = xs[i + 1]; ys[i] = ys[i + 1];
+                osz[i] = osz[i + 1]; oidx[i] = oidx[i + 1];
+            }
+            n = 3;
+            ++s_bseedveto;
+        }
+    }
+
     QuadResult r = quad_update(xs, ys, n);
+    // Blobs this frame sitting far from every resolved corner. Computed in the
+    // learning block below and read by the verdict after it, so a frame that
+    // never reaches that branch honestly reads zero.
+    int nfar_frame = 0;
     // How many corners were really SEEN this frame is the honest measure of
     // how much the light is costing: a run that sits on 3 is a run where one
-    // LED is being taken from us every frame.
-    {
+    // LED is being taken from us every frame. A passthrough frame is no model
+    // yet, or the set was refused -- not a corner count, so it goes elsewhere.
+    if (r.passthrough) {
+        ++s_bcold;
+    } else {
         int nr = r.n_real;
         if (nr < 0) nr = 0;
         if (nr > 4) nr = 4;
@@ -961,6 +1266,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
                 }
                 if (dmin > gate2 * gate2) { ++nfar; jfar = i; }
             }
+            nfar_frame = nfar;
             // Exactly one, and no more. One corner is missing, so at most one
             // blob in this frame can honestly be the thing standing in its
             // place. Two or more far blobs means the resolver's own
@@ -995,19 +1301,41 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         }
     }
 
-    if (r.count < 4) { ++s_bdrop; emit_q(now_us, xs, ys, n); return false; }
+    // ---- the hwmax loop's oracle --------------------------------------
+    // K1: judged on 'an', what the SENSOR reported, before any software gate.
+    {
+        // K2: a corner missing while the gun points away is not evidence; the
+        // window is wall time so it ages while a parked gun sends duplicates.
+        const bool recent = s_loop_ever_lock
+                         && (now_us - s_loop_last_lock_us) < LOOP_RECENT_US;
+        int verdict = V_NONE;
+        if (an == 4 && r.locked && r.n_real == 4)
+            verdict = V_CLEAN;
+        else if (an == 4 && r.locked && r.count == 4 && r.n_real == 3
+                 && nfar_frame == 1)
+            verdict = V_STRAY;          // a slot went to something that is not a corner
+        else if (an == 4 && !r.locked)
+            verdict = V_STRAY;          // four sensor blobs and still no lock: also "lower"
+        else if (an <= 3 && recent)
+            verdict = V_CUT;            // a corner we had a moment ago is simply gone
+        // Right after a LOWER the value is untested and a stray-only room may
+        // never have locked, so three blobs is a cut there too (K4).
+        else if (an == 3 && s_loop_state == LOOP_LOWER)
+            verdict = V_CUT;
+        loop_tick(verdict);
+    }
+    if (r.locked) { s_loop_last_lock_us = now_us; s_loop_ever_lock = true; }
+
+    if (r.count < 4) {
+        ++s_bdrop;
+        emit_q(now_us, xs, ys, n, 'p', (1u << n) - 1u, 0.0f, 0.0f);
+        return false;
+    }
 
     // Latency lead: extrapolate the published quad along its velocity,
     // clamped; never fed back into the resolver.
     float qx[4], qy[4];
     float lx = 0.0f, ly = 0.0f;
-    // Temporal mode 1 folds the lead into the pipeline's own FIR, so publish
-    // the quad unled there; both numbers it needs come from here.
-    aim_lead_note(s_lead_ms);
-    aim_conf_note((float)r.n_real * 0.25f);
-    // Mode 1 folds the lead into the FIR inside aim_runtime_solve, which is
-    // only reached with a calibration loaded. Uncalibrated, the lead must stay
-    // here or it disappears with nothing replacing it.
     // 'locked' here for the same reason as in the learning hook above, and to
     // stop the two front ends disagreeing: the OV2640 path has always guarded
     // this identical computation with q.locked && q.n_real >= 2. Before a lock,
@@ -1017,15 +1345,24 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // two associated points -- so only the lock was missing. Cost of the guard
     // is no lead for the pre-lock frames after each quad_reset, which is the
     // conservative direction: less extrapolation, never more.
-    if ((aim_tmode_get() == 0 || !aim_runtime_active())
-        && s_lead_ms > 0.0f && dt > 1e-4f && r.locked) {
+    if (s_lead_ms > 0.0f && dt > 1e-4f && r.locked) {
         const float frames = (s_lead_ms * 1e-3f) / dt;
         lx = r.vx * frames; ly = r.vy * frames;
         const float m = sqrtf(lx*lx + ly*ly);
         if (m > WIICAM_LEAD_PX_MAX) { lx *= WIICAM_LEAD_PX_MAX/m; ly *= WIICAM_LEAD_PX_MAX/m; }
     }
+    // The wire carries the resolver's corners and the lead SEPARATELY; the
+    // solve below still runs on corners + lead, exactly as before.
+    {
+        float cx[4], cy[4];
+        unsigned real = 0;
+        for (int i = 0; i < 4; ++i) {
+            cx[i] = r.p[i].x; cy[i] = r.p[i].y;
+            if (r.p[i].real) real |= 1u << i;
+        }
+        emit_q(now_us, cx, cy, 4, 'c', real, lx, ly);
+    }
     for (int i = 0; i < 4; ++i) { qx[i] = r.p[i].x + lx; qy[i] = r.p[i].y + ly; }
-    emit_q(now_us, qx, qy, 4);
 
     if (!aim_runtime_active()) return false;
     aim_pt_t q[4];
@@ -1071,8 +1408,6 @@ bool wiicam_cam_command(const char* line)
         ok = aim_smooth_store(aim_smooth_get()) && ok;
         ok = aim_dead_store(aim_dead_get()) && ok;
         ok = aim_beta_store(aim_beta_get()) && ok;
-        ok = aim_tmode_store(aim_tmode_get()) && ok;
-        ok = aim_fir_store(aim_fir_k(), aim_fir_pct()) && ok;
         ok = (fx_store() != 0) && ok;       // recoil knobs ride the same save
         // The software gate rides it too. It has to: the first real capture
         // showed the gun holding 99.7% four-corner with rtol on, and every
@@ -1144,10 +1479,10 @@ bool wiicam_cam_command(const char* line)
         // beta rides in the reply so a tool can VERIFY what was written rather
         // than assume it; cam? reports the live value, this reports the stored one.
         reply(ok && lens_ok
-              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d fmt=%d bmin=%d bmax=%d rtol=%d bhmax=%d pxmax=%d armax=%d (sens lives in the OpenFIRE profile; the two SENSOR thresholds hwmax/hwmin are NOT saved, so a power cycle always clears them; fullreg is not saved either and comes back as 0x55)\n"
-              : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d tmode=%d firk=%d firpct=%d\n",
+              ? "CAM: saved lead=%dms smooth=%d dead=%d beta=%d lens=%d fmt=%d bmin=%d bmax=%d rtol=%d bhmax=%d pxmax=%d armax=%d (sens lives in the OpenFIRE profile; hwmin and a hand-set hwmax are NOT saved; the loop's own hwmax is saved by the loop when it settles; fullreg is not saved either and comes back as 0x55)\n"
+              : "CAM: SAVE FAILED lead=%dms smooth=%d dead=%d beta=%d lens=%d\n",
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(), aim_beta_get(),
-              (int)s_lens, aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
+              (int)s_lens,
               save_fmt,
               (int)s_bmin, (int)s_bmax, (int)s_rtol,
               (int)s_bhmax, (int)s_pxmax, (int)s_armax);
@@ -1200,7 +1535,7 @@ bool wiicam_cam_command(const char* line)
         reply("CAM: blob fmt=%u ext=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
               "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
-              "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu "
+              "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu bsv=%lu bcold=%lu "
               "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu\n",
               (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
               (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
@@ -1212,6 +1547,7 @@ bool wiicam_cam_command(const char* line)
               (unsigned long)(fx_now() / 1000ull),
               (unsigned long)s_bdrop, (unsigned long)s_bsrej,
               (unsigned long)s_bfar, (unsigned long)s_bnear,
+              (unsigned long)s_bseedveto, (unsigned long)s_bcold,
               (unsigned long)s_breal[4],
               (unsigned long)s_breal[3], (unsigned long)s_breal[2],
               (unsigned long)s_breal[1], (unsigned long)s_breal[0]);
@@ -1397,24 +1733,19 @@ bool wiicam_cam_command(const char* line)
         // MINSIZE goes to 0, the direction that cannot cost an LED.
         s_hwmax = WIICAM_HW_RESTORE; s_hwmin = WIICAM_HW_RESTORE;
         s_hw_dirty = true;
-        // The capture stops with everything else. Leaving it running past a
-        // reset would keep filling one distribution from two configurations.
-        wl_enable(0);
-        // And erase the SAVED copy. Now that the gate survives a reboot, a
-        // gate that stops the gun aiming would come back on the next boot and
-        // the one command a user reaches for when nothing works would fix the
-        // session and lose the argument.
-        // Every key is attempted whatever the others did. The first cut used
-        // && and stopped at the first failure -- so if gate0 would not erase,
-        // gate1, which holds bhmax, was never even tried, on the one command a
-        // user reaches for when the gun has gone dark.
+        // The loop starts over from the preset, and its saved value goes too,
+        // or the reset would fix the session and lose it on the next boot.
+        loop_reset(loop_preset());
+        s_loop_on = true;
+        // Erase every saved key, each attempted whatever the others did.
         bool gone = aim_gate_clear();
         gone = aim_gate2_clear() && gone;
         gone = aim_fit_clear()   && gone;
-        // The live histograms go too, or the floor outlives the reset: with
-        // fit0 erased but the capture untouched, rig_led_max_h() still read
-        // the old bar's LEDs and refused a ceiling measured for the new one.
+        gone = aim_hwloop_clear() && gone;
+        // The live histograms go too (or the floor outlives the reset), and
+        // the capture is armed as at boot (G3), so it refills from here.
         wl_reset();
+        wl_enable(1);
         reply(gone ? "CAM: lens + lead cleared, blob gates off and unsaved, "
                      "sensor thresholds restored\n"
                    : "CAM: lens + lead cleared, blob gates off, sensor "
@@ -1425,22 +1756,37 @@ bool wiicam_cam_command(const char* line)
     if (!strncmp(line, "cam?", 4)) {
         reply("CAM: board=rp2040-wiicam sens=%d mirx=%d miry=%d lead=%d "
               "smooth=%d dead=%d lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d "
-              "lcxu=%d lcyu=%d beta=%d tmode=%d firk=%d firpct=%d res=%u dash=%u "
+              "lcxu=%d lcyu=%d beta=%d res=%u dash=%u "
               "ext=%u fmt=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
-              "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d\n",
+              "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
+              "loop=%d hwv=%d hwlo=%d hwhi=%d hws=%s\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
               (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f),
               (int)(s_lcx*10.0f), (int)(s_lcy*10.0f),
-              aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
+              aim_beta_get(),
               (unsigned)s_res, (unsigned)s_dash,
               (unsigned)((s_ext_state & 3) >= WIICAM_FMT_EXT),
               (unsigned)(s_ext_state & 3), (unsigned)wiicam_aim_fullreg(),
               (unsigned)s_bmin, (unsigned)s_bmax, (unsigned)s_rtol,
               (unsigned)s_bhmax, (unsigned)s_pxmax, (unsigned)s_armax,
               (int)(s_hwmax < 0 ? -1 : s_hwmax),
-              (int)(s_hwmin < 0 ? -1 : s_hwmin));
+              (int)(s_hwmin < 0 ? -1 : s_hwmin),
+              (int)s_loop_on, s_loop_val, s_loop_lo, s_loop_hi,
+              loop_state_name());
+        return true;
+    }
+    if (!strncmp(line, "camloop?", 8)) {
+        // The whole controller in one line: where it is, what it is bracketed
+        // between, and what this dwell has seen. Read it while the gun runs --
+        // the counts are per dwell and reset with every register write.
+        reply("CAM: loop on=%d state=%s val=%d lo=%d hi=%d dwell=%d/%d "
+              "clean=%d stray=%d cut=%d settled=%d saved=%d\n",
+              (int)s_loop_on, loop_state_name(), s_loop_val, s_loop_lo,
+              s_loop_hi, s_loop_dwell, LOOP_DWELL,
+              s_loop_nclean, s_loop_nstray, s_loop_ncut,
+              (int)(s_loop_hold_run >= LOOP_SETTLED), (int)s_loop_saved);
         return true;
     }
     if (strncmp(line, "cam=", 4) != 0) return false;
@@ -1456,7 +1802,12 @@ bool wiicam_cam_command(const char* line)
         // A key with no number after the colon is a truncated or garbled line,
         // not a request to set zero. Skipped entirely rather than acted on.
         if (!have) continue;
-        if      (!strcmp(key, "res"))  { s_res = (uint8_t)(val ? 2 : 0); if (s_res) quad_reset(0); }
+        // Reset when the value CHANGES, either way -- res:0 used to leave the
+        // resolver standing. The tools re-send res:2 on every connect, and a
+        // locked gun must not lose its lock for that.
+        if      (!strcmp(key, "res"))  { const uint8_t nv = (uint8_t)(val ? 2 : 0);
+                                         if (nv != s_res) s_quad_reset_pending = true;
+                                         s_res = nv; }
         else if (!strcmp(key, "dash")) { s_dash = (uint8_t)(val < 0 ? 0 : (val > 2 ? 2 : val));
                                          if (s_dash == 2 && s_dash_min_dt_us == 0)
                                              s_dash_min_dt_us = 1000000 / 60; }
@@ -1480,9 +1831,6 @@ bool wiicam_cam_command(const char* line)
         else if (!strcmp(key, "smooth")) { aim_smooth_set(val); }
         else if (!strcmp(key, "dead"))   { aim_dead_set(val); }
         else if (!strcmp(key, "beta"))   { aim_beta_set(val); }
-        else if (!strcmp(key, "tmode"))  { aim_tmode_set(val); }
-        else if (!strcmp(key, "firk"))   { aim_fir_set(val, aim_fir_pct()); }
-        else if (!strcmp(key, "firpct")) { aim_fir_set(aim_fir_k(), val); }
         else if (!strcmp(key, "sens")) {
             if (s_sens_set && val >= 0 && val <= 2) {
                 // A capture that spans a sensitivity change is two rigs
@@ -1496,6 +1844,9 @@ bool wiicam_cam_command(const char* line)
                 // on every keypress, and a same-value repeat must cost nothing.
                 const int was = s_sens_get ? s_sens_get() : -1;
                 s_sens_set(val);
+                // The preset rewrote 0x06 under the loop: same path as the
+                // pause menu, which restarts the search from the new preset.
+                wiicam_aim_hw_dirty();
                 if (was >= 0 && was != val && wl_enabled()) {
                     wl_reset();
                     reply("CAM: learn cleared -- sensitivity changed from %d "
@@ -1642,6 +1993,11 @@ bool wiicam_cam_command(const char* line)
                     wl_reset();
                     reply("CAM: learn cleared -- hwmax changed\n");
                 }
+                // A hand-set value is a manual override: the loop stops
+                // driving the register rather than fighting the user for it.
+                s_loop_on = false;
+                s_loop_state = LOOP_OFF;
+                if (nv >= 0) s_loop_val = nv;
                 s_hwmax = nv; s_hw_dirty = true;
             } }
         else if (!strcmp(key, "hwmin")) {
@@ -1653,15 +2009,29 @@ bool wiicam_cam_command(const char* line)
             }
             s_hwmin = nv; s_hw_dirty = true;
         }
-        else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); quad_reset(0); }
-        else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); quad_reset(0); }
+        // The loop's own switch. On clears the bounds and adopts whatever the
+        // register holds; off hands the register back to the sensitivity preset.
+        else if (!strcmp(key, "loop")) {
+            if (val) {
+                loop_reset(s_hwmax >= 0 ? (int)s_hwmax : loop_preset());
+                s_loop_on = true;
+            } else {
+                s_loop_on = false;
+                s_loop_state = LOOP_OFF;
+                s_loop_val = loop_preset();
+                s_loop_saved = false;
+                s_hwmax = WIICAM_HW_RESTORE; s_hw_dirty = true;
+            }
+        }
+        else if (!strcmp(key, "mirx")) { s_mirx = (uint8_t)(val != 0); s_quad_reset_pending = true; }
+        else if (!strcmp(key, "miry")) { s_miry = (uint8_t)(val != 0); s_quad_reset_pending = true; }
     }
     s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
-    reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d tmode=%d firk=%d "
-          "firpct=%d lens=%u res=%u dash=%u ext=%u fmt=%u fullreg=%u "
+    reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d "
+          "lens=%u res=%u dash=%u ext=%u fmt=%u fullreg=%u "
           "bmin=%u bmax=%u rtol=%u bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d\n",
           s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
-          aim_beta_get(), aim_tmode_get(), aim_fir_k(), aim_fir_pct(),
+          aim_beta_get(),
           (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash,
           (unsigned)((s_ext_state & 3) >= WIICAM_FMT_EXT),
           (unsigned)(s_ext_state & 3), (unsigned)wiicam_aim_fullreg(),

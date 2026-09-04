@@ -18,7 +18,13 @@ def parse(path):
             t=int(f[1]); n=int(f[2]); v=[int(x) for x in f[3:11]]
         except ValueError: continue
         if n!=4 or min(v)<0: continue        # need all four, no -1 placeholders
-        ts.append(t); qs.append([x/10.0 for x in v])   # dash_x10 -> native px
+        q=[x/10.0 for x in v]                # dash_x10 -> native px
+        if len(f)>=15:                       # 14-field form: add the lead back, as parse_q does
+            try:
+                ldx,ldy=int(f[13])/10.0,int(f[14])/10.0
+                q=[c+(ldx if i%2==0 else ldy) for i,c in enumerate(q)]
+            except ValueError: pass
+        ts.append(t); qs.append(q)
     return np.array(ts), np.array(qs).reshape(-1,4,2)
 
 def similarity_resid(hold):

@@ -1,6 +1,6 @@
 --- a/OpenFIREmain/OpenFIREmain.ino
 +++ b/OpenFIREmain/OpenFIREmain.ino
-@@ -23,6 +23,179 @@
+@@ -23,6 +23,188 @@
  #include "OpenFIREFeedback.h"
  #include "OpenFIREprefs.h"
  #include "OpenFIREconstant.h"
@@ -30,6 +30,15 @@
 +        const size_t w = ((size_t)room < (n - off)) ? (size_t)room : (n - off);
 +        Serial.write((const uint8_t*)line + off, w);
 +        off += w;
++    }
++    // A truncated line still ends: without its '\n' the host glues the
++    // remainder onto the next reply and files the fields under the wrong key.
++    if (off < n) {
++        const uint32_t t1 = millis();
++        while ((millis() - t1) < 5u) {
++            if (Serial.availableForWrite() > 0) { Serial.write((uint8_t)'\n'); break; }
++            delay(1);
++        }
 +    }
 +}
 +static void aim_announce()
@@ -180,28 +189,20 @@
  
  // Sets up the environment
  void setup() {
-@@ -61,8 +234,19 @@
+@@ -61,8 +243,11 @@
                  OF_Prefs::profiles[i].rightOffset = 0;
              }
          
-+            // A profile with no sensitivity yet -- fresh flash, or a
-+            // rebuilt preferences block -- starts at MAX, not at the driver's
-+            // Default. Measured on the wiicam: at Default and High the blob
-+            // reports hit a hard 4-pixel floor and an LED vanishes at about
-+            // 1.8x the distance where it was full brightness, so a quarter of
-+            // all corner reports sat on the floor. Max opens the sensor's own
-+            // size limit (register 0x06, 144 -> 255) and the floor share fell
-+            // to under one percent. What Max costs -- more stray light
-+            // reported -- is what the shape gate and camfit exist to handle.
-+            // A profile that already HOLDS a sensitivity is left alone: this
-+            // only fills a blank, it never overrides a choice.
++            // A profile with no sensitivity yet starts at Max: at Default
++            // and High the wiicam's blob reports sit on a 4-pixel floor and an
++            // LED drops out early. A profile that holds a value is left alone.
              if(OF_Prefs::profiles[i].irSens > DFRobotIRPositionEx::Sensitivity_Max)
 -                OF_Prefs::profiles[i].irSens = DFRobotIRPositionEx::Sensitivity_Default;
 +                OF_Prefs::profiles[i].irSens = DFRobotIRPositionEx::Sensitivity_Max;
  
              if(OF_Prefs::profiles[i].runMode >= FW_Const::RunMode_Count)
                  OF_Prefs::profiles[i].runMode = FW_Const::RunMode_Normal;
-@@ -141,7 +325,123 @@
+@@ -141,7 +326,125 @@
      #endif // LED_ENABLE
  
      // IR camera maxes out motion detection at ~300Hz, and millis() isn't good enough
@@ -210,6 +211,11 @@
 +
 +#ifdef USE_AIM_PIPELINE
 +    aim_runtime_begin();
++    // Hooks BEFORE begin(): the hwmax loop reads the sensitivity preset at boot.
++    wiicam_set_sens_hooks(aim_sens_set, aim_sens_get, aim_sens_save);
++    wiicam_set_blobreg_hook(aim_blobreg_set);
++    wiicam_set_fullread_hook(aim_fullread);
++    wiicam_set_preflash_hook(fx_glue_shutdown);   // the loop's own flash write
 +    wiicam_aim_begin();
 +    // Recoil engine: pins from the profile; dormant until switched on.
 +    fx_glue_begin(OF_Prefs::pins[OF_Const::solenoidPin],
@@ -315,9 +321,6 @@
 +        aim_cam_give();
 +        return v;
 +    });
-+    wiicam_set_sens_hooks(aim_sens_set, aim_sens_get, aim_sens_save);
-+    wiicam_set_blobreg_hook(aim_blobreg_set);
-+    wiicam_set_fullread_hook(aim_fullread);
 +    // Install sinks at boot so replies work before the Run loop starts.
 +    aim_set_out(aim_reply_sink);
 +    wiicam_set_reply_sink(aim_reply_sink);
@@ -326,7 +329,7 @@
  
      FW_Common::OpenFIREper.source(OF_Prefs::profiles[OF_Prefs::currentProfile].adjX,
                                    OF_Prefs::profiles[OF_Prefs::currentProfile].adjY);
-@@ -165,6 +465,18 @@
+@@ -165,6 +468,18 @@
          #endif // USES_DISPLAY
  
          while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
@@ -345,7 +348,7 @@
              // Check and process serial commands, in case user needs to change EEPROM settings.
              if(Serial.available())
                  OF_Serial::SerialProcessingDocked();
-@@ -210,7 +522,12 @@
+@@ -210,7 +525,12 @@
          // skip cali if we're prematurely set to run from the above loop
          // (i.e. cal'd from Desktop)
          if(FW_Common::gunMode != FW_Const::GunMode_Run)
@@ -358,7 +361,7 @@
      } else {
          // this will turn off the DotStar/RGB LED and ensure proper transition to Run
          FW_Common::SetMode(FW_Const::GunMode_Run);
-@@ -272,6 +589,12 @@
+@@ -272,6 +592,12 @@
          // All buttons' outputs except for the trigger are processed here.
          FW_Common::buttons.Poll(0);
  
@@ -371,7 +374,7 @@
          #ifdef USES_TEMP
              if(OF_Prefs::pins[OF_Const::tempPin] > -1)
                  OF_FFB::TemperatureUpdate();
-@@ -292,6 +615,11 @@
+@@ -292,6 +618,11 @@
              FW_Common::buttons.SendReports();
          }
  
@@ -383,7 +386,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -369,6 +697,11 @@
+@@ -369,6 +700,11 @@
      }
  
      #ifdef MAMEHOOKER
@@ -395,7 +398,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
      #endif // MAMEHOOKER
  
-@@ -648,6 +981,10 @@
+@@ -648,6 +984,10 @@
      #endif // ARDUINO_ARCH_RP2040 && DUAL_CORE
  
      for(;;) {
@@ -406,7 +409,7 @@
          // Setting the state of our toggles, if used.
          // Only sets these values if the switches are mapped to valid pins.
          #ifdef USES_SWITCHES
-@@ -684,6 +1021,14 @@
+@@ -684,6 +1024,14 @@
  
          if(FW_Common::irPosUpdateTick) {
              FW_Common::irPosUpdateTick = 0;
@@ -421,7 +424,7 @@
              FW_Common::GetPosition();
          }
          #ifdef USES_DISPLAY
-@@ -723,6 +1068,11 @@
+@@ -723,6 +1071,11 @@
  
          FW_Common::buttons.Poll(0);
  
@@ -433,7 +436,7 @@
          // For processing the trigger specifically.
          // (FW_Common::buttons.debounced is a binary variable intended to be read 1 bit at a time,
          // with the 0'th point == rightmost == decimal 1 == trigger, 3 = start, 4 = select)
-@@ -739,6 +1089,11 @@
+@@ -739,6 +1092,11 @@
          }
  
          // Run through serial receive buffer once this run, if it has contents.
@@ -445,7 +448,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -821,6 +1176,14 @@
+@@ -821,6 +1179,14 @@
  
          if(FW_Common::irPosUpdateTick) {
              FW_Common::irPosUpdateTick = 0;
@@ -460,7 +463,7 @@
              FW_Common::GetPosition();
          }
      }
-@@ -934,8 +1297,14 @@
+@@ -934,8 +1300,14 @@
  // Handles events when trigger is pulled/held
  void TriggerFire()
  {

@@ -117,10 +117,13 @@ void wiicam_aim_fmt_fallback(int fmt);
 // reporting a value the sensor does not hold.
 void wiicam_set_blobreg_hook(int (*fn)(int reg, int val));
 void wiicam_aim_hw_tick(void);        // cheap; writes only when something changed
-// Mark the thresholds for rewriting without disturbing the data format. The
-// firmware calls this after anything that rewrites register 0x06 behind our
-// back -- a sensitivity change from the pause menu, or a profile switch.
+// The firmware calls this after the sensitivity preset rewrote register 0x06
+// (pause menu, profile switch, '~cam=sens:'). Re-marks the thresholds and, on
+// a changed preset, restarts the hwmax loop's search from it.
 void wiicam_aim_hw_dirty(void);
+// Run right before the hwmax loop's own flash write (its settled value), from
+// wiicam_aim_hw_tick(). The firmware installs the recoil shutdown camsave uses.
+void wiicam_set_preflash_hook(void (*fn)(void));
 
 // Camera bus ownership. Every loop that polls the sensor must skip its poll
 // while wiicam_aim_cam_held() is true and call wiicam_aim_cam_ack() instead --
@@ -133,8 +136,10 @@ void wiicam_aim_cam_ack(void);
 int  wiicam_aim_cam_acked(void);
 
 // The '~cam...' command subset for this board: cam? / camsave / camreset /
-// cam=res:..,dash:..,dashhz:..,lead:..,lens:..,lk1u:..,lk2u:..,lfpx:..,
-// lfeq:..,sens:..  Returns true if the line was handled.
+// camloop? / cam=res:..,dash:..,dashhz:..,lead:..,lens:..,lk1u:..,lk2u:..,
+// lfpx:..,lfeq:..,sens:..,loop:..  Returns true if the line was handled.
+// 'camloop?' reports the hwmax controller; 'loop:0' hands the register back to
+// the sensitivity preset, and a hand-set 'hwmax:' switches the loop off.
 bool wiicam_cam_command(const char* line);
 
 // Telemetry (Q/T lines) and replies, same split as the ESP32 build: telemetry

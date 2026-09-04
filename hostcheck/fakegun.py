@@ -61,6 +61,7 @@ def stream():
     while not stop[0]:
         if dash[0]:
             n+=1
+            # The OV/ESP32 gun's OLD 10-field Q line, kept on purpose: the tools must go on reading it.
             os.write(m,("Q,%d,4,1476,664,1807,654,1473,1290,1818,1308\n"%(n*17)).encode())
             if n%30==0: os.write(m,b"STAT,1000,135.0,0.2,0,0,thr=60 aec=40 agc=2 boost=0 y8=0\n")
             if n%45==0: os.write(m,b"T,%d\n"%(n*17))   # a simulated trigger pull

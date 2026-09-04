@@ -58,7 +58,7 @@ class FakeGun:
                 beta = (" beta=%d" % self.state["beta"]) if self.report_beta else ""
                 self.replies.append(
                     "%s thr=110 aec=300 agc=4 boost=0 lead=%dms smooth=%d "
-                    "dead=%d%s lens=%d tmode=0 firk=7 firpct=100"
+                    "dead=%d%s lens=%d"
                     % (head, self.state["lead"], self.state["smooth"],
                        self.state["dead"], beta, self.state["lens"]))
         return len(b)

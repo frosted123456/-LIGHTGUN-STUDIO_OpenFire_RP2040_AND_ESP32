@@ -8,7 +8,7 @@
 Aim at each target and pull the trigger (space or click also work), step back when
 asked. Requires pyserial, numpy, tkinter.
 """
-import argparse, json, os, queue, re, sys, threading, time
+import argparse, os, queue, re, sys, threading, time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,10 +87,39 @@ def _rig_line(session):
 _LAST_STATE = None
 
 
+def replies_snapshot(src):
+    """A copy of a source's reply buffer, under its lock when it has one
+    (the test fakes are plain lists)."""
+    snap = getattr(src, "snapshot", None)
+    return snap() if snap else list(src.replies)
+
+
+def replies_clear(src):
+    clr = getattr(src, "clear_replies", None)
+    if clr:
+        clr()
+    else:
+        src.replies.clear()
+
+
+def parse_aimcal_reply(r):
+    """The 'AIM: ... cx= ...' read-back as a dict of floats, or None for any
+    other line. AIM:-only: a CAM: line's 'lcxu=' token contains 'cx='."""
+    if not r.startswith("AIM:") or "cx=" not in r:
+        return None
+    got = {}
+    for tok in r.replace("AIM:", "").split():
+        if "=" in tok:
+            k, _, v = tok.partition("=")
+            try: got[k] = float(v)
+            except ValueError: pass
+    return got
+
+
 def install_over_serial(src, cmd, c, timeout=2.5):
     """Send the calibration and read it back to confirm the gun took it."""
     try:
-        src.replies.clear()
+        replies_clear(src)
         src.ser.write(("\n~" + cmd.lstrip("~") + "\n").encode())
         time.sleep(0.4)
         src.ser.write(b"\n~aimcal?\n")
@@ -98,16 +127,9 @@ def install_over_serial(src, cmd, c, timeout=2.5):
         return "Could not auto-send (%s); send it by hand:\n  ~%s" % (e, cmd.lstrip("~"))
     t0 = time.time()
     while time.time() - t0 < timeout:
-        for r in list(src.replies):
-            # AIM:-only: a CAM: line's "lcxu=" token contains "cx=" and would
-            # otherwise be parsed as a calibration read-back
-            if not r.startswith("AIM:") or "cx=" not in r: continue
-            got = {}
-            for tok in r.replace("AIM:", "").split():
-                if "=" in tok:
-                    k, _, v = tok.partition("=")
-                    try: got[k] = float(v)
-                    except ValueError: pass
+        for r in replies_snapshot(src):
+            got = parse_aimcal_reply(r)
+            if got is None: continue
             want_rx, want_ry = c.get('rx', 0.0), c.get('ry', 0.0)
             ok = (abs(got.get('cx', 9e9) - c['cx']) < 2e-4 and
                   abs(got.get('bx', 9e9) - c['bx']) < 2e-2 and
@@ -144,13 +166,13 @@ def camsave_verified(src, timeout=2.5, **want):
     if src is None:
         return False, "no gun connected -- NOT saved"
     try:
-        src.replies.clear()
+        replies_clear(src)
         src.ser.write(b"\n~camsave\n")
     except Exception as e:
         return False, "could not reach the gun (%s) -- NOT saved" % e
     t0 = time.time()
     while time.time() - t0 < timeout:
-        for r in list(src.replies):
+        for r in replies_snapshot(src):
             if not (r.startswith("CAM: saved")
                     or r.startswith("CAM: SAVE FAILED")):
                 continue
@@ -622,9 +644,46 @@ def parse_q(line):
     except ValueError:
         return None
     if min(v) < 0: return None
+    q = np.array(v, float).reshape(4, 2)/10.0
+    # The 14-field form carries the corners BEFORE the motion lead; adding it
+    # back gives the quad the cursor was really solved from, same as the old form.
+    if len(f) >= 15:
+        try:
+            q = q + np.array([int(f[13]), int(f[14])], float)/10.0
+        except ValueError:
+            pass
     # Returns (quad, gun_time_seconds). The gun's own clock is used for dwell,
     # capture duration and frame rate -- NOT the PC's wall clock at drain time.
-    return np.array(v, float).reshape(4, 2)/10.0, t/1000.0
+    return q, t/1000.0
+
+
+def parse_q_ex(line):
+    """Every field of a Q line, old (10-field) or new (14-field) form, as a dict:
+    t (s), n, q (pre-lead 4x2 or None unless n==4), kind r/p/c (None on the old
+    form), real (bit i = corner i measured; 15 when unknown), lead (dx, dy) px."""
+    if not line.startswith('Q,'): return None
+    f = line.strip().split(',')
+    if len(f) < 11: return None
+    try:
+        t = int(f[1]); n = int(f[2])
+        v = [int(x) for x in f[3:11]]
+    except ValueError:
+        return None
+    # Old form: a slot is "measured" when it is not the -1,-1 placeholder.
+    real = sum(1 << i for i in range(4) if v[2*i] >= 0 and v[2*i+1] >= 0)
+    out = {"t": t/1000.0, "n": n, "q": None, "kind": None, "real": real,
+           "lead": (0.0, 0.0)}
+    if n == 4 and min(v) >= 0:
+        out["q"] = np.array(v, float).reshape(4, 2)/10.0
+    if len(f) >= 15:
+        kind = f[11].strip()
+        out["kind"] = kind if kind in ("r", "p", "c") else None
+        try:
+            out["real"] = int(f[12]) & 15
+            out["lead"] = (int(f[13])/10.0, int(f[14])/10.0)
+        except ValueError:
+            pass
+    return out
 
 
 def find_gun(baud=115200):
@@ -676,6 +735,25 @@ class SerialSource(threading.Thread):
         self._armed = 0.0
         self.stop = False
         self.replies = []          # AIM: lines, so an install can be VERIFIED
+        # The reader appends from its thread while a waiter reads from the UI
+        # thread; every touch of the list goes through this lock.
+        self.lock = threading.Lock()
+        # Set by a Link that owns this source: the re-arm below then goes out
+        # through the Link's queue (want_dash) instead of straight to the port.
+        self.via_queue = False
+        self.want_dash = False
+        # Why the reader thread ended, so a front end can say more than "lost".
+        self.dead = False
+        self.dead_reason = ""
+
+    def snapshot(self):
+        """A copy of the reply buffer, taken under the lock."""
+        with self.lock:
+            return list(self.replies)
+
+    def clear_replies(self):
+        with self.lock:
+            self.replies.clear()
 
     def run(self):
         buf = b""
@@ -689,8 +767,11 @@ class SerialSource(threading.Thread):
             now = time.time()
             if (now - last_q) > 2.0 and (now - last_arm) > 2.0:
                 last_arm = now
-                try: self.ser.write(b"~cam=dash:2\n~aimcap=1\n")
-                except Exception: pass
+                if self.via_queue:
+                    self.want_dash = True      # Link.pump() queues it
+                else:
+                    try: self.ser.write(b"~cam=dash:2\n~aimcap=1\n")
+                    except Exception: pass
             # Read what has ARRIVED, not a fixed 512 bytes: read(512) blocks
             # until 512 bytes accumulate or the timeout fires, which at Q-line
             # rates is a ~200 ms burst -- the live view then updates at ~5 Hz
@@ -699,7 +780,10 @@ class SerialSource(threading.Thread):
             try:
                 nwait = self.ser.in_waiting
                 buf += self.ser.read(nwait if nwait > 0 else 1)
-            except Exception: break
+            except Exception as e:
+                self.dead_reason = "%s: %s" % (type(e).__name__, e)
+                self.dead = True
+                break
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 txt = line.decode("ascii", "replace")
@@ -708,8 +792,11 @@ class SerialSource(threading.Thread):
                     # and an AIM:-only filter silently dropped that reply --
                     # the tool then started from defaults and the first nudge
                     # stomped the saved values.
-                    self.replies.append(txt)
-                    del self.replies[:-40]
+                    # 80: a 13-line camlearn answer plus a blob pair, verdicts
+                    # and margin, so a waiter's line is not pushed out early.
+                    with self.lock:
+                        self.replies.append(txt)
+                        del self.replies[:-80]
                 elif txt.startswith("Q,"):
                     last_q = time.time()
                 try: self.q.put_nowait(txt)

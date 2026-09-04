@@ -80,18 +80,13 @@ else
 fi
 
 # The aim pipeline's own C++ suites.
-for T in aim_core_test aim_runtime_test roll_test lever_test fir_temporal_test; do
+for T in aim_core_test aim_runtime_test roll_test lever_test; do
     SRC="lib/AimPipeline/aim_core.cpp"
-    TFLAGS=""
     case "$T" in
         aim_runtime_test)
             SRC="$SRC lib/AimPipeline/aim_runtime.cpp" ;;
-        fir_temporal_test)
-            # Mode 1 is compiled out of the shipped build; its tests ask for it
-            # explicitly, so a kept negative result stays verified.
-            SRC="$SRC lib/AimPipeline/aim_runtime.cpp"; TFLAGS="-DAIM_FIR_MODE" ;;
     esac
-    if g++ -std=c++17 -O2 $TFLAGS -Ilib/AimPipeline hostcheck/$T.cpp $SRC \
+    if g++ -std=c++17 -O2 -Ilib/AimPipeline hostcheck/$T.cpp $SRC \
            -o /tmp/ov_$T -lm && /tmp/ov_$T > /tmp/ov_$T.out 2>&1 \
        && grep -q "ALL PASS" /tmp/ov_$T.out; then
         echo "$T: OK"
@@ -169,6 +164,22 @@ if g++ -std=c++17 -O2 -Ilib/QuadResolver -Ilib/OV2640Capture -Ilib/AimPipeline \
 else
     cat /tmp/ov_drift.out 2>/dev/null
     echo "no drift over a two-hour run: FAILED"; exit 1
+fi
+
+# Batch A of the resolver refactor: the seed/reseed vetoes, the three-real
+# partial lock and the cold anisotropy ceiling, each asserted with the flags ON
+# (the wiicam's s_quad_cfg) and again with them OFF (guardrail K6 -- the OV path
+# leaves them at the defaults and must not change), plus a hashed 300-frame
+# script that pins the flag-off path byte for byte.
+if g++ -std=c++17 -O2 -Wall -Wextra -Werror -Ilib/QuadResolver \
+       hostcheck/quad_veto_test.cpp lib/QuadResolver/quad_resolver.cpp \
+       -o /tmp/ov_quadveto -lm \
+   && /tmp/ov_quadveto > /tmp/ov_quadveto.out 2>&1 \
+   && grep -q "ALL PASS" /tmp/ov_quadveto.out; then
+    echo "resolver seed vetoes and partial lock (Batch A): OK"
+else
+    cat /tmp/ov_quadveto.out 2>/dev/null
+    echo "resolver seed vetoes and partial lock (Batch A): FAILED"; exit 1
 fi
 
 # The latency lead must actually move the quad, measured through the real

@@ -60,36 +60,6 @@ int  aim_beta_get(void);            // -1 when following the table
 bool aim_beta_load(int* out_beta);
 bool aim_beta_store(int beta);
 
-// Temporal mode. 0 (default) is the shipped pair: One Euro on the output plus
-// the latency lead applied to the quad in the capture layer. 1 replaces both
-// with a single causal least-squares fit over the last k samples, evaluated
-// `lead` ahead of the newest one. Mode 1 is COMPILED OUT unless AIM_FIR_MODE
-// is defined -- it lost to mode 0 on hardware, because a fixed window cannot
-// reproduce One Euro's speed-adaptive cutoff. It is kept, tested and off. Smoothing and prediction come from the same
-// fit, so the window sets the smoothing and the horizon sets the prediction
-// independently, instead of the filter's lag cancelling the lead's gain.
-void aim_tmode_set(int mode);
-int  aim_tmode_get(void);
-bool aim_tmode_load(int* out_mode);
-bool aim_tmode_store(int mode);
-
-// FIR shape, used only in mode 1. k is the window in samples (3..15; 7 is the
-// default). pct is the horizon as a percentage of the stored lead (0..140; 100
-// is the default, so the same `lead` means the same compensation in both
-// modes and switching mode is a fair comparison). Both are persisted in one NVS key.
-//
-// k is the smoothing knob and pct the prediction knob, and they are
-// independent -- which is the point, since mode 0's filter lag and lead partly
-// cancel. Note the fit is evaluated at the window's newest end, so its weights
-// are mixed-sign even at pct=0: it is a WEAKER pure noise filter than One Euro
-// at the same span, and only comes out ahead once the lead is counted, because
-// it predicts without amplifying. Do not read k as a One Euro level.
-void aim_fir_set(int k, int pct);
-int  aim_fir_k(void);
-int  aim_fir_pct(void);
-bool aim_fir_load(int* out_k, int* out_pct);
-bool aim_fir_store(int k, int pct);
-
 // The wiicam's software blob gate: report format and the three size knobs.
 // Stored together because they are one setting -- the size window means
 // nothing without a format that reports sizes, and a gate that survives a
@@ -132,15 +102,17 @@ bool aim_fit_load(int* out_led_max_h, int* out_stray_min_h, int* out_led_max_px)
 bool aim_fit_store(int led_max_h, int stray_min_h, int led_max_px);
 bool aim_fit_clear(void);
 
-// The capture layer owns the lead value and how much of the quad was really
-// seen; mode 1 needs both, so it reports them here. conf is the fraction of
-// corners MEASURED this frame (n_real/4), not the resolver's miss-damped
-// confidence. It scales the horizon: a coasting resolver is the one way a
-// mixed-sign filter can leave the range of its own inputs. Widening the
-// window lowers the noise gain at the same horizon, so a wider window is the
-// answer to a jittery prediction rather than a shorter lead.
-void aim_lead_note(float ms);
-void aim_conf_note(float conf);
+// The hwmax loop's settled value, with the two bounds it was found between --
+// its provenance. val is what the sensor's MAXSIZE register held while four
+// dwells ran clean, lo the highest value ever seen to CUT an LED and hi the
+// lowest ever seen to admit a stray (256 = never seen one, stored as 0).
+// Written only by the loop itself, never by camsave: a hand-set hwmax stays
+// unsaved, because it is the one setting that can leave a gun dark and a power
+// cycle has to remain a way out. Saving the loop's value is safe only because
+// the loop raises again on the first dwell that reads "LED cut" (K4).
+bool aim_hwloop_load(int* out_val, int* out_lo, int* out_hi);
+bool aim_hwloop_store(int val, int lo, int hi);
+bool aim_hwloop_clear(void);
 
 // Output dead-band, in final output units at the move call. Swallows
 // sub-threshold shimmer around the last SENT position; motion at or above the

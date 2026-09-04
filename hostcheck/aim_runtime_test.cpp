@@ -16,12 +16,6 @@ int main(){
     float sx,sy;
     ck(!aim_runtime_solve(q,240,176,&sx,&sy,0.0f), "solve refuses with no calibration");
 
-    printf("\ntemporal mode is off in the shipped build:\n");
-    aim_tmode_set(1);
-    ck(aim_tmode_get() == 0,
-       "mode 1 cannot be selected without -DAIM_FIR_MODE");
-    aim_tmode_set(0);
-
     printf("\nOne Euro speed sensitivity (beta):\n");
     aim_smooth_set(3);
     ck(aim_beta_get() == -1, "beta follows the smoothing table by default");

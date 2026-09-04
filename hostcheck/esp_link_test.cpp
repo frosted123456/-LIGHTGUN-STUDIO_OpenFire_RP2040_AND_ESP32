@@ -65,7 +65,7 @@ esp_err_t nvs_get_u32(nvs_handle_t, const char*, uint32_t* v) {
 // i16 values live under their own keys (lead, smoothing); the stub is
 // key-aware or the second key would silently alias the first.
 struct I16Slot { char key[16]; int16_t v; bool have; };
-static I16Slot g_i16s[8];   // lead0 smth0 dead0 tmod0 fir0, plus room
+static I16Slot g_i16s[8];   // lead0 smth0 dead0 beta0, plus room
 esp_err_t nvs_set_i16(nvs_handle_t, const char* k, int16_t v) {
     for (auto& s : g_i16s)
         if (s.have && !strcmp(s.key, k)) { s.v = v; return ESP_OK; }

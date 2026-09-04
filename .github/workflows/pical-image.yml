@@ -1,9 +1,10 @@
 name: pical
 
-# Two jobs. `test` runs the app's headless suite on every push, so a broken
-# app is caught in a minute. `image` builds the bootable USB/SD image: on a
-# tag it is attached to the release, otherwise it is uploaded as an artifact
-# so a build can be tested without cutting a release.
+# Two jobs. `smoke` proves the packaging still produces a file. `image` builds
+# the bootable USB/SD image: on a tag it is attached to the release, otherwise
+# it is uploaded as an artifact so a build can be tested without cutting a
+# release. The host test suite is not in the repository; it runs locally before
+# every delivery.
 on:
   push:
     branches: [main]
@@ -12,26 +13,10 @@ on:
       - 'pical/**'
       - 'tools/aim_calib.py'
       - 'tools/aim_fit.py'
-      - 'hostcheck/pical_render_test.py'
       - '.github/workflows/pical-image.yml'
   workflow_dispatch:
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: install deps
-        run: python -m pip install --quiet pygame numpy pyserial
-      - name: headless render + end-to-end calibration
-        env:
-          SDL_VIDEODRIVER: dummy
-          SDL_AUDIODRIVER: dummy
-        run: python hostcheck/pical_render_test.py
-
   # Packaging faults that still produce a file are caught here in seconds,
   # without downloading a 500 MB base image.
   smoke:
@@ -47,7 +32,7 @@ jobs:
         run: sudo bash pical/image/smoke.sh
 
   image:
-    needs: [test, smoke]
+    needs: [smoke]
     runs-on: ubuntu-latest
     # The release step attaches the image to the tag; new repositories give
     # GITHUB_TOKEN read-only access, which would fail that upload.

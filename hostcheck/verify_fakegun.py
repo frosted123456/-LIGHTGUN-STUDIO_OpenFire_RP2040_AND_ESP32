@@ -43,7 +43,8 @@ def tx():
             n+=1
             q=quad(tgt[0],tgt[1])
             v=np.rint(q.reshape(-1)*10).astype(int)
-            os.write(m,("Q,%d,4,%d,%d,%d,%d,%d,%d,%d,%d\n"%(n*17,*v)).encode())
+            # The wiicam's 14-field form: kind c, every corner measured, no lead.
+            os.write(m,("Q,%d,4,%d,%d,%d,%d,%d,%d,%d,%d,c,15,0,0\n"%(n*17,*v)).encode())
             time.sleep(1/60.)
         else: time.sleep(0.05)
 for f in (rx,tx): threading.Thread(target=f,daemon=True).start()

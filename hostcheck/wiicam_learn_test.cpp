@@ -1196,15 +1196,18 @@ int main()
                            "bhmax:0,pxmax:0,armax:0");
         arm_clean();
         const unsigned long r4a   = blobstat("br4=");
+        const unsigned long cold_a= blobstat("bcold=");
         const unsigned long rej_a = blobstat("brej=");
         const unsigned long srej_a= blobstat("bsrej=");
         for (int i = 0; i < PRELOCK; ++i) frame(JUNK);
 
-        ck(blobstat("br4=") == r4a + (unsigned long)PRELOCK,
-           "every one of these frames DID reach the resolver with four real "
-           "corners -- the condition the bug lived under was satisfied on all "
-           "of them, so a zero below is the 'locked' test refusing them and "
-           "not the frames quietly never arriving");
+        ck(blobstat("br4=") == r4a
+           && blobstat("bcold=") == cold_a + (unsigned long)PRELOCK,
+           "every one of these frames DID reach the resolver -- it is the seed "
+           "veto that turns them away, not a gate upstream -- and the resolver "
+           "hands them straight back as a COLD PASSTHROUGH: bcold counts all "
+           "of them and br4 none, because four blobs in a shape no rig could "
+           "produce are not four corners");
         ck(blobstat("brej=") == rej_a && blobstat("bsrej=") == srej_a,
            "...and not one gate rejected anything: all four junk blobs were "
            "kept and offered, with the size window wide open and every shape "
@@ -1237,11 +1240,14 @@ int main()
         wiicam_cam_command("cam=mirx:1");
         arm_clean();
         const unsigned long r4b = blobstat("br4=");
+        const unsigned long cold_b = blobstat("bcold=");
         for (int i = 0; i < PRELOCK; ++i) frame(JUNK);
-        ck(blobstat("br4=") == r4b + (unsigned long)PRELOCK,
-           "the same junk is four-real again after a mid-session 'mirx:' -- "
-           "the reset really did take the lock down and hand the resolver back "
-           "to its angular seed");
+        ck(blobstat("br4=") == r4b
+           && blobstat("bcold=") == cold_b + (unsigned long)PRELOCK,
+           "the same junk is a cold passthrough again after a mid-session "
+           "'mirx:' -- the reset really did take the lock down and hand the "
+           "resolver back to a cold start, where the seed veto declines the "
+           "set once more and bcold, not br4, is what moves");
         ck(wl_blobs(0) == 0u && wl_frames() == 0u,
            "...and the positive class stays empty there too: the guard is on "
            "the resolver's verdict, not on how long the gun has been running, "
@@ -2360,19 +2366,23 @@ int main()
            "outliers are and the first thing a truncation loses");
     }
 
-    // ---- camreset stops the capture too ------------------------------------
-    // It is the command a user reaches for when nothing works, and leaving the
-    // capture running past it would go on filling one distribution from two
-    // configurations -- with everything else on the gun having just changed.
+    // ---- camreset clears the capture and arms it again ------------------
+    // It is the command a user reaches for when nothing works: what was
+    // measured is about a gun that no longer exists, but the gun still has to
+    // learn as you play from here (G3), so the capture comes back armed.
     {
         arm_clean();
         frame(RIG);
         ck(wl_enabled() == 1 && wl_frames() == 1u, "a capture is running");
         g_replies.clear();
         wiicam_cam_command("camreset");
-        ck(wl_enabled() == 0, "camreset stops the capture with everything else");
+        ck(wl_enabled() == 1, "camreset leaves the capture ARMED, as boot does");
+        ck(wl_frames() == 0u && wl_blobs(0) == 0u,
+           "...and CLEARED: the frame that was in it is gone. Stopping and "
+           "keeping left the refusal floor reading the old bar's LEDs after "
+           "the one command a user reaches for to start over");
         // camreset also puts the format back to basic, so drive the plain
-        // entry point: the point is that nothing accumulates, whatever arrives.
+        // entry point: the frames after it count from zero.
         {
             int rpx[4] = {256, 768, 256, 768};
             int rpy[4] = {240, 240, 528, 528};
@@ -2383,12 +2393,10 @@ int main()
                 wiicam_aim_process(rpx, rpy, 0xF, g_t, &sx, &sy);
             }
         }
-        ck(wl_frames() == 0u && wl_blobs(0) == 0u,
-           "...and the capture is CLEARED, not merely stopped: the frame that "
-           "was in it is gone, and no frame after it is counted. It used to "
-           "stop and keep, which left the refusal floor reading the old bar's "
-           "LEDs after the one command a user reaches for to start over -- "
-           "and refusing a ceiling measured for the new one");
+        ck(wl_frames() == 3u,
+           "...and the frames after it are counted from zero (the first one "
+           "re-seeds the resolver and is not learned), so what the capture "
+           "holds is only ever about the gun as it is now");
     }
 
     printf("\nwiicam learn: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
