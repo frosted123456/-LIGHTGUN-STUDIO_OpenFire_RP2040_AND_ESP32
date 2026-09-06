@@ -133,6 +133,11 @@ python pical/pical.py                   # fullscreen, same as the stick
 python pical/pical.py --stances 2       # two distances instead of three
 ```
 
+In a window the gun's pointer is frozen on every screen that does not aim
+with it (menu, camera, lens), so your real mouse keeps working, and released
+on calibrate / fine tune / verify and when you quit. Fullscreen (the Pi) never
+freezes it -- there the gun is the only mouse.
+
 Studio remains the place for step 1 (buttons and pins, through the OpenFIRE
 app) and is the more comfortable environment for a long tuning session.
 Every step after that one is available in both.

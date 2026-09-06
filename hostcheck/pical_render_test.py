@@ -4136,6 +4136,41 @@ def main():
        and any(b"cam=res:2" in w for w in shutdown_holder["src"].ser.written),
        "shutdown turns the resolver back on (R8)")
 
+    # ---- PC mode: the gun's pointer is frozen except where it aims -----------
+    # On a PC the gun's absolute mouse pins the desktop cursor to its aim and
+    # the real mouse cannot click anything (seen: Explorer "frozen"). Windowed
+    # runs freeze it on the menu/camera screens and release it on the aiming
+    # screens and at exit; the Pi build (fullscreen) never touches it.
+    if True:
+        pygame.init()
+        surf = pygame.display.set_mode((1280, 720))   # run() above quit pygame
+        pc = pical.App(surf, stances=2, pc_mode=True)
+        attach(pc)
+        pc.step([], 0.0); to_wire(pc)
+        w = b"".join(pc.link.src.ser.written)
+        ck(b"~aimhid=0" in w, "PC mode: the menu freezes the gun's pointer")
+        n0 = w.count(b"~aimhid=")
+        pc.step([], 0.1); pc.step([], 0.2); to_wire(pc)
+        ck(b"".join(pc.link.src.ser.written).count(b"~aimhid=") == n0,
+           "...once, not every frame")
+        pc.view = pical.Verify(pc, None)     # a pointer screen; never drawn here
+        pc.step([], 0.3); to_wire(pc)
+        w = b"".join(pc.link.src.ser.written)
+        ck(w.rstrip().endswith(b"~aimhid=1") or b"~aimhid=1" in w[w.rfind(b"~aimhid=0"):],
+           "...released on a screen that aims with the gun")
+        pc.view = pical.Menu(pc)
+        pc.step([], 0.4); to_wire(pc)
+        ck(b"".join(pc.link.src.ser.written).count(b"~aimhid=0") == 2,
+           "...and frozen again back on the menu")
+        pc.pointer_rule(leaving=True); to_wire(pc)
+        ck(b"".join(pc.link.src.ser.written).endswith(b"~aimhid=1\n"),
+           "...leaving hands the cursor back to the game")
+        pi = pical.App(surf, stances=2)
+        attach(pi)
+        pi.step([], 0.0); to_wire(pi)
+        ck(b"~aimhid=" not in b"".join(pi.link.src.ser.written),
+           "the Pi build (not windowed) never freezes the pointer -- the gun is its only mouse")
+
     # ---- pygame's joystick hot-plug bug must not reach event.get() -------------
     # pygame 2.6 raises KeyError inside event.get() on a JOYDEVICEREMOVED whose
     # instance id it never mapped; a gun re-enumerating on USB took pical down

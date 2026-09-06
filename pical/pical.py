@@ -3745,11 +3745,21 @@ class Menu(RowScreen):
 # application
 # ---------------------------------------------------------------------------
 class App:
-    def __init__(self, surf, stances=3):
+    # Screens that use the gun AS the pointer. On a PC (windowed) the gun's
+    # absolute mouse otherwise pins the desktop cursor to wherever it aims,
+    # and the real mouse cannot click anything; the pointer is frozen on every
+    # other screen and released again on exit. On the Pi the gun is the only
+    # pointer, so nothing is frozen there.
+    POINTER_SCREENS = ()      # filled after the classes exist (see below)
+
+    def __init__(self, surf, stances=3, pc_mode=False):
         self.sc = Screen(surf)
         self.link = Link()
         self.inp = Input()
         self.stances = stances
+        self.pc_mode = pc_mode
+        self._pointer_sent = None      # last ~aimhid the screen rule sent
+        self._pointer_src = None
         self.session = None
         self.running = True
         self.toast = ""
@@ -4674,6 +4684,18 @@ class App:
         sc.s.blit(img, r)
 
     # ---- one frame -------------------------------------------------------
+    def pointer_rule(self, leaving=False):
+        """PC only: freeze the gun's pointer except on screens that aim with it."""
+        if not self.pc_mode or not self.link.src:
+            return
+        if self.link.src is not self._pointer_src:   # a (re)connected gun boots with it ON
+            self._pointer_src = self.link.src
+            self._pointer_sent = None
+        want = True if leaving else isinstance(self.view, App.POINTER_SCREENS)
+        if want != self._pointer_sent:
+            self._pointer_sent = want
+            self.link.pointer(want, remember=False)
+
     def step(self, events, now):
         if self._t_frame is not None and now > self._t_frame:
             self._frame_hist.append((now, now - self._t_frame))
@@ -4683,6 +4705,7 @@ class App:
             # leaves future-stamped entries the window prune never reaches.
             del self._frame_hist[:-240]
         self._t_frame = now
+        self.pointer_rule()
         acts = self.inp.actions(events, now)
         # The gun's clock went backwards: it rebooted (power dip or a firmware
         # crash). Said on stdout too, because the launcher keeps that log.
@@ -4858,6 +4881,9 @@ def pump_wait(clock, pump):
         pygame.event.pump()
 
 
+App.POINTER_SCREENS = (Calib, FineTune, Verify)
+
+
 def run(stances=3, windowed=False, port=None):
     # The HWCURSOR switch file is read HERE, not only by the launcher: the
     # launcher lives in the image's Linux filesystem, which a PC cannot edit,
@@ -4880,7 +4906,7 @@ def run(stances=3, windowed=False, port=None):
     pygame.mouse.set_visible(windowed)
     pygame.display.set_caption("Lightgun calibration")
     print("pical: SDL video driver in use: %s" % pygame.display.get_driver())
-    app = App(surf, stances)
+    app = App(surf, stances, pc_mode=windowed)
     if port is None:
         app.connect()
     else:
@@ -4940,6 +4966,7 @@ def run(stances=3, windowed=False, port=None):
         # R8: leave the resolver on -- a crash mid-sweep must not strand it off until a power cycle
         try:
             app.link.send("~cam=res:2")
+            app.pointer_rule(leaving=True)    # PC: hand the cursor back to the game
         except Exception:
             pass
         app.link.close()
