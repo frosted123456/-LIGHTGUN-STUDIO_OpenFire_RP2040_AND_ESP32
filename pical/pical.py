@@ -690,10 +690,19 @@ class Input:
 
     def __init__(self):
         pygame.joystick.init()
+        # pygame 2.6 raises KeyError inside event.get() on a JOYDEVICEREMOVED it
+        # never mapped (github pygame #3860/#4568) -- the gun re-enumerating
+        # took the whole app down. Keep those events out and poll the count.
+        try:
+            pygame.event.set_blocked([pygame.JOYDEVICEADDED,
+                                      pygame.JOYDEVICEREMOVED])
+        except Exception as e:
+            print("pical: could not block joystick hot-plug events: %s" % e)
         self.pads = []
         self.rescan()
         self._t = 0.0
         self._last = (0, 0)
+        self._count_t = 0.0
 
     def rescan(self):
         for p in self.pads:
@@ -742,8 +751,13 @@ class Input:
                     out.append("left")
                 elif e.value[0] > 0:
                     out.append("right")
-            elif e.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
-                self.rescan()
+        if now - self._count_t > 1.0:
+            self._count_t = now
+            try:
+                if pygame.joystick.get_count() != len(self.pads):
+                    self.rescan()
+            except Exception:
+                pass
         vx = vy = 0
         for p in self.pads:
             try:
@@ -3817,6 +3831,7 @@ class App:
         # The app's own frame interval, measured, so display lag stops being a
         # guess: current and the worst over the last second, in draw_hud.
         self._t_frame = None
+        self._reboots_seen = 0
         self._frame_hist = []
         self.view = Menu(self)
 
@@ -4646,6 +4661,13 @@ class App:
             del self._frame_hist[:-240]
         self._t_frame = now
         acts = self.inp.actions(events, now)
+        # The gun's clock went backwards: it rebooted (power dip or a firmware
+        # crash). Said on stdout too, because the launcher keeps that log.
+        if self.link.reboots != self._reboots_seen:
+            self._reboots_seen = self.link.reboots
+            msg = "the GUN REBOOTED (its clock restarted) -- %d so far" % self.link.reboots
+            print("pical: %s at %s" % (msg, time.strftime("%H:%M:%S")))
+            self.toast_now(msg)
         mouse = pygame.mouse.get_pos()
         if self._mpos is not None and mouse != self._mpos:
             if not self._mseen:
@@ -4849,7 +4871,12 @@ def run(stances=3, windowed=False, port=None):
     clock = pygame.time.Clock()
     try:
         while app.running:
-            events = pygame.event.get()
+            try:
+                events = pygame.event.get()
+            except SystemError as e:
+                # pygame's joystick map bug (see Input): drop the batch, keep running.
+                print("pical: pygame event error, ignored: %s" % e)
+                events = []
             for e in events:
                 if e.type == pygame.QUIT:
                     app.running = False

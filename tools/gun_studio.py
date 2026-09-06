@@ -1094,6 +1094,8 @@ class Link:
         # Optional consumers, so another front end can drive a capture session
         # from this same stream. Unused by Studio.
         self.gun_t = 0.0          # the gun's own clock, from the last frame
+        self.reboots = 0          # times the gun's clock went backwards (it rebooted)
+        self.reboot_t = 0.0       # wall clock of the last one
         self.sink = None          # called with (quad, gun_time_s)
         self.trig_sink = None     # called on a trigger marker
         self.blobs = ""           # last "CAM: blobs ..." line, raw
@@ -1541,6 +1543,12 @@ class Link:
             q, gt = pq
             self.frames += 1
             self.full_t = time.time()
+            # The gun's clock only runs forward; a jump back means it rebooted.
+            if self.gun_t > 0 and gt < self.gun_t - 1.0:
+                self.reboots += 1
+                self.reboot_t = time.time()
+                self.hist = []
+                self.trail = []
             self.gun_t = gt
             self.hist.append((gt, q))
             # The trail the previews draw: PRE-lead quad centres when the gun
@@ -4083,6 +4091,10 @@ def main():
         # and a USB soak then blamed the camera for the silence.
         alive = (getattr(link.src, "is_alive", lambda: True)()
                  if link.src else True)
+        if link.reboots != link_state.get("reboots", 0):
+            link_state["reboots"] = link.reboots
+            log("the GUN REBOOTED -- its clock restarted (%d so far). A power "
+                "dip or a firmware crash; check the USB 5 V under recoil." % link.reboots)
         if link.src and not alive and not link_state["dead"]:
             link_state["dead"] = True
             st_conn.config(text="link LOST -- replug and Reconnect", fg=C_BAD)

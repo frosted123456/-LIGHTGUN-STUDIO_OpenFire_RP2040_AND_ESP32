@@ -4087,7 +4087,25 @@ def main():
        and any(b"cam=res:2" in w for w in shutdown_holder["src"].ser.written),
        "shutdown turns the resolver back on (R8)")
 
+    # ---- pygame's joystick hot-plug bug must not reach event.get() -------------
+    # pygame 2.6 raises KeyError inside event.get() on a JOYDEVICEREMOVED whose
+    # instance id it never mapped; a gun re-enumerating on USB took pical down
+    # (last-run.log: "SystemError: <built-in function get> returned a result with
+    # an exception set"). Input blocks those two events and polls the count instead.
+    try:
+        pygame.init()
+        pygame.display.set_mode((64, 48))     # set_blocked needs a video system
+        _inp = pical.Input()
+        ck(pygame.event.get_blocked(pygame.JOYDEVICEREMOVED)
+           and pygame.event.get_blocked(pygame.JOYDEVICEADDED),
+           "Input blocks JOYDEVICEADDED/REMOVED so pygame's KeyError path is never entered")
+        ck(_inp.actions([], 5.0) == [] and _inp.actions([], 6.5) == [],
+           "...and actions() polls the joystick count on its own timer without error")
+    except Exception as e:
+        ck(False, "Input construction failed: %r" % e)
+
     pygame.quit()
+
     print("\npical: %s (%d failures)" % ("ALL PASS" if not FAILS else "FAILED",
                                          len(FAILS)))
     return 1 if FAILS else 0

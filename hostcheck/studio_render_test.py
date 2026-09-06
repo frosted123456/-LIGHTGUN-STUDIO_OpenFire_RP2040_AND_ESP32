@@ -592,6 +592,28 @@ def driver():
         errs.append("the fit lines never reached the log, which is the only "
                     "place the gun's own wording is shown: %r" % L3.replies)
 
+    # ---- a gun whose clock goes backwards has rebooted -----------------------
+    LR = gun_studio.Link()
+    LR.src = FakeSource("X")
+    QL = "Q,%d,4,300,300,1800,300,300,1400,1800,1400,c,15,0,0"
+    for t in (5000, 5010, 5020):
+        LR.src.q.put(QL % t)
+    LR.pump()
+    if LR.reboots != 0 or len(LR.hist) != 3:
+        errs.append("a forward-running gun clock counted as a reboot: %d / hist %d"
+                    % (LR.reboots, len(LR.hist)))
+    LR.src.q.put(QL % 40)          # 5.02 s -> 0.04 s: the gun restarted
+    LR.pump()
+    if LR.reboots != 1 or len(LR.hist) != 1:
+        errs.append("a gun clock jumping from 5 s back to 0.04 s was not read as "
+                    "a reboot (reboots=%d hist=%d): the one signal that "
+                    "separates a firmware crash from a flaky wire went unread"
+                    % (LR.reboots, len(LR.hist)))
+    LR.src.q.put(QL % 30)          # 10 ms of jitter is not a reboot
+    LR.pump()
+    if LR.reboots != 1:
+        errs.append("10 ms of timestamp jitter counted as a reboot")
+
     # ---- the hwmax loop, off the wire and into words ----------------------
     # The one control that acts BEFORE the sensor hands out its four slots.
     # Both reply forms are walked here rather than through the window for the

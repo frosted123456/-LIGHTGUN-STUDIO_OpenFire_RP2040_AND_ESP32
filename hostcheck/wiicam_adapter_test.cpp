@@ -6318,6 +6318,68 @@ int main()
                "path too: same-size strays, back to the preset (K5)");
         }
 
+        // (z) A BLIND sensor. A saved hwmax that lets nothing through sends the
+        // same empty report every poll; the duplicate cache swallows every one,
+        // so no frame ever reached the verdict and K4's boot correction could
+        // not fire -- the gun booted dark and stayed dark (seen on hardware).
+        boot_with(5, 2);
+        g_reg.clear();
+        wiicam_aim_hw_tick();                     // the saved 5 lands
+        {
+            LoopLine L = loopq();
+            ck(L.val == 5 && !strcmp(L.state, "HOLD") && L.saved == 1,
+               "boot writes the saved value, blind or not -- nothing has "
+               "vouched for it yet");
+        }
+        g_reg.clear();
+        for (int i = 0; i < 100; ++i) shot(0x0, 0);   // ~0.5 s of nothing seen
+        {
+            LoopLine L = loopq();
+            ck(L.val == 5 && regs06().empty(),
+               "half a second of an empty sensor is not yet a verdict -- a "
+               "gun pointed at the floor at boot must not be re-tuned");
+        }
+        for (int i = 0; i < 120; ++i) shot(0x0, 0);   // past 1 s
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(!strcmp(L.state, "RAISE") && L.val == 255 && L.lo == 5
+               && w.size() == 1 && w[0] == 255,
+               "...but a whole second of NOTHING at a value below the preset "
+               "is the cut K4 talks about: raise to the preset and record 5 as "
+               "lo, without waiting for a frame the blind sensor can never send");
+        }
+        // Same for a LOWER that blinds the sensor mid-session.
+        arm(2);
+        load_bad();
+        run(58, 0xF);                             // LOWER: val=127, hi=255
+        g_reg.clear();
+        for (int i = 0; i < 230; ++i) shot(0x0, 0);
+        {
+            LoopLine L = loopq();
+            std::vector<int> w = regs06();
+            ck(!strcmp(L.state, "RAISE") && L.lo == 127 && L.val == 254
+               && w.size() == 1 && w[0] == 254,
+               "a LOWER after which the sensor sees nothing for a second is "
+               "read as a cut too: back up to just under the stray's value");
+        }
+        // And NOT when the value is already vouched for: a locked gun that is
+        // then pointed at the ceiling holds.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=hwmax:100");      // below the preset...
+        wiicam_cam_command("cam=loop:1");         // ...adopted by the loop
+        wiicam_aim_hw_tick();
+        run(50, 0xF);                             // and locked at it
+        g_reg.clear();
+        for (int i = 0; i < 230; ++i) shot(0x0, 0);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.val == 100 && regs06().empty(),
+               "a HOLD value the gun has locked at is not touched by an empty "
+               "sensor: pointing away is not a cut");
+        }
+
         // camreset arms the capture, as boot does (G3): the loop's margin is
         // measured by it, and a reset is when it is needed most.
         wiicam_cam_command("camlearn=on:0");

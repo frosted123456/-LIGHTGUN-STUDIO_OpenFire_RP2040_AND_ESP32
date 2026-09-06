@@ -310,6 +310,8 @@ static bool     s_loop_ever_lock = false;
 // Boot value came from flash and no lock has vouched for it yet: a value that
 // cuts an LED never locks, so a whole dwell without a lock is the K4 evidence.
 static bool     s_loop_from_flash = false;
+#define LOOP_BLIND_US 1000000u
+static uint64_t s_loop_blind_us = 0;      // when a run of empty reports started
 
 // The value the sensitivity preset puts in 0x06, and the loop's own ceiling.
 static int loop_preset(void)
@@ -463,7 +465,25 @@ static void loop_reset(int val)
     s_loop_saved = false;
     s_loop_from_flash = false;
     s_loop_settle = 0;
+    s_loop_blind_us = 0;
     loop_new_dwell();
+}
+
+// A blind sensor sends the same empty report every poll and the duplicate
+// cache swallows it, so no frame ever reaches the verdict. A value the loop
+// just wrote (LOWER) or booted from flash that leaves the sensor seeing NOTHING
+// for a second has cut the LEDs (K4): raise, without waiting for a frame.
+static void loop_blind(uint64_t now_us)
+{
+    if (!s_loop_on || s_hw_dirty) return;
+    const bool untested = (s_loop_state == LOOP_LOWER)
+                       || (s_loop_from_flash && !s_loop_ever_lock);
+    if (!untested || s_loop_val >= loop_preset()) { s_loop_blind_us = 0; return; }
+    if (!s_loop_blind_us) { s_loop_blind_us = now_us; return; }
+    if (now_us - s_loop_blind_us < LOOP_BLIND_US) return;
+    s_loop_blind_us = 0;
+    s_loop_from_flash = false;
+    loop_raise();
 }
 
 static const char* loop_state_name(void)
@@ -594,6 +614,7 @@ int  wiicam_aim_cam_acked(void) { return s_cam_ack; }
 // which is what says "this many frames lost a corner in the last two seconds"
 // rather than a number that only grows.
 static uint32_t s_bframes = 0;   // frames processed
+static uint32_t s_bpolls  = 0;   // camera reads offered, duplicates included
 static uint32_t s_brej    = 0;   // blobs dropped by the absolute size window
 static uint32_t s_brrej   = 0;   // blobs dropped for not matching the others
 static uint32_t s_bvalve  = 0;   // blobs the floor had to give back: the window
@@ -940,6 +961,9 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // The serial core's quad_reset, performed here on the camera core -- and
     // BEFORE the duplicate check, or a cached return would swallow it.
     if (s_quad_reset_pending) { s_quad_reset_pending = false; quad_reset(&s_quad_cfg); }
+    // Counted before the cache: polls advancing while bframes stands still is a
+    // sensor repeating one frame; polls standing still is a poll that stopped.
+    ++s_bpolls;
 
     // A byte-identical report is the previous camera frame seen again: return
     // the cached answer and leave every stateful stage untouched.
@@ -956,9 +980,11 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             if ((seen & (1u << i)) && sizes[i] != s_cache_sz[i])
                 same = false;
     if (same) {
+        if (seen == 0) loop_blind(now_us);   // nothing seen, again
         *sx = s_cache_sx; *sy = s_cache_sy;
         return s_cache_ret;
     }
+    if (seen) s_loop_blind_us = 0;
     s_cache_seen = seen;
     for (int i = 0; i < 4; ++i) {
         s_cache_px[i] = px[i]; s_cache_py[i] = py[i];
@@ -1536,7 +1562,7 @@ bool wiicam_cam_command(const char* line)
               "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
               "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu bsv=%lu bcold=%lu "
-              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu\n",
+              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d\n",
               (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
               (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
               (unsigned)s_rtol, (unsigned)s_bhmax, (unsigned)s_pxmax, (unsigned)s_armax,
@@ -1550,7 +1576,8 @@ bool wiicam_cam_command(const char* line)
               (unsigned long)s_bseedveto, (unsigned long)s_bcold,
               (unsigned long)s_breal[4],
               (unsigned long)s_breal[3], (unsigned long)s_breal[2],
-              (unsigned long)s_breal[1], (unsigned long)s_breal[0]);
+              (unsigned long)s_breal[1], (unsigned long)s_breal[0],
+              (unsigned long)s_bpolls, (int)s_cam_hold);
         // In full mode each blob carries three more numbers -- box width, box
         // height and intensity -- so the line grows and the buffer with it.
         // Nine fields a blob in full mode, four of them added since this was
