@@ -40,23 +40,26 @@ trap cleanup EXIT
 # Partition nodes appear asynchronously; touching one before it exists is a
 # race that surfaces as "no such file or directory" on a loaded runner.
 wait_part() {
+    # The KERNEL's view is the truth: a /dev node left over from an earlier
+    # attach of the same loop device exists before the partition does, and
+    # e2fsck on it fails with "No such file or directory".
+    local name dev
+    name="$(basename "$1")"
     for _ in $(seq 1 40); do
-        [ -b "$1" ] && return 0
+        dev="$(cat "/sys/class/block/$name/dev" 2>/dev/null || true)"
+        [ -n "$dev" ] && break
         partprobe "$LOOP" >/dev/null 2>&1 || true
         partx -u "$LOOP" >/dev/null 2>&1 || true
         command -v udevadm >/dev/null 2>&1 && udevadm settle >/dev/null 2>&1
         sleep 0.25
     done
-    # No udev (container-based runners): the kernel knows the partition even
-    # when nothing populated /dev, so make the node from what sysfs reports.
-    local name dev
-    name="$(basename "$1")"
-    dev="$(cat "/sys/class/block/$name/dev" 2>/dev/null || true)"
-    if [ -n "$dev" ]; then
-        mknod "$1" b "${dev%%:*}" "${dev##*:}" 2>/dev/null || true
-        [ -b "$1" ] && return 0
+    [ -n "$dev" ] || die "partition $name never appeared"
+    # No udev (container-based runners): make or remake the node from sysfs.
+    if [ ! -b "$1" ] || [ "$(stat -c '%t:%T' "$1" 2>/dev/null)" != "$(printf '%x:%x' "${dev%%:*}" "${dev##*:}")" ]; then
+        rm -f "$1"
+        mknod "$1" b "${dev%%:*}" "${dev##*:}" || die "cannot create $1"
     fi
-    die "partition node $1 never appeared"
+    return 0
 }
 
 # Chroot mounts, made explicitly rather than with --rbind. A recursive bind of
