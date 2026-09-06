@@ -725,6 +725,9 @@ class SerialSource(threading.Thread):
         # consider it connected, but an RTS+DTR toggle can reset the chip.
         self.ser = serial.Serial()
         self.ser.port = port; self.ser.baudrate = baud; self.ser.timeout = 0.2
+        # A gun that stops servicing USB would otherwise block write() forever,
+        # and writes happen on the front end's main thread.
+        self.ser.write_timeout = 0.2
         self.ser.dtr = True; self.ser.rts = False
         self.ser.open()
         time.sleep(0.3)

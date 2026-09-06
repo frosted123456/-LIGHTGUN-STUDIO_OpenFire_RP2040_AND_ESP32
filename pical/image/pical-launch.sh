@@ -18,6 +18,11 @@ export SDL_AUDIODRIVER=dummy
 export PICAL_OUT="$APP/calib_out"
 export PYTHONUNBUFFERED=1
 
+# Keep the previous run's log: the one below starts fresh, and the run that
+# went wrong is usually the one BEFORE the reboot you are now reading from.
+[ -f "$LOG" ] && mv -f "$LOG" "$APP/last-run.prev.log"
+sync
+
 log() {
     echo "$*" | tee -a "$LOG"
     sync
@@ -107,8 +112,11 @@ if command -v xinit >/dev/null 2>&1 && [ -z "${PICAL_NO_X:-}" ]; then
     # No -nocursor: the X server's own pointer IS the low-latency path -- it
     # moves the hardware cursor from the HID report without waiting for the
     # app's frame. The app hands it the crosshair artwork and draws nothing.
-    SDL_VIDEODRIVER=x11 xinit /usr/bin/python3 "$APP/pical.py" "$@" \
-        -- :0 vt1 -keeptty >> "$LOG" 2>&1
+    # The client runs via sh so 'xset s off -dpms' (if xset exists) can turn
+    # off X's 10-minute screen blanking before the app starts.
+    SDL_VIDEODRIVER=x11 xinit /bin/sh -c \
+        'command -v xset >/dev/null 2>&1 && xset s off -dpms; exec /usr/bin/python3 "$0" "$@"' \
+        "$APP/pical.py" "$@" -- :0 vt1 -keeptty >> "$LOG" 2>&1
     RC=$?
     sync
     if [ "$RC" = "0" ]; then

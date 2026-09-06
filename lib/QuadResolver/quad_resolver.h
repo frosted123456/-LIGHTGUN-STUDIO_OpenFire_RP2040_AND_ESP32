@@ -79,6 +79,7 @@ struct QuadStats {
     uint32_t reshapes;      // locked-but-wrong assignment detected and rebuilt
     uint32_t worst_us;      // worst single quad_update(), microseconds
     uint32_t total_us;      // summed quad_update() time, microseconds
+    uint32_t giveups;       // veto_seed: a model dropped for refusing every re-acquire
 };
 QuadStats quad_take_stats(void);
 

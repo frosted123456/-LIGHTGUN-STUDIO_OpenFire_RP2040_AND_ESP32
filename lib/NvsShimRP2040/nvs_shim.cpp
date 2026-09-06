@@ -5,6 +5,12 @@
 #include <LittleFS.h>
 #include <pico/time.h>
 #include <hardware/watchdog.h>
+#include <hardware/structs/watchdog.h>
+#include <hardware/regs/watchdog.h>
+#if defined(PICO_RP2040)
+#include <hardware/structs/vreg_and_chip_reset.h>
+#include <hardware/regs/vreg_and_chip_reset.h>
+#endif
 #include "esp_system.h"
 
 static void key_path(const char* key, char* out, size_t n)
@@ -73,9 +79,29 @@ int64_t esp_timer_get_time(void)
     return (int64_t)to_us_since_boot(get_absolute_time());
 }
 
+// No watchdog is ever enabled here, so a watchdog reboot is a FORCED one
+// (UF2 upload, sClearFlash) unless the TIMER bit says otherwise. The HAD_*
+// bits are sticky across a watchdog reboot, so the watchdog is read first.
+const char* rp2040_reset_reason(void)
+{
+    const uint32_t wd = watchdog_hw->reason;
+    if (wd & WATCHDOG_REASON_TIMER_BITS) return "WDT";
+    if (wd & WATCHDOG_REASON_FORCE_BITS) return "WDT_FORCE";
+#if defined(PICO_RP2040)
+    const uint32_t cr = vreg_and_chip_reset_hw->chip_reset;
+    if (cr & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_PSM_RESTART_BITS) return "DBG";
+    if (cr & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_RUN_BITS) return "RUN";
+    if (cr & VREG_AND_CHIP_RESET_CHIP_RESET_HAD_POR_BITS) return "POR";
+#endif
+    return "UNKNOWN";
+}
+
 esp_reset_reason_t esp_reset_reason(void)
 {
-    return watchdog_caused_reboot() ? ESP_RST_WDT : ESP_RST_POWERON;
+    const uint32_t wd = watchdog_hw->reason;
+    if (wd & WATCHDOG_REASON_TIMER_BITS) return ESP_RST_WDT;
+    if (wd & WATCHDOG_REASON_FORCE_BITS) return ESP_RST_SW;
+    return ESP_RST_POWERON;
 }
 
 }

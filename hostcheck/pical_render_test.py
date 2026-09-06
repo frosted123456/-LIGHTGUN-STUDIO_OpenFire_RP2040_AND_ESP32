@@ -634,9 +634,44 @@ def main():
     app.view.sweeping = False
     app.draw_cursor(sc)
     ck(shown[-1:] == [True], "it comes back when the sweep ends")
+    # kmsdrm drops mouse focus for good when the gun aims past the screen
+    # edge, and the hardware cursor goes with it. The app must notice once,
+    # say so once, and draw the cursor itself from then on.
+    real_focused, real_grab = pygame.mouse.get_focused, pygame.event.set_grab
+    pygame.mouse.get_focused = lambda: False
+    grabs = []
+    pygame.event.set_grab = lambda v: grabs.append(bool(v))
+    app.view = pical.Menu(app)
+    app._sys_cursor, app._pump_wait, app._sys_shown = True, True, None
+    app.toast = ""
+    import io, contextlib
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        surf.fill(pical.C_BG); app.draw_cursor(sc)
+        first = lit(surf)
+        surf.fill(pical.C_BG); app.draw_cursor(sc)
+    ck(app._sys_cursor is False and app._pump_wait is False,
+       "lost mouse focus under kmsdrm switches to the drawn cursor for good")
+    ck(out.getvalue().count("hardware cursor gone") == 1,
+       "and says so once, not every frame (%r)" % out.getvalue())
+    ck("drawing it" in app.toast, "with a toast the user can see")
+    ck(grabs == [True, False], "after one grab/ungrab recovery attempt (%s)" % grabs)
+    ck(first > 50, "the drawn cursor appears on that same frame")
+    # ...and when the recovery trick works, the hardware cursor stays.
+    focus = {"n": 0}
+    def flaky():
+        focus["n"] += 1
+        return focus["n"] > 1           # False on the first ask, True after the grab
+    pygame.mouse.get_focused = flaky
+    app._sys_cursor, app._pump_wait, app._sys_shown = True, True, None
+    shown.clear()
+    surf.fill(pical.C_BG); app.draw_cursor(sc)
+    ck(app._sys_cursor is True and shown[-1:] == [True],
+       "a recovered focus keeps the hardware cursor")
+    pygame.mouse.get_focused, pygame.event.set_grab = real_focused, real_grab
     pygame.mouse.set_visible = real_vis
     pygame.mouse.get_pos = real_pos
-    app._sys_cursor, app._sys_shown = False, None
+    app._sys_cursor, app._pump_wait, app._sys_shown = False, False, None
     app.view = keep
     # the headless driver must NOT have taken that path by itself, or the Pi
     # console would silently lose its only cursor
@@ -4059,6 +4094,20 @@ def main():
     globmod.glob, builtins.open = real_glob, real_open
     ck(idx == "1", "picks the connected card, not the render node (got %s)" % idx)
     ck(picked and "card1" in picked, "and names the device it chose")
+    # SDL's index is the N in cardN, not the position in the listing.
+    fake = {"/dev/dri/card*": ["/dev/dri/card1", "/dev/dri/card2"],
+            "/sys/class/drm/card1-*/status": [],
+            "/sys/class/drm/card2-*/status": ["/sys/class/drm/card2-HDMI-A-1/status"]}
+    globmod.glob = lambda p: fake.get(p, [])
+    builtins.open = lambda p, *a, **k: (io.StringIO("connected\n")
+                                        if "card2-HDMI" in str(p)
+                                        else real_open(p, *a, **k))
+    os.environ.pop("SDL_KMSDRM_DEVICE_INDEX", None)
+    picked = pical.pick_drm_device()
+    idx = os.environ.pop("SDL_KMSDRM_DEVICE_INDEX", None)
+    globmod.glob, builtins.open = real_glob, real_open
+    ck(idx == "2", "card1+card2: the index is the card number, not the "
+       "list position (got %s)" % idx)
 
     # ---- R8: shutdown must turn the resolver back on ----------------------
     # A crash or a window close mid-sweep must not strand the gun at res:0.

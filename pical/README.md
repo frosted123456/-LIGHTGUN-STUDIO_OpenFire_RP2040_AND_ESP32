@@ -103,7 +103,7 @@ undo):
 
 | file | effect |
 |---|---|
-| `HWCURSOR` | moves the cursor on the display chip's own cursor layer, at input-pump rate instead of frame rate. Less cursor lag; costs CPU. If the cursor disappears, delete the file |
+| `HWCURSOR` | moves the cursor on the display chip's own cursor layer, at input-pump rate instead of frame rate. Less cursor lag; costs CPU. If the display driver loses the cursor (it can, when aiming past the screen edge), the app notices, says so in the log, and goes back to drawing the cursor by itself for the rest of the run |
 | `NOKMS` | skips the direct display path and starts the X server, where the server moves the cursor from the gun's reports like a desktop does |
 
 Even so, to compare filter settings by feel, save them to the gun, quit, and

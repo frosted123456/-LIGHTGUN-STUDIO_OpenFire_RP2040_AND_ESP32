@@ -86,7 +86,7 @@
                              GetPosition();
                          }
  
-@@ -648,11 +699,120 @@
+@@ -648,11 +699,129 @@
  void FW_Common::GetPosition()
  {
      if(dfrIRPos != nullptr) {
@@ -152,11 +152,14 @@
 +        static int      aim_fx[4], aim_fy[4], aim_fsz[4];
 +        static unsigned aim_fseen = 0;
 +        int error;
-+        if(aim_fmt == WIICAM_FMT_FULL)
-+            error = wiicam_aim_full_poll(aim_fx, aim_fy, aim_fsz, &aim_fseen)
-+                  ? DFRobotIRPositionEx::Error_Success
-+                  : DFRobotIRPositionEx::Error_IICerror;
-+        else
++        if(aim_fmt == WIICAM_FMT_FULL) {
++            // -1 is a torn frame (the two reads never matched): dropped like
++            // the driver's own DataMismatch, not a bus error that latches.
++            const int fr = wiicam_aim_full_poll(aim_fx, aim_fy, aim_fsz, &aim_fseen);
++            error = (fr > 0) ? DFRobotIRPositionEx::Error_Success
++                  : (fr < 0) ? DFRobotIRPositionEx::Error_DataMismatch
++                             : DFRobotIRPositionEx::Error_IICerror;
++        } else
 +            error = (aim_fmt == WIICAM_FMT_EXT)
 +                  ? dfrIRPos->extendedAtomic(DFRobotIRPositionEx::Retry_2)
 +                  : dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
@@ -165,6 +168,9 @@
 +#endif
          if(error == DFRobotIRPositionEx::Error_Success) {
 +#ifdef USE_AIM_PIPELINE
++            // A good read clears the latch: a flash write or a probe that
++            // tripped it must not leave the gun reported as camera-less.
++            camNotAvailable = false;
 +            // Calibrated aim pipeline; falls through to the stock path when
 +            // no calibration is loaded. The seen() mask is applied inside
 +            // the adapter. Sizes are handed over only when the sensor is
@@ -193,7 +199,10 @@
 +                    aim_ok = true;
 +                }
 +            }
-+            if(!aim_ok) {
++            // A loaded calibration whose resolver refused this frame HOLDS
++            // the cursor: the stock warp would jump it to an uncalibrated spot.
++            const bool aim_hold = !aim_ok && aim_runtime_active();
++            if(!aim_ok && !aim_hold) {
 +#else
 +            // Same names for the stock build, so the warp below has exactly
 +            // one way to reach the sensor data whichever way this is compiled.
@@ -208,7 +217,7 @@
                  OpenFIREper.warp(OpenFIREdiamond.X(0), OpenFIREdiamond.Y(0),
                                  OpenFIREdiamond.X(1), OpenFIREdiamond.Y(1),
                                  OpenFIREdiamond.X(2), OpenFIREdiamond.Y(2),
-@@ -661,7 +821,7 @@
+@@ -661,7 +830,7 @@
                                  res_y / 2, res_x / 2,
                                  res_y, res_x, res_y / 2);
              } else {
@@ -217,7 +226,7 @@
                  OpenFIREper.warp(OpenFIREsquare.X(0), OpenFIREsquare.Y(0),
                                  OpenFIREsquare.X(1), OpenFIREsquare.Y(1),
                                  OpenFIREsquare.X(2), OpenFIREsquare.Y(2),
-@@ -699,6 +859,9 @@
+@@ -699,6 +868,9 @@
                  default:
                      break;
                  }
@@ -227,7 +236,7 @@
  
              // Constrain that bisch so negatives don't cause underflow
              int32_t conMoveX = constrain(mouseX, 0, res_x);
-@@ -753,9 +916,18 @@
+@@ -753,9 +925,28 @@
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  
@@ -239,17 +248,27 @@
 +                // frozen. Dead-band (~cam=dead:N): swallow sub-threshold
 +                // shimmer around the last sent position; motion at or above
 +                // the threshold passes with zero added delay.
-+                if(aim_runtime_hid_enabled() && aim_dead_pass(conMoveX, conMoveY))
-+#endif
++                if(!aim_hold && aim_runtime_hid_enabled()
++                   && aim_dead_pass(conMoveX, conMoveY))
++                {
++                    // Never exactly 32767: SDL's kmsdrm backend drops mouse
++                    // focus for good at x == width, and the cursor is gone.
++                    if(buttons.analogOutput)
++                         Gamepad16.moveCam(conMoveX, conMoveY);
++                    else AbsMouse5.move(min(conMoveX, (int32_t)32766),
++                                        min(conMoveY, (int32_t)32766));
++                }
++#else
 +                {
 +                    if(buttons.analogOutput)
 +                         Gamepad16.moveCam(conMoveX, conMoveY);
 +                    else AbsMouse5.move(conMoveX, conMoveY);
 +                }
++#endif
  
              } else {
                  if(gunMode == FW_Const::GunMode_Verification) {
-@@ -970,6 +1142,13 @@
+@@ -970,6 +1161,13 @@
      }
  
      if(dfrIRPos != nullptr) dfrIRPos->sensitivityLevel((DFRobotIRPositionEx::Sensitivity_e)sensitivity);

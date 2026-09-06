@@ -75,6 +75,10 @@ int partial_phase = 0;
 const int BAN_FRAMES = 120;             // ~0.6s at 200fps
 float banned_x[4], banned_y[4];
 int   banned_ttl = 0;
+// veto_seed: frames in a row a valid model has refused four offered blobs. A
+// model that cannot re-acquire anything gives way, or the gun never locks again.
+const int REACQ_GIVEUP = 40;
+int   reacq_fail = 0;
 
 // Squared distance between two points.
 inline float d2(float ax, float ay, float bx, float by) {
@@ -513,6 +517,7 @@ void quad_reset(const QuadConfig* cfg)
     consec_bad = 0;
     reshape_bad = 0;
     stuck_cnt = 0;
+    reacq_fail = 0;
     partial_phase = 0;
     banned_ttl = 0;
 }
@@ -557,6 +562,22 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     if (live < 4) {
         bool got = false;
         if (n >= 4) got = reseed_with_model(xs, ys, n);
+        // A model refusing every four-set for REACQ_GIVEUP frames is a model
+        // of something no longer in view; drop it and let seed() start over
+        // (the ban still keeps a condemned set out).
+        if (C.veto_seed) {
+            if (!got && model_valid && n >= 4) {
+                if (++reacq_fail >= REACQ_GIVEUP) {
+                    reacq_fail = 0;
+                    model_valid = false;
+                    for (int i = 0; i < 4; ++i) { MX[i] = MY[i] = 0.0f; }
+                    env_aniso_max = 1.0f; env_valid = false;
+                    ST.giveups++;
+                }
+            } else {
+                reacq_fail = 0;
+            }
+        }
         // angular seed ONLY when there is no learned model: a failed re-acquire
         // must not overwrite MX/MY with whatever four blobs are in frame
         if (!got && n == 4 && !model_valid) got = seed(xs, ys);

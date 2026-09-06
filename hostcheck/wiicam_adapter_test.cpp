@@ -160,7 +160,8 @@ esp_err_t nvs_get_u32(nvs_handle_t, const char* k, uint32_t* v){
 esp_err_t nvs_commit(nvs_handle_t){ return ESP_OK; }
 void nvs_close(nvs_handle_t){}
 esp_err_t nvs_flash_init(void){ return ESP_OK; }
-int64_t esp_timer_get_time(void){ return 0; }
+static int64_t g_fake_us = 0;     // the pump core's clock, for hw_tick's back-off
+int64_t esp_timer_get_time(void){ return g_fake_us; }
 }
 
 static std::vector<std::string> g_lines, g_replies;
@@ -949,10 +950,39 @@ int main()
         wiicam_aim_hw_tick();
         g_reg_fail = false;
         g_reg.clear();
+        g_fake_us += 1100000;                   // past the retry back-off
         wiicam_aim_hw_tick();
         ck(g_reg.size() == 1 && g_reg[0].second == 44,
            "a write refused because the camera was down is retried later, not "
            "forgotten while cam? claims it landed");
+
+        // ...but not on the very next loop. With the sensor dead each attempt
+        // costs up to ~260 ms of bus waits, and retrying every tick starved
+        // core 1 -- buttons, HID, serial -- down to a few Hz.
+        static int g_refusals;
+        g_refusals = 0;
+        wiicam_set_blobreg_hook([](int, int) -> int { ++g_refusals; return 0; });
+        wiicam_cam_command("cam=hwmax:45");
+        for (int i = 0; i < 100; ++i) {
+            wiicam_aim_hw_tick();
+            g_fake_us += 9000;                  // 100 ticks inside one second
+        }
+        ck(g_refusals == 1,
+           "a refused write is not retried for a second: 100 ticks inside it "
+           "reach the sensor once");
+        g_fake_us += 1000000;
+        wiicam_aim_hw_tick();
+        ck(g_refusals == 2, "and once more after the back-off");
+        wiicam_set_blobreg_hook([](int reg, int val) -> int {
+            if (g_reg_fail) return 0;
+            g_reg.push_back(std::make_pair(reg, val));
+            return 1;
+        });
+        g_fake_us += 1100000;
+        g_reg.clear();
+        wiicam_aim_hw_tick();
+        ck(g_reg.size() == 1 && g_reg[0].second == 45,
+           "and lands once the sensor answers again");
 
         // Zero in MAXSIZE is a dark gun, and it is where a typo lands.
         g_replies.clear();
@@ -1157,10 +1187,11 @@ int main()
         for (int i = 0; i < 4; ++i) { fpx[i] = fpy[i] = fsz[i] = -777; }
         fseen = 0xDEADu;
         g_fcalls = 0; g_fdrift = 1;
-        ck(wiicam_aim_full_poll(fpx, fpy, fsz, &fseen) == 0,
+        ck(wiicam_aim_full_poll(fpx, fpy, fsz, &fseen) == -1,
            "a frame that differs on every read is dropped, not published -- "
            "full mode must not be more permissive than the two formats it "
-           "stands in for");
+           "stands in for -- and reported as -1, a torn frame, NOT the 0 of a "
+           "bus error that would latch camNotAvailable on a healthy gun");
         ck(g_fcalls == 3,
            "and it gives up after ONE retry -- three reads, never a spin");
         ck(fseen == 0xDEADu && fpx[0] == -777 && fsz[0] == -777,

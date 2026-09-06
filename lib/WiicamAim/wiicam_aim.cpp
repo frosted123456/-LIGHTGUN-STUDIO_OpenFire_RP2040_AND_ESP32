@@ -34,9 +34,11 @@ static int  (*s_sens_get)(void) = 0;
 static void (*s_sens_save)(void) = 0;
 static int  (*s_diag)(void) = 0;
 static void (*s_preflash)(void) = 0;   // run before the loop's own flash write
+static void (*s_postflash)(void) = 0;  // and after it: give the camera bus back
 
 void wiicam_set_diag_hook(int (*fn)(void)) { s_diag = fn; }
 void wiicam_set_preflash_hook(void (*fn)(void)) { s_preflash = fn; }
+void wiicam_set_postflash_hook(void (*fn)(void)) { s_postflash = fn; }
 
 void wiicam_set_line_sink(void (*fn)(const char*))  { s_line = fn; }
 void wiicam_set_reply_sink(void (*fn)(const char*)) { s_reply = fn; }
@@ -556,7 +558,9 @@ int wiicam_aim_full_poll(int* px, int* py, int* sizes, unsigned* seen)
         if (!memcmp(a + 1, b + 1, WIICAM_FULL_LEN - 1)) matched = 1;
         else memcpy(a, b, WIICAM_FULL_LEN);
     }
-    if (!matched) return 0;
+    // -1, not 0: a torn frame is a dropped frame, not a bus fault. Reported
+    // as 0 it latched camNotAvailable on a gun whose wiring is fine.
+    if (!matched) return -1;
     *seen = 0;
     // Cleared for every slot, not just the ones that report: an unseen slot
     // must read as "no box measured", never as last frame's box.
@@ -712,8 +716,15 @@ void wiicam_aim_hw_tick(void)
         s_loop_store_req = false;
         if (s_preflash) s_preflash();
         s_loop_saved = aim_hwloop_store(s_loop_val, s_loop_lo, s_loop_hi);
+        if (s_postflash) s_postflash();
     }
     if (!s_hw_dirty || !s_blobreg) return;
+    // A refused write is not retried for a second: with the sensor dead each
+    // attempt costs up to ~260 ms of bus waits, which starved core 1's
+    // buttons and HID down to a few Hz until the sensor came back.
+    static uint64_t s_hw_retry_us = 0;
+    const uint64_t hw_now = fx_now();
+    if (s_hw_retry_us && (int64_t)(hw_now - s_hw_retry_us) < 0) return;
     // Two masters clocking one bus is how a bus locks up; the second caller
     // leaves and the request stays pending.
     if (s_hw_busy) return;
@@ -755,6 +766,7 @@ void wiicam_aim_hw_tick(void)
     // Re-marked on failure, so a write refused because the camera was down is
     // tried again rather than forgotten while cam? claims it landed.
     if (!done) s_hw_dirty = true;
+    s_hw_retry_us = done ? 0 : hw_now + 1000000ull;
     s_hw_busy = false;
 }
 

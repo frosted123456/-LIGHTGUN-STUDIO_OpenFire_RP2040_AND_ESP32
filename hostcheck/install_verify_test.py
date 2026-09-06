@@ -110,6 +110,30 @@ if src.snapshot():
     fails.append("clear_replies() left lines behind")
 print("reply buffer: 80 kept, copied out under the lock, death reason %r" % src.dead_reason[:40])
 
+# The port is opened with a WRITE timeout too: a gun that stops servicing USB
+# would otherwise block write() forever, on the front end's main thread.
+import sys, types
+class RecordingSerial:
+    def __init__(self): self.written = []
+    def open(self): pass
+    def write(self, b): self.written.append(b)
+fake_serial = types.ModuleType("serial"); fake_serial.Serial = RecordingSerial
+real_serial = sys.modules.get("serial")
+sys.modules["serial"] = fake_serial
+try:
+    real_sleep = A.time.sleep; A.time.sleep = lambda s: None
+    try:
+        src2 = A.SerialSource("FAKEPORT")
+    finally:
+        A.time.sleep = real_sleep
+finally:
+    if real_serial is not None: sys.modules["serial"] = real_serial
+    else: del sys.modules["serial"]
+if getattr(src2.ser, "write_timeout", None) != 0.2 or src2.ser.timeout != 0.2:
+    fails.append("SerialSource did not set both timeouts: read=%r write=%r"
+                 % (getattr(src2.ser, "timeout", None), getattr(src2.ser, "write_timeout", None)))
+print("serial port: read timeout %r, write timeout %r" % (src2.ser.timeout, src2.ser.write_timeout))
+
 for f in fails: print("  [FAIL]", f)
 print("install verification: %s" % ("ALL PASS" if not fails else "FAILED"))
 sys.exit(1 if fails else 0)

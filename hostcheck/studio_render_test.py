@@ -421,6 +421,85 @@ def driver():
         errs.append("connect kept state from the previous gun: %r / %r"
                     % (L2.last, L2.blobs))
 
+    # A known port is tried BEFORE any scan: find_gun() takes seconds and
+    # pical calls connect() every 5 s from its frame loop while the gun is away.
+    scans = []
+    real_find = gun_studio.find_gun
+    gun_studio.find_gun = lambda *a, **k: scans.append(1) or "FAKE1"
+    L2b = gun_studio.Link()
+    ok = L2b.connect("X")
+    if not ok or scans or L2b.port != "X":
+        errs.append("connect(port) scanned before trying the port: ok=%r scans=%r"
+                    % (ok, scans))
+    class NoSuchPort(FakeSource):
+        def __init__(self, port, baud=115200):
+            if port == "GONE": raise OSError("no such port")
+            FakeSource.__init__(self, port, baud)
+    gun_studio.SerialSource = NoSuchPort
+    L2c = gun_studio.Link()
+    ok = L2c.connect("GONE")
+    if not ok or scans != [1] or L2c.port != "FAKE1":
+        errs.append("a dead port did not fall back to ONE scan: ok=%r scans=%r port=%r"
+                    % (ok, scans, L2c.port))
+    gun_studio.SerialSource = FakeSource
+    gun_studio.find_gun = real_find
+
+    # A write that times out (a gun that stopped taking USB) is counted and
+    # dropped, never raised into the frame loop.
+    import serial as _serial
+    class HungSerial(FakeSerial):
+        def write(self, b): raise _serial.SerialTimeoutException("Write timeout")
+    L2d = gun_studio.Link(); L2d.src = FakeSource("H"); L2d.src.ser = HungSerial()
+    try:
+        L2d.send("~ping"); L2d.pump()
+    except Exception as e:
+        errs.append("a write timeout escaped the frame loop: %r" % e)
+    if L2d.send_fails != 1 or L2d.pending():
+        errs.append("a timed-out write was not counted and dropped: fails=%d pending=%d"
+                    % (L2d.send_fails, L2d.pending()))
+
+    # A late "pointer FROZEN" reply to an EARLIER freeze must not undo the
+    # release sent after it -- and the same the other way round.
+    L2e = gun_studio.Link(); L2e.src = FakeSource("P")
+    L2e.pointer(False); L2e.pointer(True)
+    L2e.src.q.put("CAM: pointer FROZEN"); L2e.pump()
+    if L2e.hid_on is not True:
+        errs.append("a late FROZEN reply overrode the release sent after it")
+    L2e.src.q.put("CAM: pointer ON"); L2e.pump()
+    if L2e.hid_on is not True:
+        errs.append("the matching ON reply was not accepted")
+    L2e.pointer(True); L2e.pointer(False)
+    L2e.src.q.put("CAM: pointer ON"); L2e.pump()
+    if L2e.hid_on is not False:
+        errs.append("a late ON reply overrode the freeze sent after it")
+    L2e.src.q.put("CAM: pointer FROZEN"); L2e.pump()
+    if L2e.hid_on is not False:
+        errs.append("the matching FROZEN reply was not accepted")
+    L2f = gun_studio.Link(); L2f.src = FakeSource("P2")
+    L2f.src.q.put("CAM: pointer FROZEN"); L2f.pump()
+    if L2f.hid_on is not False:
+        errs.append("with nothing sent, the gun's own word on the pointer was ignored")
+
+    # Quads are pruned by gun time, so after the stream stops the previews
+    # would show the last 2 s forever; the wall clock clears them.
+    L2g = gun_studio.Link(); L2g.src = FakeSource("S")
+    wall = {"t": 5000.0}
+    L2g.wall = lambda: wall["t"]
+    for i in range(10):
+        L2g.src.q.put("Q,%d,4,1000,600,1800,610,1010,1300,1810,1310" % (7000 + i * 10))
+    L2g.pump()
+    n_live = len(L2g.hist)
+    wall["t"] += 1.0; L2g.pump()
+    n_soon = len(L2g.hist)
+    wall["t"] += 2.0; L2g.pump()
+    n_late = len(L2g.hist)
+    if n_live != 10 or n_soon != 10:
+        errs.append("quads were dropped while the stream was still fresh: %d/%d"
+                    % (n_live, n_soon))
+    if n_late or L2g.trail:
+        errs.append("3 s after the last Q line the previews still had %d quads, "
+                    "%d trail points" % (n_late, len(L2g.trail)))
+
     # ---- '~camfit', parsed off the wire ------------------------------------
     # The gun's answer to "what height gate can THIS rig have" is several
     # lines, and ANY of them can be absent: three of the four outcomes are a
@@ -1799,6 +1878,12 @@ def driver():
             if "SIZE" not in logged or "full detail" not in logged:
                 errs.append("starting outside full mode did not warn that "
                             "only size would fill: %r" % logged[-300:])
+            # The gun answers the '~camlearn?' the click sent. Without an
+            # answer the 700 ms sync would put the button back to the gun's
+            # LAST word (off) whenever it happened to tick before this check.
+            for ln in learn_lines(1, 12, 40, 1, {(0, "sz"): [1] * 32}):
+                link.src.q.put(ln)
+            settle(1.4)
             if str(btn_learn.cget("text")) != "Stop learning":
                 errs.append("the button did not become a stop: %r"
                             % btn_learn.cget("text"))

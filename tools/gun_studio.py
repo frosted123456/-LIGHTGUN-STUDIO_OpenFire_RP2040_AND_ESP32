@@ -1088,6 +1088,7 @@ class Link:
         self.last = {}
         self.replies = []
         self.hid_on = True        # the gun boots this way; we do not change it uninvited
+        self._hid_want = None     # the last ~aimhid= value sent; None = never asked
         self.partial_t = 0.0      # wall clock of the last <4-LED frame
         self.partial_n = 0        # running count of <4-LED frames
         self.full_t = 0.0         # wall clock of the last 4-LED frame
@@ -1129,6 +1130,7 @@ class Link:
         self.polls_skipped = 0    # poll=True lines dropped rather than piled up
         self.wrote = 0            # lines that reached the port
         self.clock = time.monotonic
+        self.wall = time.time     # wall clock for the frame ages (tests swap it)
 
     # How long the wire is held after a write, by command prefix; anything
     # else gets HOLD_DEFAULT. Flash writes and camera rebuilds need the long ones.
@@ -1143,7 +1145,13 @@ class Link:
         raises inside SerialSource, and that exception used to die in Tk's
         callback with the header stuck on "looking for the gun...". A gun
         that re-enumerated on a NEW port is found by falling back to a scan."""
-        for cand in (port or find_gun(), None if port is None else find_gun()):
+        # The known port first, and the scan (seconds, on the calling thread)
+        # only if that fails: pical retries this every 5 s from its frame loop.
+        def candidates():
+            if port:
+                yield port
+            yield find_gun()
+        for cand in candidates():
             if not cand:
                 continue
             try:
@@ -1242,6 +1250,9 @@ class Link:
             return len(self._outq)
 
     def _write(self, line):
+        # A write timeout (SerialTimeoutException, a gun that stopped taking
+        # USB) drops the line like any other failure; it must never block or
+        # raise, because this runs on the front end's frame loop.
         try:
             self.src.ser.write(("\n%s\n" % line).encode())
         except Exception:
@@ -1312,6 +1323,7 @@ class Link:
         frozen until they replug."""
         if remember:
             self.hid_on = on
+        self._hid_want = bool(on)
         self.send("~aimhid=%d" % (1 if on else 0))
 
     def feed_loop(self, line):
@@ -1450,9 +1462,14 @@ class Link:
                 # (x, y, size, kept) and belong together, not as loose keys.
                 if line.startswith("CAM: blobs"):
                     self.blobs = line.strip()
-                # keep the label honest if the gun disagrees with us
-                if "pointer FROZEN" in line: self.hid_on = False
-                elif "pointer ON" in line:   self.hid_on = True
+                # keep the label honest if the gun disagrees with us -- but a
+                # late reply to an EARLIER ~aimhid= (the gun answers in its own
+                # time) must not undo the value we sent last.
+                if "pointer FROZEN" in line: said = False
+                elif "pointer ON" in line:   said = True
+                else:                        said = None
+                if said is not None and self._hid_want in (None, said):
+                    self.hid_on = said
                 # Any CAM:/pong/ack line may carry k=v state -- the old
                 # "CAM: thr=" prefix missed the wiicam's "CAM: board=" readback
                 # AND the ping's board tag, so Studio never learned the board
@@ -1535,18 +1552,18 @@ class Link:
                 if line.startswith("Q,"):
                     try:
                         if 0 <= int(line.split(",")[2]) < 4:
-                            self.partial_t = time.time()
+                            self.partial_t = self.wall()
                             self.partial_n += 1
                     except (ValueError, IndexError):
                         pass
                 continue
             q, gt = pq
             self.frames += 1
-            self.full_t = time.time()
+            self.full_t = self.wall()
             # The gun's clock only runs forward; a jump back means it rebooted.
             if self.gun_t > 0 and gt < self.gun_t - 1.0:
                 self.reboots += 1
-                self.reboot_t = time.time()
+                self.reboot_t = self.wall()
                 self.hist = []
                 self.trail = []
             self.gun_t = gt
@@ -1562,6 +1579,11 @@ class Link:
         # thread, and a read-then-index on the live attribute lost the race --
         # the IndexError killed the tick loop and froze the whole live panel.
         h = self.hist
+        # Pruned by GUN time, so once the stream stops the last 2 s would sit
+        # in the previews forever; the wall clock clears them instead.
+        if h and self.wall() - self.full_t > 2.0:
+            h = []
+            self.trail = []
         cut = h[-1][0] - 2.0 if h else 0
         self.hist = [x for x in h if x[0] >= cut][-400:]
         self.trail = [x for x in self.trail if x[0] >= cut][-400:]

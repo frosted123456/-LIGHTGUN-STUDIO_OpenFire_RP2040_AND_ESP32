@@ -71,7 +71,8 @@ void wiicam_set_fullread_hook(int (*fn)(unsigned char* buf, int len));
 
 // One full-mode poll. Fills px/py/sizes/seen exactly as the driver's
 // extendedAtomic would, and keeps each blob's box and intensity for the
-// report. Returns 1 when a frame was read, 0 on a bus error or no hook.
+// report. Returns 1 when a frame was read, 0 on a bus error or no hook, and
+// -1 when the two reads never matched (a torn frame: drop it, the bus is fine).
 int  wiicam_aim_full_poll(int* px, int* py, int* sizes, unsigned* seen);
 
 // The byte written to the mode register (0x33) to select full mode.
@@ -124,6 +125,8 @@ void wiicam_aim_hw_dirty(void);
 // Run right before the hwmax loop's own flash write (its settled value), from
 // wiicam_aim_hw_tick(). The firmware installs the recoil shutdown camsave uses.
 void wiicam_set_preflash_hook(void (*fn)(void));
+// Run right after that write. The firmware gives the camera bus back here.
+void wiicam_set_postflash_hook(void (*fn)(void));
 
 // Camera bus ownership. Every loop that polls the sensor must skip its poll
 // while wiicam_aim_cam_held() is true and call wiicam_aim_cam_ack() instead --

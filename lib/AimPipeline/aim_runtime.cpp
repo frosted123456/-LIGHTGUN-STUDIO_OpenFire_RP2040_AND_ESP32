@@ -794,7 +794,9 @@ uint32_t aim_uptime_s(void)
 
 const char* aim_reset_reason(void)
 {
-#if defined(AIM_HAVE_STORE)
+#if defined(ARDUINO_ARCH_RP2040)
+    return rp2040_reset_reason();   // POR / RUN / WDT_FORCE / WDT, from the shim
+#elif defined(AIM_HAVE_STORE)
     switch (esp_reset_reason()) {
         case ESP_RST_POWERON:   return "POWERON";
         case ESP_RST_SW:        return "SW";

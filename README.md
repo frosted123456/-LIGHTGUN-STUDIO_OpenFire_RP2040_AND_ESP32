@@ -597,7 +597,7 @@ All are prefixed `~` on the native USB port.
 
 | Command | Effect |
 |---|---|
-| `~ping` | Alive check — board, calibration state, uptime, boot count, reset reason |
+| `~ping` | Alive check — board, calibration state, uptime, boot count, reset reason (RP2040: `rst=POR` power-on/brown-out, `RUN` reset pin, `WDT_FORCE` forced reboot such as a UF2 upload, `WDT` watchdog timer) |
 | `~aimcal?` | Print the active calibration |
 | `~aimcal=...` | Install and save a calibration |
 | `~aimhid=0` / `=1` | Freeze / release the cursor (never saved) |

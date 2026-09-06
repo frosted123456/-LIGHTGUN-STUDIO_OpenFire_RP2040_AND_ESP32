@@ -4521,6 +4521,17 @@ class App:
         """
         want = (self._mseen and self.link.hid_on
                 and not getattr(self.view, "hide_cursor", False))
+        if self._sys_cursor and self._pump_wait and not pygame.mouse.get_focused():
+            # kmsdrm drops mouse focus for good the first time the gun aims
+            # past the screen edge; the cursor plane hides with it. Try the
+            # one known way back, else draw the cursor for the rest of the run.
+            if self._refocus():
+                self._sys_shown = None        # the trick left it visible; redo below
+            else:
+                print("pical: SDL lost mouse focus at the screen edge -- "
+                      "hardware cursor gone, drawing it instead")
+                self.toast_now("hardware cursor lost -- drawing it instead")
+                self._sys_cursor, self._pump_wait, self._sys_shown = False, False, None
         if self._sys_cursor:
             # set_visible on every frame would spam SDL; only on a change
             if want != self._sys_shown:
@@ -4531,6 +4542,18 @@ class App:
             return
         x, y = pygame.mouse.get_pos()
         sc.crosshair(x, y, sc.h * 0.022, C_RING, dot=True)
+
+    @staticmethod
+    def _refocus():
+        """One attempt to get mouse focus back from SDL; True if it worked."""
+        try:
+            pygame.event.set_grab(True)
+            pygame.mouse.set_visible(False)
+            pygame.mouse.set_visible(True)
+            pygame.event.set_grab(False)
+            return bool(pygame.mouse.get_focused())
+        except Exception:
+            return False
 
     def draw_noise(self, sc, y):
         """The blob noise floor and what it means, in one line."""
@@ -4778,8 +4801,14 @@ def pick_drm_device():
     cards = sorted(glob.glob("/dev/dri/card*"))
     if len(cards) < 2:
         return None                       # nothing to disambiguate
-    for i, dev in enumerate(cards):
+    for dev in cards:
         name = os.path.basename(dev)
+        # SDL wants the N of cardN, not the position in the listing: a Pi
+        # with card1 and card2 (no card0) has no index 0 at all.
+        try:
+            i = int(name[len("card"):])
+        except ValueError:
+            continue
         for st in sorted(glob.glob("/sys/class/drm/%s-*/status" % name)):
             try:
                 with open(st) as fh:
