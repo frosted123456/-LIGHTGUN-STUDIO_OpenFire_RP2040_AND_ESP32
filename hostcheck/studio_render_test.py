@@ -1228,6 +1228,9 @@ def driver():
         # 130,140 in the 240x176 pipeline is at 69,76 in the sensor's 128x96
         # array, so a 11x9 box whose origin is 64,72 has its centre within a
         # pixel of the crosshair. That agreement is the measurement.
+        # These origins are written unmirrored, so this fake gun has mirx off
+        # (the box is flipped into the position's frame when mirx is on).
+        link.last["mirx"] = 0
         for ln in (
             "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 bhmax=10 "
             "pxmax=14 armax=20 hwmax=-1 "

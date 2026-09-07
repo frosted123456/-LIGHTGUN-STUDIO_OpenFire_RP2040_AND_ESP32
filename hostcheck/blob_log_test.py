@@ -128,7 +128,7 @@ def main():
     # gun's 240x176 pipeline. Mapping one into the other is the only check
     # there is, and it has to be right or it will report a fault that is not
     # there -- or miss one that is.
-    s = blob_shape((120, 88, 3, 1, 11, 9, 60, 58, 43))
+    s = blob_shape((120, 88, 3, 1, 11, 9, 60, 58, 43), mirx=False)
     ck(abs(s["cross"][0] - 120 * NATIVE_W / 240.0) < 1e-9
        and abs(s["cross"][1] - 88 * NATIVE_H / 176.0) < 1e-9,
        "the reported position maps into the sensor's array by 128/240 and "
@@ -147,7 +147,19 @@ def main():
     ck(s["off"] is not None and s["off"] < 1.0,
        "a box whose centre lands on the crosshair reports no offset -- which "
        "is what says the box fields ARE in this array: %r" % s["off"])
-    far = blob_shape((120, 88, 3, 1, 11, 9, 60, 5, 5))
+    # The gun mirrors X in the reported position but sends the box origin raw.
+    # A real row off the gun (mirx=1): blob at x=172 in 240-space, box origin
+    # xm=35 w=5 in the sensor array -- comparable only once the box is flipped.
+    real = blob_shape((172, 77, 1, 1, 5, 1, 11, 35, 42), mirx=True)
+    raw = blob_shape((172, 77, 1, 1, 5, 1, 11, 35, 42), mirx=False)
+    ck(real["off"] < 3.0 and raw["off"] > 50.0,
+       "with the gun's mirror applied to the box, a real row's box lands on "
+       "its crosshair (%.1f px); unmirrored it sits on the far side (%.1f px) "
+       "-- the crossed red lines in the shape panel" % (real["off"], raw["off"]))
+    ck(real["box"][0] == NATIVE_W - 1 - 35 - 5,
+       "...the flipped box spans 127-xm-w .. 127-xm, the same flip the "
+       "firmware applies to the position")
+    far = blob_shape((120, 88, 3, 1, 11, 9, 60, 5, 5), mirx=False)
     ck(far["off"] > SHAPE_OFF_MAX,
        "and a box parked somewhere else reports an offset past the limit, "
        "which is the only evidence there is that the units are wrong: %r"

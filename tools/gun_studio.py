@@ -411,8 +411,12 @@ GATE_HEAVY_PER_FRAME = 1.0
 GATE_WARN_STALE_S = 8.0
 
 
-def blob_shape(b):
+def blob_shape(b, mirx=True, miry=False):
     """One blob's geometry for the preview, in the sensor's native 128x96 array.
+
+    The reported position has the gun's mirror applied; the box origin comes
+    straight off the wire, unmirrored. mirx/miry (the gun's settings) flip the
+    box into the position's frame so the two can be compared at all.
 
     Returns a dict, or None for a blob with no shape in it at all:
 
@@ -452,15 +456,35 @@ def blob_shape(b):
     area = (w + 1) * (h + 1)
     out["density"] = px / float(area)
     if len(b) >= 9:
-        out["box"] = (float(b[7]), float(b[8]), float(w), float(h))
+        left, top = float(b[7]), float(b[8])
+        if mirx:
+            left = NATIVE_W - 1 - left - w
+        if miry:
+            top = NATIVE_H - 1 - top - h
+        out["box"] = (left, top, float(w), float(h))
         out["origin"] = True
-        cx = b[7] + w / 2.0
-        cy = b[8] + h / 2.0
+        cx = left + w / 2.0
+        cy = top + h / 2.0
         out["off"] = ((cx - cross[0]) ** 2 + (cy - cross[1]) ** 2) ** 0.5
     else:
         out["box"] = (cross[0] - w / 2.0, cross[1] - h / 2.0,
                       float(w), float(h))
     return out
+
+
+def mirror_x(link):
+    """The gun's mirror-X setting as last read (on by default on the wiicam)."""
+    try:
+        return int(link.last.get("mirx", 1)) != 0
+    except (TypeError, ValueError):
+        return True
+
+
+def mirror_y(link):
+    try:
+        return int(link.last.get("miry", 0)) != 0
+    except (TypeError, ValueError):
+        return False
 
 
 def preview_quad(link):
@@ -2076,7 +2100,7 @@ def main():
         assumed = 0
         boxed = 0
         for b in blobs:
-            s = blob_shape(b)
+            s = blob_shape(b, mirror_x(link), mirror_y(link))
             if s is None:
                 continue
             if s["kept"]:

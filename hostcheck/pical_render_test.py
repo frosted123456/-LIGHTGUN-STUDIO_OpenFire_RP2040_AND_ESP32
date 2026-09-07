@@ -1452,6 +1452,7 @@ def main():
     # background and its 32-pixel grid are lit too, so a bare threshold would
     # pass on a panel that drew no blobs at all.
     app.link.last["fmt"] = 2
+    app.link.last["mirx"] = 0      # blob9 writes unmirrored origins
     app.link.blobs = "CAM: blobs"
     texts_of(cam3)
     bare = paint(cam3.shape_rect)

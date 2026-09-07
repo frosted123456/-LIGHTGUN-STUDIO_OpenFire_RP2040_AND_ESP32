@@ -44,7 +44,8 @@ from gun_studio import (BlobLog, CAM_RANGE, FrameRate, LENS_KEYS,
                         Link, QUIET_REARM_S, auto_tune, parse_blobs,
                         quiet_plan, sigma_gates, write_shape_csv,
                         GATE_HEAVY_PER_FRAME, NATIVE_W, NATIVE_H,
-                        PREVIEW_LEGEND, SHAPE_OFF_MAX, blob_shape, preview_quad)
+                        PREVIEW_LEGEND, SHAPE_OFF_MAX, blob_shape, preview_quad,
+                        mirror_x, mirror_y)
 
 # The shared serial layer lives in tools/ beside this file, and this file is
 # routinely copied onto the stick ON ITS OWN. When only pical.py is updated,
@@ -163,7 +164,7 @@ def recording_path(prefix, ext=".csv"):
 # ---------------------------------------------------------------------------
 # what a blob actually looked like, in the sensor's own pixels
 # ---------------------------------------------------------------------------
-def box_position_gap(blobs):
+def box_position_gap(blobs, mirx=True, miry=False):
     """Worst distance between a box centre and its own reported position.
 
     In sensor pixels, or None when no blob carried a box origin to compare.
@@ -175,7 +176,7 @@ def box_position_gap(blobs):
     """
     worst = None
     for b in blobs:
-        s = blob_shape(b)
+        s = blob_shape(b, mirx, miry)
         if s is None or s["off"] is None:
             continue
         worst = s["off"] if worst is None else max(worst, s["off"])
@@ -1990,7 +1991,7 @@ class Camera(RowScreen):
             # in words as well as drawing, because it is a conclusion, not a
             # reading -- and it is the answer to the question the panel was
             # added to settle.
-            gap = box_position_gap(parsed)
+            gap = box_position_gap(parsed, mirror_x(link), mirror_y(link))
             if gap is not None and gap > SHAPE_OFF_MAX:
                 out.append("BOX AND POSITION DISAGREE by %.1f of 128 px -- "
                            "box units wrong, or a lens correction is moving "
@@ -2194,7 +2195,7 @@ class Camera(RowScreen):
         boxed = False
         for i, b in enumerate(blobs[:4]):
             tag = "ABCD"[i]
-            s = blob_shape(b)
+            s = blob_shape(b, mirror_x(self.app.link), mirror_y(self.app.link))
             if s is None:
                 continue
             (bx, by), box, dens = s["cross"], s["box"], s["density"]
