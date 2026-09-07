@@ -4032,6 +4032,7 @@ class App:
         self._gun_t0 = None
         if not rebooted:
             return
+        self.ask_why_rebooted()
         held = self._cam_borrow is not None or self._cam_arm is not None
         # Dropped, never restored: nothing is SENT to put the old state back,
         # because the gun that would receive it is not the gun the state was
@@ -4050,6 +4051,13 @@ class App:
         else:
             self.toast_now("the gun RESTARTED -- anything it had measured is "
                            "gone")
+
+    def ask_why_rebooted(self):
+        """Ask for the reset reason. The pong carries up= boots= rst= (POR,
+        RUN, WDT, WDT_FORCE), the only evidence a reboot at the TV leaves
+        behind; it is written to stdout -- lastrun.log -- when it arrives."""
+        self.link.send("~ping")
+        self._want_pong = True
 
     def cam_borrow(self):
         """Take what the LED measurement needs -- after asking what is there.
@@ -4857,6 +4865,7 @@ class App:
             msg = "the GUN REBOOTED (its clock restarted) -- %d so far" % self.link.reboots
             print("pical: %s at %s" % (msg, time.strftime("%H:%M:%S")))
             self.toast_now(msg)
+            self.ask_why_rebooted()
         mouse = pygame.mouse.get_pos()
         if self._mpos is not None and mouse != self._mpos:
             if not self._mseen:
@@ -4877,6 +4886,13 @@ class App:
                     self.view.save_now()
         self.link_tick(now)
         self.link.pump()
+        # The reset reason asked for on a reboot, logged the frame it lands.
+        if getattr(self, "_want_pong", False):
+            pong = self.link.last.get("pong_line")
+            if pong and pong != getattr(self, "_pong_seen", None):
+                self._pong_seen = pong
+                self._want_pong = False
+                print("pical: %s" % pong.strip())
         # A calibration read that is waiting on the gun, before the view gets
         # to act on this frame's keys.
         self.calib_tick(time.monotonic())

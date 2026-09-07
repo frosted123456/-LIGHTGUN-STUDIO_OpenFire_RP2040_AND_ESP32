@@ -32,6 +32,7 @@ QuadConfig  C;
 Slot        S[4];
 float       MX[4], MY[4];     // rig model, centroid-normalised
 bool        model_valid;
+uint32_t    identity_epoch = 0;   // bumped whenever the four slots are (re)bound
 int         lock_count;
 bool        locked;
 QuadStats   ST;
@@ -419,6 +420,61 @@ bool reseed_with_model(const float* xs, const float* ys, int n, bool strict = fa
     stuck_cnt   = 0;                                 // old streaks must not bill it
     partial_phase = 0;
     ST.reseeds++;
+    ++identity_epoch;
+    return true;
+}
+
+// Re-acquire from THREE of the blobs, the fourth corner reconstructed. The
+// sensor has four object slots; a stray that holds one for minutes (a sun
+// streak, seen on the Pi) means the sensor never reports all four LEDs at
+// once, and a re-acquire that needs four matching blobs never comes -- after
+// REACQ_GIVEUP the model is dropped and the angular seed takes the three LEDs
+// plus the streak as a rig. Every 3-subset against every placement on three
+// of the four model corners (24 per subset), a similarity fit: three points
+// leave it two degrees of freedom to be wrong in, which a triangle with a
+// stray in it is. Accepted only with a residual under RESHAPE_RESID_PX; the
+// four-set search runs first, so any set whose fourth blob really sits on the
+// fourth corner was taken there. reseed3 in QuadConfig.
+bool reseed3_with_model(const float* xs, const float* ys, int n)
+{
+    if (!model_valid || n < 3) return false;
+    float best = 1e18f; float bx[4], by[4]; bool have = false;
+    int c[3];
+    for (c[0] = 0; c[0] < n - 2; ++c[0])
+    for (c[1] = c[0] + 1; c[1] < n - 1; ++c[1])
+    for (c[2] = c[1] + 1; c[2] < n; ++c[2]) {
+        // slots (s0, s1, s2) for blobs (c0, c1, c2): 4*3*2 placements
+        for (int s0 = 0; s0 < 4; ++s0)
+        for (int s1 = 0; s1 < 4; ++s1)
+        for (int s2 = 0; s2 < 4; ++s2) {
+            if (s0 == s1 || s0 == s2 || s1 == s2) continue;
+            const int idx[3] = { s0, s1, s2 };
+            float ox[4] = {0, 0, 0, 0}, oy[4] = {0, 0, 0, 0};
+            ox[s0] = xs[c[0]]; oy[s0] = ys[c[0]];
+            ox[s1] = xs[c[1]]; oy[s1] = ys[c[1]];
+            ox[s2] = xs[c[2]]; oy[s2] = ys[c[2]];
+            Lin2 L; float cmx, cmy, cox, coy;
+            if (!fit_similarity(idx, 3, ox, oy, &L, &cmx, &cmy, &cox, &coy)) continue;
+            const float r = fit_residual(L, cmx, cmy, cox, coy, idx, 3, ox, oy);
+            if (r > RESHAPE_RESID_PX || r >= best) continue;
+            // the fourth corner is the model's, through the same similarity:
+            // convex by construction, since the model is
+            const int s3 = 6 - s0 - s1 - s2;
+            lin2_apply(L, cmx, cmy, cox, coy, s3, &ox[s3], &oy[s3]);
+            best = r; have = true;
+            for (int i = 0; i < 4; ++i) { bx[i] = ox[i]; by[i] = oy[i]; }
+        }
+    }
+    if (!have) return false;
+    for (int i = 0; i < 4; ++i) {
+        S[i].x = bx[i]; S[i].y = by[i];
+        S[i].vx = 0; S[i].vy = 0; S[i].live = true; S[i].miss = 0;
+    }
+    lock_count = 1;
+    Hr_valid = false;
+    reshape_bad = 0; stuck_cnt = 0; partial_phase = 0;
+    ST.reseeds++;
+    ++identity_epoch;
     return true;
 }
 
@@ -482,6 +538,7 @@ bool seed(const float* xs, const float* ys)
     reshape_bad = 0; stuck_cnt = 0;                  // fresh clocks
     partial_phase = 0;
     banned_ttl = 0;                                  // a different set got in
+    ++identity_epoch;
     return true;
 }
 
@@ -504,12 +561,19 @@ QuadConfig quad_default_config(void)
     c.partial_lock   = false;
     c.cold_aniso_max = ANISO_FLOOR;   // the existing floor
     c.seed_wratio    = 0.0f;          // off: the OV path offers no widths
+    c.gate_cap_ratio    = 0.0f;       // off
+    c.assoc_ambig_ratio = 0.0f;       // off
+    c.reseed3           = false;      // off
+    c.merge_split       = false;      // off
     return c;
 }
 
 // State as of the last quad_update(), for the camera core -- see the header.
 bool quad_locked(void)    { return locked; }
 bool quad_has_model(void) { return model_valid; }
+static uint32_t ambig_total = 0;
+uint32_t quad_ambig_total(void) { return ambig_total; }
+uint32_t quad_identity_epoch(void) { return identity_epoch; }
 
 // Clears all state and installs cfg (NULL = defaults).
 void quad_reset(const QuadConfig* cfg)
@@ -553,9 +617,10 @@ void quad_offer_widths(const int* w, int n)
 }
 // seed_wratio: four offered blobs whose widths say they are not four of a
 // kind. Consumed here so a stale offer never judges a later frame.
+static int  s_ow_cur = 0;       // widths valid for THIS update (after the consume)
 static bool shape_refused(int n)
 {
-    const int on = s_own; s_own = 0;
+    const int on = s_own; s_own = 0; s_ow_cur = on;
     if (C.seed_wratio <= 0.0f || n != 4 || on < 4) return false;
     int lo = s_ow[0], hi = s_ow[0];
     for (int i = 1; i < 4; ++i) {
@@ -564,6 +629,29 @@ static bool shape_refused(int n)
     }
     if (lo < 0) return false;             // a width the sensor did not report
     return (float)hi > C.seed_wratio * (float)(lo < 1 ? 1 : lo);
+}
+
+// partial_lock with a blob left over: every unmatched blob must sit farther
+// from the missing slot's prediction than the model's shortest side. With no
+// unmatched blob this is simply true (the old n == 3).
+static bool unmatched_far(const float* xs, const float* ys, int n,
+                          const int* slot_of, const bool* blob_used,
+                          const float* px, const float* py)
+{
+    int miss = -1;
+    for (int s = 0; s < 4; ++s) if (slot_of[s] < 0) { miss = s; break; }
+    if (miss < 0) return true;
+    float side2 = 1e18f;
+    for (int a = 0; a < 4; ++a)
+        for (int b = a + 1; b < 4; ++b) {
+            const float d = d2(MX[a], MY[a], MX[b], MY[b]);
+            if (d < side2) side2 = d;
+        }
+    for (int b = 0; b < n; ++b) {
+        if (blob_used[b]) continue;
+        if (d2(px[miss], py[miss], xs[b], ys[b]) <= side2) return false;
+    }
+    return true;
 }
 
 QuadResult quad_update(const float* xs, const float* ys, int n)
@@ -605,6 +693,9 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         // fragments through the widened gates for as long as the gun stayed
         // there. Seen on hardware.
         if (n >= 4 && !shape_bad) got = reseed_with_model(xs, ys, n);
+        // Three of them, the fourth reconstructed: the re-acquire a sensor
+        // slot held by a stray otherwise never allows (see reseed3_with_model).
+        if (!got && C.reseed3 && n >= 3 && !shape_bad) got = reseed3_with_model(xs, ys, n);
         // A model refusing every four-set for REACQ_GIVEUP frames is a model
         // of something no longer in view; drop it and let seed() start over
         // (the ban still keeps a condemned set out).
@@ -647,6 +738,11 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     }
 
     // ---- 1. ASSOCIATE: greedy nearest-neighbour, blob -> predicted slot -----
+    // The blob list is copied so merge_split can append two synthetic blobs.
+    float sx_[QUAD_MAX_IN], sy_[QUAD_MAX_IN];
+    for (int b = 0; b < n; ++b) { sx_[b] = xs[b]; sy_[b] = ys[b]; }
+    xs = sx_; ys = sy_;
+    int n_amb = 0, amb_b[4];
     float px[4], py[4];
     for (int i = 0; i < 4; ++i) { px[i] = S[i].x + S[i].vx; py[i] = S[i].y + S[i].vy; }
 
@@ -654,9 +750,24 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     bool blob_used[QUAD_MAX_IN] = {false};
     // a slot that has been missing is less sure where it is, so widen its gate
     float g2[4];
+    // gate_cap_ratio: the widened gate may not exceed this fraction of the
+    // model's shortest side (any pair -- the diagonals are longer, so the
+    // minimum over all six is a side), and never drops below the base gate.
+    float gcap = 1e18f;
+    if (C.gate_cap_ratio > 0.0f && model_valid) {
+        float side2 = 1e18f;
+        for (int a = 0; a < 4; ++a)
+            for (int b = a + 1; b < 4; ++b) {
+                const float d = d2(MX[a], MY[a], MX[b], MY[b]);
+                if (d < side2) side2 = d;
+            }
+        gcap = C.gate_cap_ratio * sqrtf(side2);
+        if (gcap < C.gate) gcap = C.gate;
+    }
     for (int i = 0; i < 4; ++i) {
         float g = C.gate * (1.0f + GATE_GROW * (float)S[i].miss);
         if (g > C.gate * GATE_GROW_MAX) g = C.gate * GATE_GROW_MAX;
+        if (g > gcap) g = gcap;
         g2[i] = g * g;
     }
 
@@ -674,6 +785,24 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
             }
         }
         if (bs < 0) break;
+        // assoc_ambig_ratio: the same blob inside another unmatched slot's
+        // gate, nearly as close -- a merged pair at the midpoint. Refuse it
+        // for BOTH slots this frame; they hold their prediction, the other
+        // blobs still match, and no corner is snapped half a rig inward.
+        if (C.assoc_ambig_ratio > 0.0f) {
+            const float lim = best * C.assoc_ambig_ratio * C.assoc_ambig_ratio;
+            bool ambig = false;
+            for (int s = 0; s < 4 && !ambig; ++s) {
+                if (s == bs || slot_of[s] >= 0) continue;
+                const float d = d2(px[s], py[s], xs[bb], ys[bb]);
+                ambig = (d <= g2[s] && d < lim);
+            }
+            if (ambig) {
+                blob_used[bb] = true; ST.ambig++; ++ambig_total;
+                if (n_amb < 4) amb_b[n_amb++] = bb;
+                continue;
+            }
+        }
         slot_of[bs] = bb; blob_used[bb] = true;
     }
     // veto_seed: a slot re-associating after a miss has a gate up to 3x wide and
@@ -686,6 +815,54 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
             for (int i = 0; i < 4; ++i) { cx4[i] = S[i].x; cy4[i] = S[i].y; }
             cx4[s] = xs[slot_of[s]]; cy4[s] = ys[slot_of[s]];
             if (!convex4(cx4, cy4)) { blob_used[slot_of[s]] = false; slot_of[s] = -1; }
+        }
+    }
+    // merge_split: an ambiguous blob -- refused above for sitting between two
+    // unmatched slots -- is two LEDs merged along a row when EVERYTHING says
+    // so: it sits at the midpoint of the two predictions, they lie on one
+    // row, and its box width is the corner separation plus one LED's width,
+    // measured on this frame's other matched blobs. Then the two corners are
+    // one LED-width in from either end of it. Any mismatch leaves it refused
+    // (the 2-real frame of before). Seen in sun: the bottom pair merged into
+    // a 30x2 blob every few seconds, and two corners went at once.
+    int split_b = -1;
+    auto is_amb = [&](int b) { for (int a = 0; a < n_amb; ++a) if (amb_b[a] == b) return true; return false; };
+    auto slot_used_now = [&](int b) { return split_b == b; };
+    if (C.merge_split && s_ow_cur >= n && n + 2 <= QUAD_MAX_IN) {
+        // one LED's width: the median of the matched blobs' widths
+        int wm[4], m = 0;
+        for (int s = 0; s < 4; ++s)
+            if (slot_of[s] >= 0 && s_ow[slot_of[s]] > 0) wm[m++] = s_ow[slot_of[s]];
+        for (int a = 1; a < m; ++a) { const int t = wm[a]; int j = a - 1;
+            while (j >= 0 && wm[j] > t) { wm[j + 1] = wm[j]; --j; } wm[j + 1] = t; }
+        const int w1 = m ? wm[m / 2] : -1;
+        // every unmatched blob against every pair of unmatched slots: the
+        // midpoint of a pair farther apart than the gate is outside both
+        // gates, so the ambiguity rule never saw it -- the split must not
+        // depend on the rig being small
+        const int n0 = n;
+        for (int b = 0; b < n0 && w1 > 0 && n + 2 <= QUAD_MAX_IN; ++b) {
+          if (blob_used[b] && !(n_amb && is_amb(b))) continue;
+          for (int s1 = 0; s1 < 4 && !slot_used_now(b); ++s1)
+          for (int s2 = s1 + 1; s2 < 4 && !slot_used_now(b); ++s2) {
+            if (slot_of[s1] >= 0 || slot_of[s2] >= 0) continue;
+            // at the midpoint to within one LED width (an ambiguous blob can
+            // sit a good part of the gate off it and still be inside both)
+            const float mx = 0.5f * (px[s1] + px[s2]), my = 0.5f * (py[s1] + py[s2]);
+            if (d2(xs[b], ys[b], mx, my) > (float)(w1 * w1)) continue;
+            // its width is the pair's HORIZONTAL separation plus one LED: a
+            // column pair (dx ~ 0) fails this on its own, as it should -- the
+            // smear that merges runs along a row
+            const float dx = fabsf(px[s1] - px[s2]);
+            const float sep = (float)(s_ow[b] - w1);
+            if (sep <= 0.0f || fabsf(sep - dx) > 0.3f * dx) continue;
+            // two synthetic blobs, one LED-width in from either end
+            const int left = (px[s1] < px[s2]) ? s1 : s2, right = (left == s1) ? s2 : s1;
+            sx_[n] = xs[b] - 0.5f * sep; sy_[n] = ys[b]; slot_of[left]  = n; blob_used[n] = true; ++n;
+            sx_[n] = xs[b] + 0.5f * sep; sy_[n] = ys[b]; slot_of[right] = n; blob_used[n] = true; ++n;
+            blob_used[b] = true; split_b = b;
+            ST.splits++; R.split += 2;
+          }
         }
     }
     for (int b = 0; b < n; ++b) if (!blob_used[b]) ST.dropped_blobs++;
@@ -979,13 +1156,18 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         if (reshape_bad == 0 && h_solve4(ox, oy, Hr)) Hr_valid = true;
         if (lock_count < C.lock_frames) lock_count++;
         }
-    } else if (C.partial_lock && R.n_real == 3 && n == 3 && model_valid
-               && have_H && rung == 3) {
+    } else if (C.partial_lock && R.n_real == 3 && model_valid
+               && have_H && rung == 3
+               && unmatched_far(xs, ys, n, slot_of, blob_used, px, py)) {
         // R1: three real corners plus a rung-3 reconstruction is evidence too,
         // at half rate -- so one displaced LED no longer pins the lock off.
-        // n == 3 as well: an unmatched blob means the fourth slot may be parked
-        // on nothing while the real LED sits outside its gate, and locking a
-        // phantom corner is worse than not locking at all.
+        // An unmatched blob is allowed only when it is demonstrably NOT the
+        // fourth LED sitting outside its gate: farther from the missing slot's
+        // prediction than this rig's shortest side. Seen in sun: a streak held
+        // a sensor slot for minutes, so the sensor never reported four LEDs at
+        // once, and with the old 'n == 3' the lock could never come back --
+        // which left the loop in its unlocked branch bisecting the sensor
+        // blind. A blob a rig-side away from the missing corner is not it.
         // R.n_real, not k: the stuck breaker zeroes it when it rebinds identity.
         if (++partial_phase >= 2) {
             partial_phase = 0;

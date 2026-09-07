@@ -64,11 +64,9 @@ static int adjugate(const float m[9], float r[9])
     return fabsf(det) > 1e-12f;
 }
 
-// Maps a native-px point through the quad -> unit-square warp (runtime path).
-int aim_quad_to_square(const aim_pt_t q_in[4], float px, float py, float* u, float* v)
+// The warp on an already-labelled quad (TL,TR,BL,BR).
+static int qts_labelled(const aim_pt_t q[4], float px, float py, float* u, float* v)
 {
-    aim_pt_t q[4];
-    aim_canon(q_in, q);                 // slot order from the resolver is arbitrary
     float s2q[9], q2s[9];
     if (!square_to_quad(q, s2q))   return 0;
     if (!adjugate(s2q, q2s))       return 0;
@@ -79,6 +77,14 @@ int aim_quad_to_square(const aim_pt_t q_in[4], float px, float py, float* u, flo
     // Beyond this is the projective pole and must not be published.
     if (!(*u > -50.0f && *u < 50.0f && *v > -50.0f && *v < 50.0f)) return 0;
     return 1;
+}
+
+// Maps a native-px point through the quad -> unit-square warp (runtime path).
+int aim_quad_to_square(const aim_pt_t q_in[4], float px, float py, float* u, float* v)
+{
+    aim_pt_t q[4];
+    aim_canon(q_in, q);                 // slot order from the resolver is arbitrary
+    return qts_labelled(q, px, py, u, v);
 }
 
 // Double-precision quad->square, used only by the calibration fit.
@@ -118,18 +124,20 @@ static int qts_d(const aim_pt_t q_in[4], double px, double py, double* u, double
 
 // Apparent size of the quad in native px, used as a stand-in for range.
 // Mean of the two diagonals, so it is rotation invariant.
-static float quad_span(const aim_pt_t q[4])
+static float span_labelled(const aim_pt_t k[4])
 {
-    aim_pt_t k[4]; aim_canon(q, k);
     const float ax = k[3].x - k[0].x, ay = k[3].y - k[0].y;   // TL->BR
     const float bx = k[2].x - k[1].x, by = k[2].y - k[1].y;   // TR->BL
     return 0.5f * (sqrtf(ax*ax + ay*ay) + sqrtf(bx*bx + by*by));
 }
-
-// Returns sin of the quad's roll, or 0 for a degenerate quad.
-float aim_quad_roll_sin(const aim_pt_t q[4])
+static float quad_span(const aim_pt_t q[4])
 {
     aim_pt_t k[4]; aim_canon(q, k);
+    return span_labelled(k);
+}
+
+static float roll_sin_labelled(const aim_pt_t k[4])
+{
     // top edge TL->TR plus bottom edge BL->BR; the sum cancels most keystone.
     const float dx = (k[1].x - k[0].x) + (k[3].x - k[2].x);
     const float dy = (k[1].y - k[0].y) + (k[3].y - k[2].y);
@@ -137,24 +145,45 @@ float aim_quad_roll_sin(const aim_pt_t q[4])
     return (n < 1e-6f) ? 0.0f : (dy / n);
 }
 
-// Runtime path: labelled quad (native px) -> normalised screen coords.
-int aim_solve(const aim_calib_t* c, const aim_pt_t q[4],
-              float frame_w, float frame_h, float* sx, float* sy)
+// Returns sin of the quad's roll, or 0 for a degenerate quad.
+float aim_quad_roll_sin(const aim_pt_t q[4])
+{
+    aim_pt_t k[4]; aim_canon(q, k);
+    return roll_sin_labelled(k);
+}
+
+// Quad already in TL,TR,BL,BR order -> normalised screen coords. The labels
+// come from the caller (a resolver that carries corner identity across
+// frames), so a rolled quad is not re-labelled by geometry every frame: with
+// a bar taller than it is wide, the y-sort in aim_canon swaps TR and BL near
+// a 57 degree roll, and jitter around that angle flips the labelling frame
+// to frame -- the cursor teleports (seen on hardware, low sun, 30-45 deg).
+int aim_solve_labelled(const aim_calib_t* c, const aim_pt_t k[4],
+                       float frame_w, float frame_h, float* sx, float* sy)
 {
     if (!c || c->magic != AIM_CAL_MAGIC) return 0;
     float bx = c->bx, by = c->by;
-    if (c->lever != 0.0f) by += c->lever * quad_span(q);
+    if (c->lever != 0.0f) by += c->lever * span_labelled(k);
     float u, v;
-    if (!aim_quad_to_square(q, frame_w * 0.5f + bx, frame_h * 0.5f + by, &u, &v))
+    if (!qts_labelled(k, frame_w * 0.5f + bx, frame_h * 0.5f + by, &u, &v))
         return 0;
     *sx = c->w * u + (c->cx - c->w * 0.5f);
     *sy = c->h * v + (c->cy - c->h * 0.5f);
     if (c->rx != 0.0f || c->ry != 0.0f) {
-        const float sr = aim_quad_roll_sin(q);
+        const float sr = roll_sin_labelled(k);
         *sx += c->rx * sr;
         *sy += c->ry * sr;
     }
     return 1;
+}
+
+// Runtime path: quad in any order -> normalised screen coords, labelled by
+// geometry first (the OV path, and the wiicam path while it has no lock).
+int aim_solve(const aim_calib_t* c, const aim_pt_t q[4],
+              float frame_w, float frame_h, float* sx, float* sy)
+{
+    aim_pt_t k[4]; aim_canon(q, k);
+    return aim_solve_labelled(c, k, frame_w, frame_h, sx, sy);
 }
 
 // ---------------------------------------------------------------------------

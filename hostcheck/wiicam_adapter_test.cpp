@@ -417,6 +417,93 @@ int main()
            "...and that corner is published where the missing LED was (within 3 px)");
     }
 
+    // ---- corner labels survive a roll ----------------------------------
+    // Low-sun capture, gun rolled: locked, four real, no strays -- and the
+    // cursor teleported from ~30 deg and settled on a wrong, rotated mapping
+    // past ~45. aim_canon() labels TL/TR/BL/BR by a y-sort on every frame;
+    // on a bar taller than it is wide the y of TR and BL cross near 57 deg
+    // of roll, and the jitter around that angle flips the labelling frame
+    // to frame. Locked, the labels are now taken from the resolver's slots
+    // once, on the lock rise, and kept.
+    {
+        wiicam_cam_command("cam=dash:0");
+        // A bar taller than wide (like the rig on hardware), off the frame
+        // centre so the aim point moves as it rolls -- a centred rig maps
+        // the centre to the centre under any labelling.
+        const float cx = 640.0f, cy = 300.0f, hw = 100.0f, hh = 150.0f;
+        auto rolled = [&](float deg, int* ox, int* oy) {
+            const float a = deg * 3.14159265f / 180.0f, c = cosf(a), sn = sinf(a);
+            const float X[4] = { -hw, hw, -hw, hw }, Y[4] = { -hh, -hh, hh, hh };
+            for (int i = 0; i < 4; ++i) {
+                ox[i] = (int)lroundf(cx + c * X[i] - sn * Y[i]);
+                oy[i] = (int)lroundf(cy + sn * X[i] + c * Y[i]);
+            }
+        };
+        int rx[4], ry[4];
+        rolled(0.0f, rx, ry);
+        for (int i = 0; i < 40; ++i) {            // lock, unrolled
+            t += DT; rx[1] += (i & 1) ? 1 : -1;
+            wiicam_aim_process(rx, ry, 0xF, t, &sx, &sy);
+        }
+        ck(quad_locked(), "roll: locked on the tall bar, unrolled");
+        const float sx0 = sx;                     // the unrolled cursor
+        float px_ = sx, py_ = sy, worst = 0.0f; int worst_deg = -1;
+        // ...then one degree per frame up to 80: past the 57 deg crossing.
+        for (int d = 1; d <= 80; ++d) {
+            rolled((float)d, rx, ry);
+            t += DT;
+            const bool ok = wiicam_aim_process(rx, ry, 0xF, t, &sx, &sy);
+            const float j = fabsf(sx - px_) + fabsf(sy - py_);
+            if (ok && j > worst) { worst = j; worst_deg = d; }
+            px_ = sx; py_ = sy;
+        }
+        {
+            char m[200];
+            snprintf(m, sizeof m, "rolled 0 -> 80 deg one degree a frame while "
+                     "locked, the cursor moves at most %.3f (screen units) in a "
+                     "frame (at %d deg): no teleport at the 57 deg crossing",
+                     worst, worst_deg);
+            ck(quad_locked() && worst < 0.05f, m);
+        }
+        // The geometric labelling, on the same quads, is what jumped: fed
+        // straight to the solver it swaps two corners across the crossing.
+        // (aim_solve on the calibration directly: no filter state in the way.)
+        {
+            float gx = 0, gy = 0, gpx = 0, gpy = 0, gworst = 0; int gdeg = -1;
+            for (int d = 0; d <= 80; ++d) {
+                rolled((float)d, rx, ry);
+                aim_pt_t q[4];
+                for (int i = 0; i < 4; ++i) {
+                    q[i].x = (1023 - rx[i]) * (240.0f / 1024.0f);
+                    q[i].y = ry[i] * (176.0f / 768.0f);
+                }
+                if (!aim_solve(aim_runtime_calib(), q, 240.0f, 176.0f, &gx, &gy)) continue;
+                if (d) { const float j = fabsf(gx - gpx) + fabsf(gy - gpy);
+                         if (j > gworst) { gworst = j; gdeg = d; } }
+                gpx = gx; gpy = gy;
+            }
+            char m[200];
+            snprintf(m, sizeof m, "...whereas labelling by geometry every frame "
+                     "jumps %.2f at %d deg on the same quads -- the teleport, "
+                     "reproduced", gworst, gdeg);
+            ck(gworst > 0.3f && gdeg >= 50 && gdeg <= 65, m);
+        }
+        // Losing the lock releases the labels; the next lock labels afresh.
+        for (int i = 0; i < 20; ++i) { t += DT; wiicam_aim_process(rx, ry, 0x0, t, &sx, &sy); }
+        rolled(0.0f, rx, ry);
+        for (int i = 0; i < 40; ++i) { t += DT; rx[1] += (i & 1) ? 1 : -1;
+                                       wiicam_aim_process(rx, ry, 0xF, t, &sx, &sy); }
+        ck(quad_locked() && fabsf(sx - sx0) < 0.05f,
+           "...and after the lock is lost and regained unrolled, the labels are "
+           "taken again by geometry: the cursor is back where the unrolled bar "
+           "first put it");
+        // Back to the rig the blocks below expect, on a fresh resolver.
+        rig(px, py, 512, 384, 512, 384);
+        wiicam_cam_command("cam=res:2");
+        for (int i = 0; i < 40; ++i) { t += DT; px[1] += (i & 1) ? 1 : -1;
+                                       wiicam_aim_process(px, py, 0xF, t, &sx, &sy); }
+    }
+
     // ---- latency lead -----------------------------------------------------
     wiicam_cam_command("cam=lead:20,dash:2,dashhz:0");
     for (int step = 0; step < 30; ++step) {    // steady rightward pan
@@ -5346,18 +5433,22 @@ int main()
         // the middle of the rig -- comfortably outside twice the resolver's
         // association radius, which is what makes the next two rigs mean what
         // they say.
-        auto load_rig = [&](void){ rig(lpx, lpy, 512, 384, 512, 384); };
+        auto load_rig = [&](void){ rig(lpx, lpy, 512, 384, 512, 384);
+                                   lsz[3] = 2; };
         // Three LEDs and a window: the fourth slot went to something in the
-        // middle of the bar that no corner can be.
+        // middle of the bar that no corner can be. The sensor reports it
+        // BIGGER than the LEDs (size 5 against 2): the room these blocks
+        // model is one MAXSIZE can fix, which is the loop's whole job. A
+        // stray the sensor sizes like an LED is the block after (K7).
         auto load_stray = [&](void){ rig(lpx, lpy, 512, 384, 512, 384);
-                                     lpx[3] = 512; lpy[3] = 384; };
+                                     lpx[3] = 512; lpy[3] = 384; lsz[3] = 5; };
         // Four blobs that CANNOT be a rectangle seen from anywhere: the fourth
         // sits inside the triangle of the other three, so the set is not in
         // convex position and Batch A's seed veto refuses it. This is the
         // "cannot lock at all" arm of the LOWER verdict, and it is the case
         // G2 says only the loop can get a gun out of.
         auto load_bad = [&](void){ rig(lpx, lpy, 512, 384, 512, 384);
-                                   lpx[3] = 512; lpy[3] = 340; };
+                                   lpx[3] = 512; lpy[3] = 340; lsz[3] = 5; };
 
         // A gun at a known starting line: nothing in flash, the capture off
         // (begin() ARMS it now -- G3 -- so a block that wants it quiet has to
@@ -6232,7 +6323,7 @@ int main()
             wiicam_cam_command("camloop?");
             ck(!g_replies.empty() && g_replies[0] ==
                "CAM: loop on=1 state=HOLD val=90 lo=0 hi=256 dwell=0/50 "
-               "clean=0 stray=0 cut=0 settled=0 saved=1\n",
+               "clean=0 stray=0 cut=0 settled=0 saved=1 uncut=0\n",
                "and '~camloop?' is the whole controller in one line, verbatim: "
                "a tool reads where it is, what it is bracketed between, and "
                "what this dwell has seen");
@@ -6760,6 +6851,92 @@ int main()
             ck(!strcmp(L.state, "LOWER") && L.val < 255,
                "...and a room that stays unlocked for over a second is the "
                "stray-only room the loop exists for: LOWER");
+        }
+
+        // (cc) K7: a stray the sensor sizes like the LEDs is not MAXSIZE's to
+        // cut. Seen on the Pi: a sun streak at size 2, the same byte as the
+        // corners, sat in a slot every frame; the loop LOWERed 139 -> 81 and
+        // the streak stayed while the LEDs went. The size byte is the
+        // sensor's own measure, the one MAXSIZE bounds: a stray no bigger
+        // than the corners in it cannot be cut without cutting a corner.
+        arm(2);
+        run(40, 0xF);                             // locked at the preset
+        wiicam_cam_command("cam=loop:1");
+        load_stray(); lsz[3] = 2;                 // the streak: LED-sized
+        g_reg.clear();
+        run(55, 0xF);                             // a whole dwell of strays
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.val == 255 && regs06().empty(),
+               "K7: a whole dwell of strays the sensor sizes like the LEDs "
+               "does not LOWER -- the register is never written and the "
+               "loop holds at the value the LEDs pass");
+        }
+        run(8, 0xF);                              // 5 left over + 8 = 13
+        {
+            g_replies.clear();
+            wiicam_cam_command("camloop?");
+            ck(!g_replies.empty() && g_replies[0].find(" uncut=13\n") != std::string::npos
+               && loopq().stray == 13,
+               "...and '~camloop?' says why: every stray frame of the dwell is "
+               "counted again in 'uncut'");
+        }
+        // A stray the sensor sizes BIGGER than the LEDs is the loop's case,
+        // unchanged: one dwell, one halving.
+        lsz[3] = 3;
+        wiicam_cam_command("cam=loop:1");
+        g_reg.clear();
+        run(55, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.val == 127 && regs06().size() == 1,
+               "...while a stray ONE size step over the LEDs is cut the way it "
+               "always was: a dwell of strays, one halving, one register write");
+        }
+        // (dd) The same rule UNLOCKED. blobs005 on the Pi: a glance away
+        // took the lock, the streak kept the sensor from ever showing four
+        // LEDs, and after a second the loop's blind branch read "four blobs,
+        // no lock" as a stray-only room and bisected 127 -> 63 -> 31 -> 15,
+        // at which the sensor reported nothing at all. The resolver still had
+        // its model and three matched corners, which is enough to ask the
+        // size byte the same question.
+        arm(2);
+        run(40, 0xF);
+        run(6, 0x0);                              // the lock decays, the slots stay
+        load_stray(); lsz[3] = 2;                 // LED-sized, at the rig's centre
+        wiicam_cam_command("cam=loop:1");
+        g_reg.clear();
+        run(250, 0xF);                            // over a second unlocked, then dwells
+        {
+            LoopLine L = loopq();
+            ck(!quad_locked() && L.val == 255 && regs06().empty() && !strcmp(L.state, "HOLD"),
+               "unlocked for a second with a model and three corners matched, "
+               "an LED-sized stray in the fourth slot still holds: the blind "
+               "branch no longer bisects the sensor dark");
+        }
+        lsz[3] = 5;
+        wiicam_cam_command("cam=loop:1");
+        g_reg.clear();
+        run(55, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.val == 127,
+               "...and a bigger stray in the same unlocked scene is bisected "
+               "as before");
+        }
+        // The dwell is judged by its majority. A stray that is LED-sized on
+        // most frames and bigger on a few is still uncuttable.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=loop:1");
+        load_stray();
+        g_reg.clear();
+        for (int i = 0; i < 55; ++i) { lsz[3] = (i % 3 == 0) ? 5 : 2; shot(0xF, 0); }
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.val == 255 && regs06().empty(),
+               "...judged by the dwell's majority: LED-sized on two frames in "
+               "three, bigger on the third, it still holds");
         }
 
         // camreset arms the capture, as boot does (G3): the loop's margin is

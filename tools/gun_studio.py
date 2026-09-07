@@ -574,7 +574,17 @@ class BlobLog:
             "loopage",
             # The width gate in force, beside nothing it belongs with -- on
             # the end, like every column since the first file.
-            "bwmax")
+            "bwmax",
+            # Camera reads since boot (duplicates included) and the automatic
+            # envelope's drops. On the end.
+            "bpolls", "benv",
+            # bmerge: blobs the resolver refused as sitting between two
+            # corners (a merged LED pair). bwide: corners the LED class did
+            # not learn, wider than the seed ratio allows beside the other
+            # three. loopuc: this dwell's stray frames where the stray was no
+            # bigger than the LEDs in the sensor's size byte (MAXSIZE cannot
+            # reach it; the loop holds). On the end.
+            "bmerge", "bwide", "loopuc")
 
     # Pushed to the medium this often, on top of the per-row flush: a
     # flush() only hands the row to the kernel, and a Pi that loses power or
@@ -656,6 +666,11 @@ class BlobLog:
         vals.append(int(round((self._clock() - t_loop) * 1000.0))
                     if t_loop is not None else "")
         vals.append(last.get("bwmax", ""))
+        vals.append(last.get("bpolls", ""))
+        vals.append(last.get("benv", ""))
+        vals.append(last.get("bmerge", ""))
+        vals.append(last.get("bwide", ""))
+        vals.append(last.get("loopuc", ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
         # an empty file, because the writes are still in the page cache.
@@ -1461,7 +1476,8 @@ class Link:
             for src, dst in (("on", "loop"), ("val", "hwv"), ("lo", "hwlo"),
                              ("hi", "hwhi"), ("dwell", "loopdw"),
                              ("clean", "loopcl"), ("stray", "loopst"),
-                             ("cut", "loopcu"), ("saved", "loopsv")):
+                             ("cut", "loopcu"), ("saved", "loopsv"),
+                             ("uncut", "loopuc")):
                 if src in d:
                     self.last[dst] = d[src]
             if d.get("state") in LOOP_STATES:
@@ -1567,6 +1583,8 @@ class Link:
                 # "CAM: thr=" prefix missed the wiicam's "CAM: board=" readback
                 # AND the ping's board tag, so Studio never learned the board
                 # and kept showing the ESP32 tuning panel.
+                if line.startswith("AIM: pong"):
+                    self.last["pong_line"] = line   # up= boots= rst=, for the reboot log
                 if line.startswith("CAM:") or line.startswith("AIM: pong") \
                         or "CMD ok" in line:
                     for tok in line.replace("|", " ").split():
@@ -1619,6 +1637,15 @@ class Link:
                                                  # bcold: no-model/refused-seed frames, after bsv.
                                                  "bsrej", "bfar", "bnear", "bsv",
                                                  "bcold",
+                                                 # bpolls: camera reads, duplicates included; benv:
+                                                 # the automatic envelope's drops. bframes/bpolls is
+                                                 # the share of reads that were a NEW frame -- the
+                                                 # one number that separates a slow sensor from a
+                                                 # slow host.
+                                                 "bpolls", "benv",
+                                                 # bmerge: merged-pair refusals; bwide: corners the
+                                                 # LED class left unlearned. After benv.
+                                                 "bmerge", "bwide",
                                                  # The loop's four off 'cam?': on, held limit, bracket.
                                                  # hwmax above is the register (-1 = back on the preset);
                                                  # hwhi 256 = no ceiling known yet, shown as '?'.

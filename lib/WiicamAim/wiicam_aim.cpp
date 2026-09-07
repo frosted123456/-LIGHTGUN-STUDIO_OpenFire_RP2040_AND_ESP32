@@ -75,6 +75,10 @@ static QuadConfig s_quad_cfg = []{
     // Four LEDs of one bar came out within 2.7x of each other in width on
     // hardware, a merged pair included; a window's fragments 3x to 16x.
     c.seed_wratio = 4.0f;
+    c.gate_cap_ratio    = 0.6f;   // a widened gate stays inside the rig
+    c.assoc_ambig_ratio = 1.5f;   // a merged pair is refused, not guessed
+    c.reseed3           = true;   // re-acquire from three when a stray holds a slot
+    c.merge_split       = true;   // a row-merged pair becomes its two corners
     return c;
 }();
 // quad_reset() must run on the camera core: the serial core raises this and
@@ -205,13 +209,51 @@ static uint8_t  s_bwmax = 0;
 //
 // Returns -1 for "this rig has never been measured", which is the only case
 // where a number is taken on trust.
+// The stored edges (fit0 / fit1), read ONCE and kept. The automatic envelope
+// asks for them on every frame, and aim_fit_load is a flash read: at blob
+// cadence that halved the poll rate (bpolls == bframes at 85 Hz instead of
+// 160+) and put a core-0 flash read next to core-1 flash writes, which is the
+// shape of the reboot seen on the Pi. The cache is marked stale at boot, on
+// every command line (the only moments the keys can change) and by the
+// writers themselves, and re-read lazily on the next ask -- never per frame.
+static struct {
+    bool dirty;
+    bool have;   int led, stray, px;
+    bool havew;  int w;
+} s_fit_cache = { true, false, -1, -1, -1, false, -1 };
+static void fit_cache_dirty(void) { s_fit_cache.dirty = true; }
+static void fit_cache_fill(void)
+{
+    if (!s_fit_cache.dirty) return;
+    s_fit_cache.dirty = false;
+    s_fit_cache.led = s_fit_cache.stray = s_fit_cache.px = -1;
+    s_fit_cache.have  = aim_fit_load(&s_fit_cache.led, &s_fit_cache.stray,
+                                     &s_fit_cache.px);
+    s_fit_cache.w = -1;
+    s_fit_cache.havew = aim_fitw_load(&s_fit_cache.w);
+}
+static bool fit_cached(int* led, int* stray, int* px)
+{
+    fit_cache_fill();
+    if (!s_fit_cache.have) return false;
+    *led = s_fit_cache.led; *stray = s_fit_cache.stray; *px = s_fit_cache.px;
+    return true;
+}
+static bool fitw_cached(int* w)
+{
+    fit_cache_fill();
+    if (!s_fit_cache.havew) return false;
+    *w = s_fit_cache.w;
+    return true;
+}
+
 static int rig_led_max_h(void)
 {
     wl_envelope_t e;
     wl_envelope(&e);
     int best = e.led_max_h;
     int led = -1, stray = -1, px = -1;
-    if (aim_fit_load(&led, &stray, &px) && led > best) best = led;
+    if (fit_cached(&led, &stray, &px) && led > best) best = led;
     return best;
 }
 // The floor under 'bwmax': the larger of the live capture and the stored
@@ -222,7 +264,7 @@ static int rig_led_max_w(void)
     wl_envelope(&e);
     int best = e.led_max_w;
     int w = -1;
-    if (aim_fitw_load(&w) && w > best) best = w;
+    if (fitw_cached(&w) && w > best) best = w;
     return best;
 }
 // The AUTOMATIC envelope: what this rig's LEDs have measured, with a margin,
@@ -238,12 +280,19 @@ static void rig_envelope(int* out_w, int* out_h)
     wl_envelope(&e);
     int w = -1, h = -1, sl = -1, ss = -1, sp = -1, sw = -1;
     if (e.led_n >= 500) { w = e.led_max_w; h = e.led_max_h; }
-    if (aim_fit_load(&sl, &ss, &sp) && sl > h) h = sl;
-    if (aim_fitw_load(&sw) && sw > w) w = sw;
+    if (fit_cached(&sl, &ss, &sp) && sl > h) h = sl;
+    if (fitw_cached(&sw) && sw > w) w = sw;
     *out_w = (w >= 0) ? w * ENV_W_FACTOR : -1;
     *out_h = (h >= 0) ? h + ENV_H_MARGIN : -1;
 }
 static uint32_t s_benv = 0;    // blobs the automatic envelope dropped
+static int  s_lab[4] = { 0, 1, 2, 3 };   // resolver slot for TL, TR, BL, BR
+static bool s_lab_valid = false;         // ...made on the last lock rise
+static uint32_t s_lab_epoch = 0;         // ...for this binding of the slots
+static uint32_t s_bwide = 0;   // corners not learned: wider than seed_wratio x the narrowest of the other three
+static uint32_t s_bsplit = 0;  // frames where a merged pair was split into two corners
+static float s_prev_px[4], s_prev_py[4];   // last frame's resolved corners, 240-space
+static bool  s_prev_locked = false;        // ...from a locked resolver
 // The floor under 'pxmax', with one honest caveat. pxmax gates on the report's
 // pixel-count byte; this bound is measured from the bounding-box AREA, because
 // the learning sink has no histogram of the raw byte. Area is an upper bound on
@@ -266,7 +315,7 @@ static int rig_led_max_px(void)
     wl_envelope(&e);
     int best = e.led_max_px;
     int led = -1, stray = -1, px = -1;
-    if (aim_fit_load(&led, &stray, &px) && px > best) best = px;
+    if (fit_cached(&led, &stray, &px) && px > best) best = px;
     if (best >= WL_BINS - 1) return RIG_PX_UNBOUNDED;
     return best;
 }
@@ -349,6 +398,7 @@ static bool s_loop_vouched = false;           // this value has held a clean dwe
 static int  s_loop_lo_prev = 0;               // lo before the last RAISE recorded one
 static bool s_loop_lo_pending = false;        // ...and that lo awaits a clean dwell
 static int  s_loop_uncured = 0;               // RAISEs in a row that cured nothing
+static int  s_loop_nstray_uncut = 0;          // stray frames this dwell where the stray was no bigger than the LEDs
 static int  s_loop_dwell_nlock = 0;           // frames of this dwell the resolver was locked
 #define LOOP_UNCURED_MAX 3
 static int  s_loop_nclean = 0, s_loop_nstray = 0, s_loop_ncut = 0;
@@ -377,6 +427,7 @@ static void loop_new_dwell(void)
 {
     s_loop_dwell = 0;
     s_loop_nclean = 0; s_loop_nstray = 0; s_loop_ncut = 0;
+    s_loop_nstray_uncut = 0;
     s_loop_cut_run = 0;
     s_loop_dwell_nlock = 0;
 }
@@ -487,6 +538,16 @@ static void loop_dwell_end(void)
     // The dwell after a RAISE is the one that says whether its lo was real.
     loop_lo_settle(s_loop_state == LOOP_RAISE && s_loop_dwell_nlock >= LOOP_DWELL / 2);
     if (s_loop_ncut == 0 && s_loop_nstray >= LOOP_DWELL / 2) {
+        // The sensor's own size byte says whether MAXSIZE can reach this
+        // stray at all. A streak the sensor reports at the LEDs' size (seen
+        // on the Pi: size 2, same as the corners) is not cut by any MAXSIZE
+        // that keeps the LEDs, so a LOWER against it only blinds the gun for
+        // a dwell. Hold instead; the value the LEDs pass at is kept.
+        if (s_loop_nstray_uncut * 2 >= s_loop_nstray) {
+            s_loop_state = LOOP_HOLD;
+            loop_new_dwell();
+            return;
+        }
         if (s_loop_val > s_loop_lo + 1) {
             s_loop_hi = s_loop_val;
             loop_write((s_loop_lo + s_loop_val) / 2);
@@ -525,7 +586,7 @@ static void loop_dwell_end(void)
 }
 
 // One judged frame: count it, then decide whether to move the register.
-static void loop_tick(int verdict, bool locked)
+static void loop_tick(int verdict, bool locked, bool stray_uncut)
 {
     if (!s_loop_on) return;
     // A write still waiting for the pump core has not landed; the frames after
@@ -534,7 +595,7 @@ static void loop_tick(int verdict, bool locked)
     if (s_loop_settle > 0) { --s_loop_settle; return; }
     if (locked) ++s_loop_dwell_nlock;
     if      (verdict == V_CLEAN) ++s_loop_nclean;
-    else if (verdict == V_STRAY) ++s_loop_nstray;
+    else if (verdict == V_STRAY) { ++s_loop_nstray; if (stray_uncut) ++s_loop_nstray_uncut; }
     else if (verdict == V_CUT)   ++s_loop_ncut;
     ++s_loop_dwell;
     if (verdict == V_CUT) ++s_loop_cut_run;
@@ -937,6 +998,7 @@ static int size_consensus_drop(const int* sz, int* keep, int n)
 void wiicam_aim_begin(void)
 {
     quad_reset(&s_quad_cfg);       // single-threaded at boot, so direct
+    fit_cache_dirty();             // the stored edges are read once, here
     int lead = 0;
     if (aim_lead_load(&lead)) s_lead_ms = (float)lead;
     int smooth = 0;
@@ -1169,7 +1231,27 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             if (!keep[i]) continue;               // already gone, do not double-count
             const int w = (int)s_fw[aslot[i]];
             const int h = (int)s_fh[aslot[i]];
-            if ((env_w >= 0 && w > env_w) || (env_h >= 0 && h > env_h)) {
+            // A blob too WIDE for the envelope that sits where two of the
+            // last frame's corners meet -- on their row, within one LED
+            // width of their midpoint -- is those two LEDs merged, not a
+            // stray: it goes through to the resolver, which splits it or
+            // refuses it (merge_split). In sun the envelope threw away the
+            // bottom pair as one 30x3 blob every few seconds (bnear +208 in
+            // 40 s), and two corners went at once. Height is judged as before.
+            const bool too_h = (env_h >= 0 && h > env_h);
+            bool too_w = (env_w >= 0 && w > env_w);
+            if (too_w && !too_h && s_prev_locked) {
+                const float lw = 0.5f * (float)env_w * (WIICAM_NORM_W / 128.0f); // one LED width, 240-space
+                for (int a = 0; a < 4 && too_w; ++a)
+                    for (int b = a + 1; b < 4 && too_w; ++b) {
+                        const float mx = 0.5f * (s_prev_px[a] + s_prev_px[b]);
+                        const float my = 0.5f * (s_prev_py[a] + s_prev_py[b]);
+                        if (fabsf(s_prev_py[a] - s_prev_py[b]) <= lw
+                            && fabsf(ax[i] - mx) <= lw && fabsf(ay[i] - my) <= lw)
+                            too_w = false;
+                    }
+            }
+            if (too_w || too_h) {
                 keep[i] = 0; srej[i] = 1; --nk; ++s_bsrej; ++s_benv;
                 continue;
             }
@@ -1298,12 +1380,18 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
 
     // Widths, in the offered order, for the seed's four-of-a-kind test. Only
     // full format carries a box; without one the resolver is told nothing.
+    // In the resolver's own units: the box is in the sensor's 128-wide array,
+    // the positions in 240-wide space, and merge_split adds a width to a
+    // distance. Ratios (the seed test) are unchanged by the scale.
     if ((s_ext_state & 3) == WIICAM_FMT_FULL) {
         int ow[4] = {-1, -1, -1, -1};
-        for (int i = 0; i < n && i < 4; ++i) ow[i] = (int)s_bw[oidx[i]];
+        for (int i = 0; i < n && i < 4; ++i)
+            ow[i] = (int)lroundf((float)s_bw[oidx[i]] * (WIICAM_NORM_W / 128.0f));
         quad_offer_widths(ow, n);
     }
     QuadResult r = quad_update(xs, ys, n);
+    s_prev_locked = r.locked && r.count == 4;
+    for (int i = 0; i < 4; ++i) { s_prev_px[i] = r.p[i].x; s_prev_py[i] = r.p[i].y; }
     // Blobs this frame sitting far from every resolved corner. Computed in the
     // learning block below and read by the verdict after it, so a frame that
     // never reaches that branch honestly reads zero.
@@ -1376,7 +1464,10 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             }
             imed = (m & 1) ? v[m / 2] : (v[m / 2 - 1] + v[m / 2]) / 2;
         }
-        if (r.locked && r.n_real == 4) {
+        if (r.split) ++s_bsplit;
+        if (r.locked && r.n_real == 4 && !r.split) {
+            // (!r.split: a frame whose corners came from splitting a merged
+            // blob has that blob in its list, and a merged pair is not an LED)
             // Four corners really seen, ON A MODEL THE RESOLVER TRUSTS.
             //
             // 'locked' is not decoration here, and leaving it off was a real
@@ -1399,9 +1490,30 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             // setting they need with a message citing a measurement that never
             // happened. The negative branch below always had this condition.
             if (learning) {
-                for (int i = 0; i < an; ++i)
+                // Hygiene for the LED class, by the rule the seed already
+                // uses: four LEDs of one bar are within seed_wratio (4x) of
+                // each other in width, so a corner wider than that times the
+                // NARROWEST of the other three is not of a kind with them and
+                // is not learned. A streak adopted as a corner froze the
+                // automatic envelope at the top of its scale (the Pi in sun:
+                // b25..b31 filled from a 31 px streak beside 5..9 px LEDs, 6x).
+                // The bar's own spread on hardware was 2.7x, a merged pair
+                // included. No new number: the ratio is the seed's, and it is
+                // measured inside the frame. Needs a box; basic format learns
+                // as before.
+                for (int i = 0; i < an; ++i) {
+                    if (flags && an == 4 && s_quad_cfg.seed_wratio > 0.0f) {
+                        int narrow = 1 << 30;
+                        for (int j = 0; j < an; ++j)
+                            if (j != i && (int)s_bw[j] < narrow) narrow = (int)s_bw[j];
+                        if ((float)s_bw[i] > s_quad_cfg.seed_wratio * (float)narrow) {
+                            ++s_bwide;
+                            continue;
+                        }
+                    }
                     wl_note(0, asz[i], (int)s_bw[i], (int)s_bh[i],
                             (int)s_bi[i], imed, flags);
+                }
                 wl_note_frame();
             }
         } else if (r.locked && r.count == 4 && (r.n_real == 3 || r.n_real == 2)) {
@@ -1489,6 +1601,30 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         const bool recent   = s_loop_ever_lock && since_lock < LOOP_RECENT_US;
         const bool unlocked = !s_loop_ever_lock || since_lock >= LOOP_UNLOCKED_US;
         int verdict = V_NONE;
+        // In the sensor's own measure -- the size byte MAXSIZE bounds -- is
+        // the stray any bigger than the corners? If not, no MAXSIZE cuts it
+        // without cutting an LED. Judged against the resolver's corners
+        // whenever it has four to offer (r.count == 4), locked or not: on
+        // the Pi the loop's blind branch bisected the sensor dark (127 -> 63
+        // -> 31 -> 15, no blobs at all) against a streak the sensor sized
+        // like the LEDs, because the lock was off and only the locked branch
+        // asked. A model is enough to say which blobs are the corners.
+        bool stray_uncut = false;
+        if (an == 4 && r.count == 4 && r.n_real >= 2) {
+            int led_max = -1, far_max = -1;
+            for (int i = 0; i < an; ++i) {
+                float dmin = 1e9f;
+                for (int k = 0; k < 4; ++k) {
+                    const float dx = ax[i] - r.p[k].x, dy = ay[i] - r.p[k].y;
+                    const float d = dx * dx + dy * dy;
+                    if (d < dmin) dmin = d;
+                }
+                const float g2 = 2.0f * quad_default_config().gate;
+                if (dmin > g2 * g2) { if (asz[i] > far_max) far_max = asz[i]; }
+                else                { if (asz[i] > led_max) led_max = asz[i]; }
+            }
+            stray_uncut = (far_max >= 0 && led_max >= 0 && far_max <= led_max);
+        }
         if (an == 4 && r.locked && r.n_real == 4)
             verdict = V_CLEAN;
         else if (an == 4 && r.locked && r.count == 4 && r.n_real < 4
@@ -1500,7 +1636,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         // corner gone at a vouched value is a hidden or weak LED, not MAXSIZE.
         else if (an <= 3 && r.locked && r.n_real >= 2 && recent && !s_loop_vouched)
             verdict = V_CUT;            // a corner is gone while the others are tracked
-        loop_tick(verdict, r.locked);
+        loop_tick(verdict, r.locked, stray_uncut);
     }
     if (r.locked) { s_loop_last_lock_us = now_us; s_loop_ever_lock = true; }
 
@@ -1551,8 +1687,40 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     if (!aim_runtime_active()) return false;
     aim_pt_t q[4];
     for (int i = 0; i < 4; ++i) { q[i].x = qx[i]; q[i].y = qy[i]; }
-    s_cache_ret = aim_runtime_solve(q, WIICAM_NORM_W, WIICAM_NORM_H,
-                                    &s_cache_sx, &s_cache_sy, dt);
+    // Corner labels come from the resolver's slots while it is locked. The
+    // slot order is stable for as long as the lock holds, so the TL/TR/BL/BR
+    // assignment is made ONCE, on the frame the lock rises, by geometry --
+    // and kept through any roll after that. Re-labelling by geometry every
+    // frame swapped TR and BL near a 57 degree roll on this rig (taller than
+    // wide) and flipped frame to frame in the jitter around it: the cursor
+    // teleported (low sun capture, 30-45 deg). Unlocked, the slots may be
+    // rebuilt under us, so the geometric labelling is used as before.
+    // ...and again whenever the resolver binds its slots afresh: a re-seed
+    // orders them by angle from scratch, and the slot that held TL may not
+    // hold it any more. That happened under a lock the consumer never saw
+    // drop (the rig jumping to a new place, re-acquired inside the gates).
+    if (quad_identity_epoch() != s_lab_epoch) s_lab_valid = false;
+    if (r.locked) {
+        if (!s_lab_valid) {
+            s_lab_epoch = quad_identity_epoch();
+            aim_pt_t k[4];
+            aim_canon(q, k);
+            for (int c = 0; c < 4; ++c) {
+                s_lab[c] = c;
+                for (int i = 0; i < 4; ++i)
+                    if (q[i].x == k[c].x && q[i].y == k[c].y) { s_lab[c] = i; break; }
+            }
+            s_lab_valid = true;
+        }
+        aim_pt_t k[4];
+        for (int c = 0; c < 4; ++c) k[c] = q[s_lab[c]];
+        s_cache_ret = aim_runtime_solve_labelled(k, WIICAM_NORM_W, WIICAM_NORM_H,
+                                                 &s_cache_sx, &s_cache_sy, dt);
+    } else {
+        s_lab_valid = false;
+        s_cache_ret = aim_runtime_solve(q, WIICAM_NORM_W, WIICAM_NORM_H,
+                                        &s_cache_sx, &s_cache_sy, dt);
+    }
     *sx = s_cache_sx; *sy = s_cache_sy;
     return s_cache_ret;
 }
@@ -1582,6 +1750,10 @@ static int parse_int(const char** p, int* got)
 bool wiicam_cam_command(const char* line)
 {
     if (!line) return false;
+    // A command line is the only moment anything can have changed the stored
+    // edges, and commands come at human cadence: re-reading them here costs
+    // nothing and keeps the cache honest to flash whoever wrote it.
+    fit_cache_dirty();
     // The recoil engine's commands ride the same channel: fx=, fx?, fxsave.
     if (fx_command(line, fx_now())) return true;
     if (!strncmp(line, "camsave", 7)) {
@@ -1651,13 +1823,17 @@ bool wiicam_cam_command(const char* line)
             if (e.led_n >= 500 && e.led_max_h >= 0) {
                 const int nl = (have && sled > e.led_max_h) ? sled : e.led_max_h;
                 const int np = (have && spx > e.led_max_px) ? spx : e.led_max_px;
-                if (!have || nl > sled || np > spx)
+                if (!have || nl > sled || np > spx) {
                     (void)aim_fit_store(nl, have ? sstray : 0, np);
+                    fit_cache_dirty();
+                }
             }
             int sw = -1;
             const bool havew = aim_fitw_load(&sw);
-            if (e.led_n >= 500 && e.led_max_w >= 0 && (!havew || e.led_max_w > sw))
+            if (e.led_n >= 500 && e.led_max_w >= 0 && (!havew || e.led_max_w > sw)) {
                 (void)aim_fitw_store(e.led_max_w);
+                fit_cache_dirty();
+            }
         }
         if (s_sens_save) s_sens_save();     // sens lives in OpenFIRE's profile
         aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq,
@@ -1725,7 +1901,7 @@ bool wiicam_cam_command(const char* line)
               "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
               "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu bsv=%lu bcold=%lu "
-              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d bwmax=%u benv=%lu\n",
+              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d bwmax=%u benv=%lu bmerge=%lu bwide=%lu bsplit=%lu\n",
               (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
               (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
               (unsigned)s_rtol, (unsigned)s_bhmax, (unsigned)s_pxmax, (unsigned)s_armax,
@@ -1741,7 +1917,8 @@ bool wiicam_cam_command(const char* line)
               (unsigned long)s_breal[3], (unsigned long)s_breal[2],
               (unsigned long)s_breal[1], (unsigned long)s_breal[0],
               (unsigned long)s_bpolls, (int)s_cam_hold, (unsigned)s_bwmax,
-              (unsigned long)s_benv);
+              (unsigned long)s_benv, (unsigned long)quad_ambig_total(),
+              (unsigned long)s_bwide, (unsigned long)s_bsplit);
         // In full mode each blob carries three more numbers -- box width, box
         // height and intensity -- so the line grows and the buffer with it.
         // Nine fields a blob in full mode, four of them added since this was
@@ -1896,6 +2073,7 @@ bool wiicam_cam_command(const char* line)
                                           g[0].next >= 0 ? g[0].next : (e.stray_min_h < 0 ? 0 : e.stray_min_h),
                                           e.led_max_px)
                          && (e.led_max_w < 0 || aim_fitw_store(e.led_max_w));
+            fit_cache_dirty();      // whatever landed, re-read it
             reply(ok ? "CAM: fit applied and saved\n"
                      : "CAM: fit applied but SAVE FAILED -- it will be gone on "
                        "the next power cycle\n");
@@ -1971,6 +2149,7 @@ bool wiicam_cam_command(const char* line)
         bool gone = aim_gate_clear();
         gone = aim_gate2_clear() && gone;
         gone = aim_fit_clear()   && gone;
+        fit_cache_dirty();
         gone = aim_hwloop_clear() && gone;
         // The live histograms go too (or the floor outlives the reset), and
         // the capture is armed as at boot (G3), so it refills from here.
@@ -2012,11 +2191,12 @@ bool wiicam_cam_command(const char* line)
         // between, and what this dwell has seen. Read it while the gun runs --
         // the counts are per dwell and reset with every register write.
         reply("CAM: loop on=%d state=%s val=%d lo=%d hi=%d dwell=%d/%d "
-              "clean=%d stray=%d cut=%d settled=%d saved=%d\n",
+              "clean=%d stray=%d cut=%d settled=%d saved=%d uncut=%d\n",
               (int)s_loop_on, loop_state_name(), s_loop_val, s_loop_lo,
               s_loop_hi, s_loop_dwell, LOOP_DWELL,
               s_loop_nclean, s_loop_nstray, s_loop_ncut,
-              (int)(s_loop_hold_run >= LOOP_SETTLED), (int)s_loop_saved);
+              (int)(s_loop_hold_run >= LOOP_SETTLED), (int)s_loop_saved,
+              s_loop_nstray_uncut);
         return true;
     }
     if (strncmp(line, "cam=", 4) != 0) return false;

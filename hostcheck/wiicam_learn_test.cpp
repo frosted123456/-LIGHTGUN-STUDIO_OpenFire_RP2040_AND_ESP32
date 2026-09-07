@@ -117,7 +117,11 @@ esp_err_t nvs_set_u32(nvs_handle_t, const char* k, uint32_t v){
     for (auto& s : g_u32s)
         if (!s.have) { strncpy(s.key, k, 15); s.v = v; s.have = true; return ESP_OK; }
     return -1; }
+// Every u32 read is counted: the stored edges must be read at boot and after
+// commands, never per frame (see the envelope block).
+static unsigned long g_u32_reads = 0;
 esp_err_t nvs_get_u32(nvs_handle_t, const char* k, uint32_t* v){
+    ++g_u32_reads;
     if (U32Slot* s = u32_find(k)) { *v = s->v; return ESP_OK; }
     return ESP_ERR_NVS_NOT_FOUND; }
 esp_err_t nvs_commit(nvs_handle_t){ return ESP_OK; }
@@ -2556,9 +2560,25 @@ int main()
            "...and with the live histograms cleared a 45x2 slab is still "
            "dropped, on width alone: the envelope reads the stored edges, so "
            "it survives a power cycle");
-        aim_fit_clear();
+        // ...from a cache. On the Pi the per-frame aim_fit_load halved the
+        // poll rate (bpolls == bframes at 85 Hz) and sat a core-0 flash read
+        // beside core-1 flash writes: the edges are read once per command,
+        // and a hundred frames touch flash not at all.
+        frame(WIDE2);
+        const unsigned long r0 = g_u32_reads;
+        for (int i = 0; i < 100; ++i) frame(WIDE2);
+        ck(g_u32_reads == r0 && benv() == e0 + 109,
+           "a hundred envelope frames read flash ZERO times: the stored edges "
+           "are cached between commands, not loaded per frame");
+        // The real command, not a stub erase: the edges are cached between
+        // commands (a flash read per frame halved the poll rate), so only a
+        // command can be expected to make the adapter see the erase.
+        wiicam_cam_command("camreset");
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("cam=res:0,dash:2,dashhz:0");
+        wiicam_cam_command("camlearn=on:0");
         g_lines.clear(); frame(SLAB); frame(SLAB);
-        ck(q_n() == 4 && benv() == e0 + 8,
+        ck(q_n() == 4 && benv() == e0 + 109,
            "camreset's erase of the stored edges switches it off again: no "
            "measurement, no envelope");
         wiicam_cam_command("cam=res:2,dash:0");
@@ -2649,6 +2669,122 @@ int main()
         }
         wiicam_cam_command("camlearn=reset");
         aim_fit_clear();
+    }
+
+    // ---- LED-class hygiene: a corner not of a kind with the other three --
+    // The Pi in sun: a 31 px streak took a corner slot on a locked model
+    // often enough to fill the LED width class from b25 up (430 of 11,692),
+    // and the automatic envelope, reading its own class, froze at 31 and
+    // cut nothing. The seed's own rule, applied to learning: four LEDs of
+    // one bar are within seed_wratio (4x) of each other, so a corner wider
+    // than 4x the NARROWEST of the other three is not learned -- a ratio
+    // inside the frame, the number the seed already uses -- and 'bwide'
+    // counts each one. Against the narrowest, not the median: a bar whose
+    // LEDs spread 2.7x on hardware must stay learnable end to end.
+    {
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("camlearn=on:0");
+        static const FullObj WIDE_RIG[4] = {      // widths 4, 5, 3 and 15: 5x the narrowest
+            { 256, 240, 2,  10, 20, 14, 24,  60 },
+            { 768, 240, 3,  10, 20, 15, 25, 100 },
+            { 256, 528, 4,  10, 20, 13, 23, 140 },
+            { 768, 528, 5,  10, 20, 25, 24, 190 },
+        };
+        static const FullObj FAT_RIG[4] = {       // widths 4, 5, 3 and 12: exactly 4x
+            { 256, 240, 2,  10, 20, 14, 24,  60 },
+            { 768, 240, 3,  10, 20, 15, 25, 100 },
+            { 256, 528, 4,  10, 20, 13, 23, 140 },
+            { 768, 528, 5,  10, 20, 22, 24, 190 },
+        };
+        for (int i = 0; i < 20; ++i) frame(WIDE_RIG);   // lock, and let it age
+        ck(quad_locked(), "hygiene: locked on the rig, one corner 15 px wide");
+        arm_clean();
+        const unsigned long wide0 = blobstat("bwide=");
+        for (int i = 0; i < 10; ++i) frame(WIDE_RIG);
+        ck(wl_frames() == 10u && hsum(0, WL_BW) == 30 && hat(0, WL_BW, 15) == 0
+           && hat(0, WL_BW, 4) == 10 && hat(0, WL_BW, 5) == 10 && hat(0, WL_BW, 3) == 10,
+           "ten locked 4-real frames teach the LED class thirty widths, not "
+           "forty: the 15 px corner -- five times the 3 px narrowest of the "
+           "other three -- is left out of every frame, the three LEDs are in");
+        ck(blobstat("bwide=") == wide0 + 10,
+           "...and 'bwide' on the camblob line counts the ten it left out");
+        for (int i = 0; i < 10; ++i) frame(FAT_RIG);
+        ck(hsum(0, WL_BW) == 70 && hat(0, WL_BW, 12) == 10 && blobstat("bwide=") == wide0 + 10,
+           "...while a 12 px corner beside the same three -- exactly 4x the "
+           "narrowest, the seed's own line -- is learned like the rest: a "
+           "bright LED is not a streak, and the rule that let it seed lets "
+           "it teach");
+        wiicam_cam_command("camlearn=on:0");
+        wiicam_cam_command("camlearn=reset");
+    }
+
+    // ---- a split frame teaches nothing -------------------------------
+    // The resolver splits a row-merged pair into two corners (merge_split),
+    // so the frame is 4-real -- but the blob list still holds the merged
+    // blob, and a 30 px pair is not an LED. The frame is skipped by the
+    // capture and counted in 'bsplit'.
+    {
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("camlearn=on:0");
+        static const FullObj SQ_RIG[4] = {          // widths 4,5,3,4
+            { 256, 240, 2,  10, 20, 14, 24,  60 },
+            { 768, 240, 3,  10, 20, 15, 25, 100 },
+            { 256, 528, 4,  10, 20, 13, 23, 140 },
+            { 768, 528, 5,  10, 20, 14, 24, 190 },
+        };
+        for (int i = 0; i < 20; ++i) frame(SQ_RIG);
+        ck(quad_locked(), "split: locked on the rig");
+        arm_clean();
+        for (int i = 0; i < 4; ++i) frame(SQ_RIG);
+        const long n0 = hsum(0, WL_BW);
+        const unsigned long sp0 = blobstat("bsplit=");
+        // bottom pair merged: one blob at their midpoint, width = the pair's
+        // separation in the sensor's 128 px array (512 raw / 8 = 64... in
+        // box units the rig is 512 raw wide = 64 box px) + one LED (4)
+        static const FullObj SQ_MERGED[3] = {
+            { 256, 240, 2,  10, 20, 14, 24,  60 },
+            { 768, 240, 3,  10, 20, 15, 25, 100 },
+            { 512, 528, 6,  30, 20, 98, 24, 250 },
+        };
+        FullObj m[4]; memcpy(m, SQ_MERGED, sizeof(SQ_MERGED)); m[3] = SQ_MERGED[2];
+        // drive three objects: the helper sends four, so mark the fourth empty
+        {
+            FullObj f[4]; memcpy(f, m, sizeof(f));
+            f[3].x = 1023; f[3].y = 1023;
+            memcpy(g_fobj, f, sizeof(g_fobj));
+            float sx = 0.0f, sy = 0.0f;
+            wiicam_aim_full_poll(g_qpx, g_qpy, g_qsz, &g_qseen);
+            g_t += DT;
+            wiicam_aim_process_sz(g_qpx, g_qpy, g_qsz, g_qseen & 7u, g_t, &sx, &sy);
+        }
+        ck(blobstat("bsplit=") == sp0 + 1 && hsum(0, WL_BW) == n0,
+           "a frame whose bottom pair came in as one 69-wide blob is split by "
+           "the resolver (bsplit +1) and the capture learns nothing from it: "
+           "the merged blob is not an LED width");
+        // With the automatic envelope live (a stored 5 px width edge -> 10 px
+        // ceiling) the 69-wide blob would be dropped before the resolver ever
+        // saw it. It sits on the last frame's bottom pair, at their midpoint:
+        // it is let through, and split again.
+        aim_fitw_store(5);
+        wiicam_cam_command("camlearn=on:1");       // any command re-reads the edges
+        for (int i = 0; i < 4; ++i) frame(SQ_RIG);
+        const unsigned long sp1 = blobstat("bsplit="), env1 = blobstat("benv=");
+        {
+            FullObj f[4]; memcpy(f, m, sizeof(f));
+            f[3].x = 1023; f[3].y = 1023;
+            memcpy(g_fobj, f, sizeof(g_fobj));
+            float sx = 0.0f, sy = 0.0f;
+            wiicam_aim_full_poll(g_qpx, g_qpy, g_qsz, &g_qseen);
+            g_t += DT;
+            wiicam_aim_process_sz(g_qpx, g_qpy, g_qsz, g_qseen & 7u, g_t, &sx, &sy);
+        }
+        ck(blobstat("bsplit=") == sp1 + 1 && blobstat("benv=") == env1,
+           "...and with the automatic width envelope live, a too-wide blob on "
+           "the last frame's pair row at their midpoint is NOT dropped by it "
+           "(benv unchanged): it reaches the resolver and is split");
+        aim_fit_clear();
+        wiicam_cam_command("camlearn=on:0");
+        wiicam_cam_command("camlearn=reset");
     }
 
     // ---- camreset clears the capture and arms it again ------------------

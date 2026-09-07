@@ -3648,6 +3648,20 @@ def main():
     ck(b"cam=ext:1" not in sent and b"camlearn=on:0" not in sent,
        "and NOTHING is sent to put the old state back: the gun that would "
        "receive it is not the gun it was recorded from (%s)" % sent)
+    # ...and the one question that says WHY: the pong carries rst=, and its
+    # answer goes to stdout, which the launcher keeps as lastrun.log -- the
+    # only evidence a reboot at the TV leaves behind.
+    ck(b"ping" in sent,
+       "a restart is followed by '~ping', for the reset reason (%s)" % sent[-80:])
+    import io, contextlib
+    app.link.src.q.put("AIM: pong  board=rp2040-wiicam calib=active filter=0.50/0.20 "
+                       "capture=on  up=3s boots=7 rst=WDT_FORCE\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        app.step([], t + 19.2)
+    ck("rst=WDT_FORCE" in out.getvalue() and "boots=7" in out.getvalue(),
+       "...and the pong is written to the log verbatim when it arrives: %r"
+       % out.getvalue().strip())
     arm(0)
     ck(app._cam_borrow is not None,
        "the fresh borrow completes against the gun that is actually there")

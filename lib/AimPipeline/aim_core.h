@@ -53,6 +53,11 @@ int  aim_quad_to_square(const aim_pt_t q[4], float px, float py,
 // Returns 0 if the calibration is invalid or the quad is degenerate.
 int  aim_solve(const aim_calib_t* c, const aim_pt_t q[4],
                float frame_w, float frame_h, float* sx, float* sy);
+// The same on a quad the caller has ALREADY put in TL,TR,BL,BR order -- no
+// geometric re-labelling. For a caller whose corner identity persists across
+// frames; a rolled quad then keeps its labels instead of swapping them.
+int  aim_solve_labelled(const aim_calib_t* c, const aim_pt_t k[4],
+                        float frame_w, float frame_h, float* sx, float* sy);
 
 // ---- calibration ---------------------------------------------------------
 

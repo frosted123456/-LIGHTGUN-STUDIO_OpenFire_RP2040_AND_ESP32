@@ -31,6 +31,10 @@ struct QuadResult {
     // Cold raw passthrough: no model yet, and no offered set accepted. p[] is
     // the blobs as handed in, so a consumer must not count them as corners seen.
     bool  passthrough;
+    // merge_split: corners this frame that came from splitting a merged
+    // blob (0, or 2 per split). They are published as real; a learner of
+    // blob shapes should skip the frame, since the merged blob is not an LED.
+    int   split;
 };
 
 // Tunables for association and model learning.
@@ -52,6 +56,30 @@ struct QuadConfig {
     // fragments never are. Relative, inside the frame -- no rig assumed.
     // Needs quad_offer_widths() each frame; 0 = off (the OV path).
     float seed_wratio;
+    // The gate a slot widens to after misses (up to 3x) is capped at this
+    // fraction of the model's SHORTEST side, never below the base gate: on a
+    // rig 35 px across a 60 px gate reaches the next corner and past it, and
+    // a stray there is adopted as the missing LED. Relative to what this rig
+    // measures; 0 = off (the OV path).
+    float gate_cap_ratio;
+    // A blob inside the gate of two unmatched slots, with the second-nearest
+    // closer than this many times the nearest, is assigned to NEITHER: two
+    // LEDs merged into one blob sit at their midpoint, and snapping either
+    // corner onto it warps the model and rotates corner identity. The other
+    // blobs still associate; the frame is used for what it holds. 0 = off.
+    float assoc_ambig_ratio;
+    // Re-acquire the model from three blobs with the fourth corner
+    // reconstructed, when no four-set matches. The sensor has four object
+    // slots; a stray holding one means it never reports all four LEDs, and
+    // without this the lock cannot come back while the stray is in view.
+    // Off = the OV path.
+    bool  reseed3;
+    // Two LEDs merged along a row into one blob, refused as ambiguous, are
+    // split into their two corners when the blob sits at the midpoint of
+    // the two predictions and its width is their separation plus one LED
+    // width (from this frame's other blobs). Needs quad_offer_widths().
+    // Off = refused and reconstructed, as before.
+    bool  merge_split;
 };
 
 // Returns the defaults, tuned for a 240x176 sensor at ~135 fps.
@@ -66,6 +94,15 @@ void       quad_offer_widths(const int* w, int n);
 // read resolver state with no hold, so a serial-core caller can see it mid-update.
 bool       quad_locked(void);     // same flag the last QuadResult carried
 bool       quad_has_model(void);  // a rig shape has been learned
+// Blobs refused as ambiguous between two slots since boot: a merged LED
+// pair, mostly. Cumulative across quad_reset() and never reset by a reader
+// (the stats are the OV path's; this one the wiicam log reads as it runs).
+uint32_t   quad_ambig_total(void);
+// Bumped every time the four slots are bound to blobs afresh (seed, re-seed
+// from the model, re-seed from three). Between two equal readings the slot
+// order carries the same corner identity, so a consumer may label the slots
+// once and keep the labels; a change means label again. Camera core only.
+uint32_t   quad_identity_epoch(void);
 
 // Telemetry, reset by the reader.
 struct QuadStats {
@@ -88,6 +125,8 @@ struct QuadStats {
     uint32_t worst_us;      // worst single quad_update(), microseconds
     uint32_t total_us;      // summed quad_update() time, microseconds
     uint32_t giveups;       // veto_seed: a model dropped -- refused every re-acquire, or a near blob it never matched
+    uint32_t ambig;         // blobs refused as ambiguous between two slots (a merged LED pair)
+    uint32_t splits;        // merged pairs split into two corners (merge_split)
 };
 QuadStats quad_take_stats(void);
 

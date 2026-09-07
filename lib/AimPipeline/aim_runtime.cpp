@@ -950,15 +950,27 @@ bool aim_runtime_clear(void)
 }
 
 // Hot path: native-px quad -> filtered normalised screen coords.
-bool aim_runtime_solve(const aim_pt_t q[4], float frame_w, float frame_h,
-                       float* sx, float* sy, float dt_s)
+static bool runtime_solve(const aim_pt_t q[4], float frame_w, float frame_h,
+                          float* sx, float* sy, float dt_s, bool labelled)
 {
     if (!s_enabled || s_c.magic != AIM_CAL_MAGIC) return false;
-    if (!aim_solve(&s_c, q, frame_w, frame_h, sx, sy)) return false;
+    const int ok = labelled ? aim_solve_labelled(&s_c, q, frame_w, frame_h, sx, sy)
+                            : aim_solve(&s_c, q, frame_w, frame_h, sx, sy);
+    if (!ok) return false;
     if (s_fc > 0.0f) oe_filter(sx, sy, dt_s);
     // A caller mapping this into integer screen units must never see a NaN.
     if (*sx != *sx || *sy != *sy) return false;
     return true;
+}
+bool aim_runtime_solve(const aim_pt_t q[4], float frame_w, float frame_h,
+                       float* sx, float* sy, float dt_s)
+{
+    return runtime_solve(q, frame_w, frame_h, sx, sy, dt_s, false);
+}
+bool aim_runtime_solve_labelled(const aim_pt_t k[4], float frame_w, float frame_h,
+                                float* sx, float* sy, float dt_s)
+{
+    return runtime_solve(k, frame_w, frame_h, sx, sy, dt_s, true);
 }
 
 // ---------------------------------------------------------------------------

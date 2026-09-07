@@ -135,6 +135,10 @@ bool aim_dead_store(int units);
 // nominal frame period is assumed. The filter runs INSIDE this call.
 bool aim_runtime_solve(const aim_pt_t q[4], float frame_w, float frame_h,
                        float* sx, float* sy, float dt_s);
+// The same, on a quad the caller has already labelled TL TR BL BR: no
+// geometric re-labelling inside (see aim_solve_labelled).
+bool aim_runtime_solve_labelled(const aim_pt_t k[4], float frame_w, float frame_h,
+                                float* sx, float* sy, float dt_s);
 
 // Call every Run-loop iteration with the trigger state. On the press edge, and
 // only while capture mode is on ("aimcap=1"), emits "T,<ms>" to the out sink.

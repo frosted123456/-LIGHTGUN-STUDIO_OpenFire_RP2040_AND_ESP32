@@ -377,12 +377,14 @@ def main():
         "CAM: blob fmt=2 ext=1 fullreg=85 bmin=2 bmax=9 rtol=3 bhmax=10 "
         "pxmax=14 armax=20 hwmax=-1 hwmin=-1 bn=4 brej=90 brrej=39 bvalve=61 "
         "bframes=1900 bms=19000 bdrop=3 bsrej=27 bfar=13 bnear=4 br4=1700 "
-        "br3=250 br2=90 br1=40 br0=20\n")
+        "br3=250 br2=90 br1=40 br0=20 bpolls=3800 hold=0 bwmax=0 benv=5 "
+        "bmerge=17 bwide=6\n")
     link = Link()
     link.src = type("S", (), {"q": _queue_of([blob_line])})()
     link.pump()
     for k, want in (("bsrej", 27), ("bfar", 13), ("bnear", 4),
-                    ("bhmax", 10), ("pxmax", 14), ("armax", 20)):
+                    ("bhmax", 10), ("pxmax", 14), ("armax", 20),
+                    ("bmerge", 17), ("bwide", 6)):
         ck(link.last.get(k) == want,
            "'%s=%d' off a real camblob? line reaches last[] (%r)"
            % (k, want, link.last.get(k)))
@@ -404,6 +406,10 @@ def main():
     ck(wire["xm0"] == "20" and wire["ym0"] == "14",
        "and the origin off the same line, so a capture can be plotted where "
        "the blobs actually were: %s" % {k: wire[k] for k in ("xm0", "ym0")})
+    ck(wire["bmerge"] == "17" and wire["bwide"] == "6",
+       "and the merged-pair refusals and the unlearned wide corners, so a "
+       "capture says how often a pair merged and how often a corner was "
+       "not of a kind: %s" % {k: wire[k] for k in ("bmerge", "bwide")})
 
     # ---- the loop's own line, and how old it is ---------------------------
     # '~camloop?' is a slower poll than '~camblob?', so a row's loop columns
@@ -415,7 +421,7 @@ def main():
     link.clock = lambda: tclk[0]
     link.src = type("S", (), {"q": _queue_of([
         "CAM: loop on=1 state=LOWER val=127 lo=0 hi=255 dwell=12/50 "
-        "clean=2 stray=9 cut=1 settled=0 saved=0\n"])})()
+        "clean=2 stray=9 cut=1 settled=0 saved=0 uncut=4\n"])})()
     link.pump()
     tclk[0] = 100.35
     log5 = BlobLog(os.path.join(d, "loop.csv"), clock=lambda: tclk[0])
@@ -436,11 +442,18 @@ def main():
     ck(lp["loopage"] == "350",
        "...with the age of that loop line in ms, so a reader knows how far "
        "the loop columns lag the frame (%r)" % lp["loopage"])
-    ck(tuple(BlobLog.COLS[-9:]) == ("loopl", "looph", "loopdw", "loopcl",
-                                    "loopst", "loopcu", "loopsv", "loopage",
-                                    "bwmax"),
+    ck(lp["loopuc"] == "4",
+       "...and the dwell's 'uncut' count -- stray frames the sensor sized "
+       "like the LEDs, the ones the loop holds on (%r)" % lp["loopuc"])
+    ck(tuple(BlobLog.COLS[-14:]) == ("loopl", "looph", "loopdw", "loopcl",
+                                     "loopst", "loopcu", "loopsv", "loopage",
+                                     "bwmax", "bpolls", "benv",
+                                     "bmerge", "bwide", "loopuc"),
        "and they are on the END, behind loopv/loops, like every column since "
-       "the first file -- with the width gate behind them")
+       "the first file -- with the width gate, the poll count, the "
+       "envelope's drops, the merge and wide counts and 'uncut' behind them")
+    ck(link.loop.get("uncut") == 4 and link.last.get("loopuc") == 4,
+       "'uncut=' off the loop line reaches both the loop dict and last[]")
     log6 = BlobLog(os.path.join(d, "noloop.csv"))
     nl = {k: v for k, v in link.last.items() if not k.startswith("loop")
           and k not in ("hwv", "hws", "hwlo", "hwhi")}
