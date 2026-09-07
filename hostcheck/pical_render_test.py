@@ -931,9 +931,15 @@ def main():
     app.open(cam3)
 
     def page(cam, advanced):
-        """Build the page named and hand back its labels, in order."""
-        if bool(cam.advanced) != advanced:
-            cam.enter_advanced() if advanced else cam.leave_advanced()
+        """Build the page named (0 camera, 1 gates, 2 sensor & diagnostics,
+        True = 1) and hand back its labels, in order."""
+        level = int(advanced)
+        if cam.advanced != level:
+            if level:
+                cam.enter_advanced(level)
+            else:
+                while cam.advanced:
+                    cam.leave_advanced()
         return [r.label for r in cam.rows]
 
     # 'Auto light limit' sits directly under the height gate on purpose: they
@@ -941,25 +947,35 @@ def main():
     # only one of the two that can act before the sensor has already dropped
     # the corner. A pass that moved it onto the second page would put the one
     # control that prevents the fault behind a disclosure.
-    FRONT = ["Sensitivity", "Blob detail (sizes)", "Biggest blob (height)",
-             "Auto light limit",
-             "Learn LED shape", "Log blobs to the stick",
-             "Write shape CSV to the stick", "Save to gun", "Advanced", "Back"]
+    # A normal user changes sensitivity and nothing else: the report format
+    # is full by default, the ceilings are measured by the room-light step,
+    # the LED shape measures itself. So the camera page is what a user acts
+    # on -- the gate's state, a reset, the loop -- and everything with a
+    # number in it is on the two pages behind 'Advanced'.
+    FRONT = ["Sensitivity", "Measure the shape gate", "Reset LED shape",
+             "Auto light limit", "Save to gun", "Advanced", "Back"]
     ADV = ["Smallest blob kept", "Largest blob kept",
            "Odd-one-out (size steps)", "Biggest blob (pixels)",
-           "Roundness limit", "Sensor max size (0x06)",
-           "Sensor min size (0x1B)", "Full-mode register (0x33)",
-           "Sensor connection test", "Back"]
+           "Roundness limit", "Blob detail (sizes)", "Biggest blob (height)",
+           "Biggest blob (width)", "Sensor & diagnostics", "Back"]
+    ADV2 = ["Learn LED shape", "Log blobs to the stick",
+            "Write shape CSV to the stick", "Sensor max size (0x06)",
+            "Sensor min size (0x1B)", "Full-mode register (0x33)",
+            "Sensor connection test", "Back"]
     labels = page(cam3, False)
     ck(labels == FRONT,
-       "the camera page carries the testing controls, in order (%s)" % labels)
+       "the camera page carries what a user acts on, in order (%s)" % labels)
     adv_labels = page(cam3, True)
     ck(adv_labels == ADV,
-       "and the second page carries the gates and the registers (%s)"
+       "and the second page carries the hand gates and the format (%s)"
        % adv_labels)
-    ck(not [l for l in adv_labels if l in FRONT and l != "Back"],
-       "with nothing on both pages at once (%s)"
-       % [l for l in adv_labels if l in FRONT and l != "Back"])
+    adv2_labels = page(cam3, 2)
+    ck(adv2_labels == ADV2,
+       "and the third the sensor's registers and the diagnostics (%s)"
+       % adv2_labels)
+    ck(not [l for l in adv_labels + adv2_labels if l in FRONT and l != "Back"]
+       and not [l for l in adv2_labels if l in ADV and l != "Back"],
+       "with nothing on two pages at once")
     # Every control the one long list used to carry is still reachable. A
     # split that quietly loses a row is worse than a list that is too long:
     # the setting is simply gone, with nothing on screen to say where.
@@ -970,9 +986,37 @@ def main():
            "Sensor max size (0x06)", "Sensor min size (0x1B)",
            "Log blobs to the stick", "Learn LED shape",
            "Write shape CSV to the stick", "Save to gun"]
-    lost = [l for l in WAS if l not in FRONT + ADV]
+    lost = [l for l in WAS if l not in FRONT + ADV + ADV2]
     ck(not lost,
        "and nothing that used to be on the screen was lost (%s)" % lost)
+    # The two rows a normal user acts on. The gate row is a status line and
+    # a door to 4b; the reset row is the toggle pressed twice (the off->on
+    # edge is what clears the capture).
+    labels = page(cam3, False)
+    grow = cam3.rows[labels.index("Measure the shape gate")]
+    app.link.last.pop("bhmax", None); app.link.last.pop("bwmax", None)
+    ck(grow.tip().startswith("off --") and "measure" in grow.tip(),
+       "with no gate set the row reads off and points at the measurement: %r"
+       % grow.tip())
+    app.link.last["bhmax"] = 8; app.link.last["bwmax"] = 19
+    ck(grow.tip().startswith("on: height 8, width 19"),
+       "...and with both ceilings in force it says which, from the gun's own "
+       "numbers: %r" % grow.tip())
+    app.link.last.pop("bhmax", None); app.link.last.pop("bwmax", None)
+    cam3.sel = labels.index("Reset LED shape")
+    n0 = len(ser.written)
+    app.step([key(pygame.K_RETURN)], t + 9.14)
+    sent = [w for w in ser.written[n0:]]
+    ck(any(b"camlearn=on:0" in w for w in sent)
+       and any(b"camlearn=on:1" in w for w in sent),
+       "Reset LED shape sends the capture off then on -- the edge that clears "
+       "it -- and nothing else (%s)" % sent)
+    # The third page's Back lands on the second, not on the camera page.
+    page(cam3, 2)
+    cam3.leave_advanced()
+    ck(cam3.advanced == 1 and cam3.rows[cam3.sel].label == "Sensor & diagnostics",
+       "Back from the third page lands on the second, on the row that opened it")
+    page(cam3, False)
 
     # Getting there and back. Esc has to come back to the camera page rather
     # than out to the menu: the menu closes a blob log that is still
@@ -1228,13 +1272,13 @@ def main():
     # over the sixteen-row band would put 51 px between 24 px labels and push
     # the readout down for nothing. Both pages are measured, because the
     # longer of the two is the one that decides how much is left below.
-    for advanced in (False, True):
+    for advanced in (0, 1, 2):
         page(cam3, advanced)
         cam3.draw(pi_sc)
         ys = sorted(r.rect.centery for r in cam3.rows if r.rect)
         pitch = min(b - a for a, b in zip(ys, ys[1:]))
-        what = "second page" if advanced else "camera page"
-        ck(8 <= len(cam3.rows) <= 11,
+        what = ("camera page", "second page", "third page")[advanced]
+        ck(7 <= len(cam3.rows) <= 11,
            "the %s is a list somebody can read from a sofa, not sixteen "
            "rows (%d)" % (what, len(cam3.rows)))
         ck(pitch - pi_sc.f_m.get_height() >= 3.0,
@@ -1587,14 +1631,15 @@ def main():
     # whichever page they now live on. fmt: is sent ONLY for full mode: the
     # previous firmware has no such key and drops it in silence, so a gun on
     # it could never be moved off detail 0 at all.
-    for label, wire, adv in (("Biggest blob (height)", b"cam=bhmax:", False),
-                             ("Odd-one-out (size steps)", b"cam=rtol:", True),
-                             ("Biggest blob (pixels)", b"cam=pxmax:", True),
-                             ("Roundness limit", b"cam=armax:", True),
-                             ("Sensor max size (0x06)", b"cam=hwmax:", True),
-                             ("Sensor min size (0x1B)", b"cam=hwmin:", True),
+    for label, wire, adv in (("Biggest blob (height)", b"cam=bhmax:", 1),
+                             ("Biggest blob (width)", b"cam=bwmax:", 1),
+                             ("Odd-one-out (size steps)", b"cam=rtol:", 1),
+                             ("Biggest blob (pixels)", b"cam=pxmax:", 1),
+                             ("Roundness limit", b"cam=armax:", 1),
+                             ("Sensor max size (0x06)", b"cam=hwmax:", 2),
+                             ("Sensor min size (0x1B)", b"cam=hwmin:", 2),
                              ("Full-mode register (0x33)", b"cam=fullreg:",
-                              True)):
+                              2)):
         here = page(cam3, adv)
         ck(label in here, "the camera screen offers '%s'" % label)
         cam3.sel = here.index(label)
@@ -1610,9 +1655,10 @@ def main():
     # screen with no console that is an arrow that visibly does nothing, so
     # the ladders are built so it cannot be reached: every rung, stepped from
     # every other rung, in both directions, has to be a value the gun takes.
-    for label, floor, adv in (("Biggest blob (height)", 8, False),
-                              ("Biggest blob (pixels)", 12, True),
-                              ("Roundness limit", 16, True)):
+    for label, floor, adv in (("Biggest blob (height)", 8, 1),
+                              ("Biggest blob (width)", 12, 1),
+                              ("Biggest blob (pixels)", 12, 1),
+                              ("Roundness limit", 16, 1)):
         here = page(cam3, adv)
         row = cam3.rows[here.index(label)]
         sent = []
@@ -1669,7 +1715,7 @@ def main():
     # means something else by the key, or a value typed at a serial terminal,
     # must not take the screen down: pical is fullscreen with no console, so
     # an exception inside draw is a black TV.
-    labels = page(cam3, False)
+    labels = page(cam3, 1)
     bh = cam3.rows[labels.index("Biggest blob (height)")]
     ck(bh.show(10) == "10 rows" and bh.show(0) == "off"
        and bh.show(None) == "--",
@@ -1681,9 +1727,9 @@ def main():
             ck(isinstance(r_.show(v), str),
                "'%s' survives a value the gun should never send (%r -> %r)"
                % (r_.label, v, r_.show(v)))
-    for label, adv in (("Biggest blob (height)", False),
-                       ("Biggest blob (pixels)", True),
-                       ("Roundness limit", True)):
+    for label, adv in (("Biggest blob (height)", 1),
+                       ("Biggest blob (pixels)", 1),
+                       ("Roundness limit", 1)):
         here = page(cam3, adv)
         tip = cam3.rows[here.index(label)].tip()
         ck("Blob detail 2" in tip,
@@ -1729,6 +1775,7 @@ def main():
            "the gun refusing %s is said out loud, not left in a log nobody "
            "can see: %r" % (why, app.toast))
 
+    labels = page(cam3, 1)
     cam3.sel = labels.index("Blob detail (sizes)")
     for k, want, gone in ((pygame.K_LEFT, b"cam=ext:1", b"cam=fmt:1"),
                           (pygame.K_RIGHT, b"cam=fmt:2", None)):
@@ -1749,18 +1796,20 @@ def main():
     # the ceiling it settled on ITSELF, so the flat old wording is now false
     # about the one limit most likely to be in force -- and false in the
     # direction that sends somebody hunting for a number by hand.
+    labels = page(cam3, False)
     save_hint = cam3.rows[labels.index("Save to gun")].tip()
     ck("full-mode register" in save_hint and "set by hand" in save_hint,
        "the Save hint names what does NOT persist: %r" % save_hint)
     ck("sensor thresholds" not in save_hint,
        "and no longer says the sensor thresholds are never kept -- the loop "
        "saves the one it settles on: %r" % save_hint)
-    adv_labels = page(cam3, True)
+    adv_labels = page(cam3, 2)
     ck("NOT saved" in cam3.rows[
            adv_labels.index("Full-mode register (0x33)")].tip(),
        "and the register's own row says it too")
     # Nothing on the second page saves, and the row that leaves it is the last
     # thing a user touches after a minute spent on the size window.
+    adv_labels = page(cam3, True)
     ck("Save" in cam3.rows[adv_labels.index("Back")].tip(),
        "the second page's Back row says where Save is: %r"
        % cam3.rows[adv_labels.index("Back")].tip())
@@ -1884,7 +1933,7 @@ def main():
     # off, and the hint no longer says the value is never saved -- the loop
     # saves the one it settled on, and only a hand-set one is thrown away.
     loop_reply("HOLD")
-    adv_labels = page(cam3, True)
+    adv_labels = page(cam3, 2)
     hwrow = cam3.rows[adv_labels.index("Sensor max size (0x06)")]
     ck("loop" in hwrow.tip() and "turns the loop off" in hwrow.tip(),
        "with the loop running, the sensor-max hint says setting it by hand "
@@ -1980,16 +2029,24 @@ def main():
     # The loop's two are the newest and therefore the last: the limit it is
     # holding and what it is doing, which is the only thing in the file that
     # explains why a capture's blob sizes changed half way through.
-    ck(head.endswith(",loopv,loops"),
-       "the loop columns are on the END, where every addition has to go or "
-       "every capture already on a stick reads shifted: %r" % head[-40:])
+    hcols = head.split(",")
+    ck(",loopv,loops," in head and hcols.index("loopv") > hcols.index("bcold"),
+       "the loop columns are behind bcold, where every addition has to go or "
+       "every capture already on a stick reads shifted: %r" % head[-60:])
+    lv = slice(hcols.index("loopv"), hcols.index("loops") + 1)
     ck(all(len(ln.split(",")) == len(head.split(",")) for ln in body),
        "COLS and sample() are the same width: header %d, rows %s"
        % (len(head.split(",")), sorted({len(ln.split(",")) for ln in body})))
-    ck(len(body) >= 2 and body[-1].split(",")[-2:] == ["41", "LOWER"],
+    ck(len(body) >= 2 and body[-1].split(",")[lv] == ["41", "LOWER"],
        "a row written after a '~camloop?' answer carries that answer's limit "
        "and state, not the ones from connect: %r"
-       % [ln.split(",")[-2:] for ln in body])
+       % [ln.split(",")[lv] for ln in body])
+    # The loop line is a separate, slower poll; the row says how stale it is,
+    # on the tools' own clock (the test drives a fake one), never a wall clock.
+    ages = [ln.split(",")[hcols.index("loopage")] for ln in body]
+    ck(all(a != "" and 0 <= int(a) < 60000 for a in ages),
+       "every row carries the age of its loop line in ms, on the link's "
+       "clock: %r" % ages)
     # And a screen that was logging must not keep the file open once it is gone.
     cam3.log_toggle()
     app.to_menu()
@@ -2029,9 +2086,10 @@ def main():
     app.link.last["board"] = "rp2040-wiicam"
     cam4 = pical.Camera(app)
     app.open(cam4)
-    labels = [r.label for r in cam4.rows]
+    labels = page(cam4, 2)
     ck("Learn LED shape" in labels and "Write shape CSV to the stick" in labels,
-       "the wiicam camera screen offers the shape capture and its CSV")
+       "the wiicam camera screen offers the shape capture and its CSV, on "
+       "the diagnostics page")
     csv_row = cam4.rows[labels.index("Write shape CSV to the stick")]
     ck("shape-NNN.csv" in csv_row.tip() and "0 LED" not in csv_row.tip(),
        "and before anything is captured its hint says what the file is, not "
@@ -2379,6 +2437,27 @@ def main():
     ck(f.bhmax == 8 and f.tight,
        "and a one-step gap comes through as TIGHT rather than as an ordinary "
        "answer, because it is the one worth re-sweeping")
+    # The width axis, on the same answer: the header carries both edges on
+    # the end, and a width ceiling is a verdict on its own -- the hardware
+    # capture that motivated it had NO height gap (a 3x0 window fragment)
+    # and a 21-column one.
+    f.feed(HDR % (900, 3, 40, 0) + " ledmaxw=9 strayminw=3")
+    f.feed("CAM: fit bwmax=19 (LEDs reach 9 wide, stray starts at 30)")
+    ck(f.verdict == "gate" and f.bwmax == 19 and f.bhmax is None
+       and f.led_w == 9 and f.stray_w == 30 and not f.tight_w,
+       "a width-only verdict is a verdict: bwmax 19 with no height ceiling "
+       "(%s, bh %s, bw %s, w %s..%s)"
+       % (f.verdict, f.bhmax, f.bwmax, f.led_w, f.stray_w))
+    ck(pical.RoomSweep.gate_words(f) == "19 columns",
+       "...and the apply screen words it as columns, not rows")
+    f.feed(HDR % (900, 7, 40, 13) + " ledmaxw=9 strayminw=3")
+    f.feed("CAM: fit bhmax=10 (LEDs reach 7, stray starts at 13)")
+    f.feed("CAM: fit bwmax=19 (LEDs reach 9 wide, stray starts at 30)")
+    ck(f.bhmax == 10 and f.bwmax == 19 and pical.RoomSweep.gate_words(f) == "10 rows and 19 columns",
+       "...both axes together read as both (%s)" % pical.RoomSweep.gate_words(f))
+    f.feed(HDR % (900, 7, 40, 13))
+    ck(f.bwmax is None and f.led_w is None,
+       "a new header clears the width verdict with the rest")
     # Setting the gate and getting it into flash fail SEPARATELY. A gate that
     # took but was not saved is gone on the next power cycle, and nothing else
     # anywhere would say so.
@@ -2626,8 +2705,10 @@ def main():
            "that always works and is not guessable from the row's label")
         ck(gate and ("Move the bar" in gate[0] or "brighter LEDs" in gate[0]),
            "...and what to do about the room instead of offering a number")
+        page(cam5, 1)
         tip = [r for r in cam5.rows
                if r.label == "Biggest blob (height)"][0].tip()
+        page(cam5, False)
         ck("NO SAFE GATE" in tip and "rows" not in tip,
            "the gate's own row says it too, and offers no height at all -- "
            "there is no number that works on such a rig, and half of one is "
@@ -2977,7 +3058,7 @@ def main():
     ck(not suggested,
        "no gate row suggests a figure for itself on either page (%s)"
        % suggested)
-    labels = page(cam6, False)
+    labels = page(cam6, 1)
     bh = cam6.rows[labels.index("Biggest blob (height)")]
     ck("sweep" in bh.tip() and "recommended" not in bh.tip(),
        "the height gate points at the room sweep that can measure it, "
@@ -2992,12 +3073,14 @@ def main():
     ck(ar.show(20) == "2.5:1" and ar.show(0) == "off" and 0 in ar.vals,
        "and it still LOADS and displays, so a gun already set up with one "
        "keeps its meaning (%s)" % [ar.show(v) for v in (0, 16, 20)])
-    hw = cam6.rows[adv_labels.index("Sensor max size (0x06)")]
+    adv2_labels = page(cam6, 2)
+    hw = cam6.rows[adv2_labels.index("Sensor max size (0x06)")]
     ck("Nintendo" not in hw.tip() and "100-200" not in hw.tip(),
        "the sensor ceiling quotes nobody else's hardware: %r" % hw.tip())
     ck(hw.vals[0] == -1 and "leaves it alone" in hw.tip(),
        "and names the value that leaves the sensor alone, which is how it "
        "ships (%s)" % (hw.vals[0],))
+    adv_labels = page(cam6, 1)
     px = cam6.rows[adv_labels.index("Biggest blob (pixels)")]
     ck(0 in px.vals and px.show(0) == "off",
        "every gate can still be turned off from its own row")
@@ -3978,8 +4061,10 @@ def main():
             if "NO SAFE GATE" in l or "REFUSING HEAVILY" in l],
        "a gun that cannot answer raises no gate verdict -- silence is not "
        "'no gate can work here'")
+    page(cam8, 1)
     tip = [r for r in cam8.rows
            if r.label == "Biggest blob (height)"][0].tip()
+    page(cam8, False)
     ck("Blob detail 2" in tip and "drops" in tip,
        "and the gate row falls back to what it is rather than to a blank: "
        "%r" % tip)

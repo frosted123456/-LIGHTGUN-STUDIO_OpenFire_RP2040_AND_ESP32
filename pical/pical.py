@@ -251,6 +251,12 @@ class FitReport:
         self.verdict = None      # 'need_led' / 'need_stray' / 'no_gate' / 'gate'
         self.bhmax = None
         self.tight = False
+        # The width axis, measured the same way and a verdict on its own:
+        # an LED never passed 12 wide on hardware, a window's slabs 13..93.
+        self.led_w = self.stray_w = None
+        self.bwmax = None
+        self.tight_w = False
+        self.led_only = False    # the ceilings came from the LEDs alone
         self.stored = None       # (LED rows, stray rows) from an earlier capture
         self.stored_px = None    # ...and the pixel envelope beside them
         self.ignored = None      # (count, height reached, height of the rest)
@@ -298,6 +304,7 @@ class FitReport:
             # showing the ceiling from before it, and that ceiling is the one
             # thing on this screen nobody may guess at.
             self.verdict, self.bhmax, self.applied = None, None, None
+            self.bwmax, self.tight_w, self.led_only = None, False, False
             self.tight = self.inert = self.switched = False
             # The provenance and the contamination note go with it. Both are
             # sent BELOW this line when the gun has them, so a reading that
@@ -308,7 +315,8 @@ class FitReport:
             got = {}
             for tok in rest.split():
                 k, sep, v = tok.partition("=")
-                if sep and k in ("ledn", "ledmaxh", "straym", "strayminh"):
+                if sep and k in ("ledn", "ledmaxh", "straym", "strayminh",
+                                 "ledmaxw", "strayminw"):
                     try:
                         got[k] = int(v)
                     except ValueError:
@@ -320,6 +328,17 @@ class FitReport:
             self.led_h = got.get("ledmaxh") if got.get("ledmaxh", -1) >= 0 else None
             self.stray_h = (got.get("strayminh")
                             if got.get("strayminh", -1) >= 0 else None)
+            self.led_w = got.get("ledmaxw") if got.get("ledmaxw", -1) >= 0 else None
+            self.stray_w = (got.get("strayminw")
+                            if got.get("strayminw", -1) >= 0 else None)
+            return True
+        if "LED samples ignored" in rest and "wide" in rest:
+            return True             # the width note; the height one is shown
+        if rest.startswith("no stray data yet"):
+            # The ceilings that follow are margins over the LED body, not a
+            # measured gap: said on the screen, so a sweep past a lamp is
+            # offered as the way to tighten them.
+            self.led_only = True
             return True
         if "LED samples ignored" in rest:
             # Samples the gun set aside before working out the ceiling. It
@@ -392,6 +411,14 @@ class FitReport:
             if len(n) >= 3:
                 self.led_h, self.stray_h = n[1], n[2]
             self.tight = "TIGHT" in rest
+            self.verdict = "gate"
+        elif rest.startswith("bwmax="):
+            n = self._ints(rest)
+            if n:
+                self.bwmax = n[0]
+            if len(n) >= 3:
+                self.led_w, self.stray_w = n[1], n[2]
+            self.tight_w = "TIGHT" in rest
             self.verdict = "gate"
         elif rest.startswith("applied"):
             # The save is reported separately from the setting, because they
@@ -1011,7 +1038,7 @@ class Camera(RowScreen):
         self._parsed = []          # ...parsed once, not once per reader
         self._blob_last = ""       # keeps the last percentage on screen while
                                    # the next window fills, so it stops flashing
-        self.advanced = False      # which of the two row pages is built
+        self.advanced = 0          # which of the three row pages is built
         self.shape_rect = None     # what the sensor panel last covered, so
                                    # hostcheck can measure it against the rows
         self.view_rect = None      # ...and the camera view stacked above it
@@ -1039,7 +1066,7 @@ class Camera(RowScreen):
         # An ESP32 gun has no second page. Left set, the flag would send a
         # gun that reconnected as an ESP32 to a page that does not exist.
         if not self.wiicam():
-            self.advanced = False
+            self.advanced = 0
         if self.advanced:
             self.build_advanced()
             return
@@ -1053,72 +1080,21 @@ class Camera(RowScreen):
                 set=lambda v: link.send("~cam=sens:%d" % v),
                 lo=0, hi=2, step=1,
                 hint="2 is the one to use; a fresh gun starts there"))
-            # Ambient light. The wiicam finds blobs in HARDWARE and reports
-            # four slots: a bright window does not add a fifth point, it TAKES
-            # one, and an LED goes missing. The only hardware fact that tells
-            # them apart is blob SIZE, which the basic report does not carry.
-            # Read the sizes first (the line under the preview), THEN set a
-            # window -- a gate guessed at is worth nothing.
-            #
-            # fmt is what the gun reports back; ext is the same answer from a
-            # gun on older firmware, which only ever knew two formats and does
-            # not send fmt at all. Without the fallback such a gun would show 0
-            # here while it was busily reporting sizes.
-            #
-            # And it is sent as ext: for 0 and 1 for the same reason. Both
-            # firmware generations take ext:; the older one has never heard of
-            # fmt and drops the key silently, so this row could never move off
-            # 0 on such a gun and every gate row below it stayed dead. Only
-            # full mode -- which the old firmware cannot do at all -- goes out
-            # as fmt:2.
-            self.rows.append(Row(
-                "Blob detail (sizes)", "spin",
-                get=lambda: link.last.get("fmt", link.last.get("ext")),
-                set=lambda v: link.send("~cam=%s:%d"
-                                        % ("fmt" if v == 2 else "ext", v)),
-                lo=0, hi=2, step=1,
-                hint="0 position only, 1 adds each blob's size, 2 adds its box "
-                     "and pixel count and fills the panel. Save to keep it"))
-            # THE gate, and the reason the other two are on the second page.
-            # Height is the one axis that still measures the SOURCE at every
-            # sensitivity: turn the gain up and the sensor smears a blob
-            # sideways -- the same LEDs went from a 2x2 box to 12x3 -- so
-            # width, area, pixel count and roundness all start measuring the
-            # gain instead. Height does not move.
-            #
-            # NO NUMBER IS SUGGESTED HERE, and none may be. The figure this
-            # row used to recommend was measured on ONE bar with two LEDs per
-            # corner; a bar with five LEDs in each cluster makes a blob
-            # several times taller, so that ceiling drops every real LED on
-            # such a gun -- and the owner sees a cursor that will not lock,
-            # with nothing anywhere pointing at a row they set weeks ago. The
-            # only defensible source for a non-zero value is '~camfit' on the
-            # rig it is going to run on, which is what the room-light sweep
-            # exists to feed. The hint points there instead.
-            #
-            # In ROWS, not pixels, and never "12 px": pxmax on the next page
-            # is a count of lit pixels and would read identically. Same units
-            # and same ladder as Studio's own row, so the two front ends
-            # cannot describe the same gate two different ways.
-            #
-            # The ladder is a list of plausible values, not a list of values
-            # worth choosing, and not a list of values the gun is guaranteed
-            # to take either. Its floor is no longer a fixed number: the gun
-            # refuses any ceiling BELOW the tallest LED this rig has been
-            # measured at, and with nothing measured it accepts anything. So a
-            # rung can be refused on a gun whose LEDs are taller than it --
-            # which is exactly the five-LED-cluster case -- and the refusal is
-            # surfaced as a toast rather than left as a row whose arrows
-            # visibly do nothing. The first non-zero rungs are the numbers
-            # this ladder was built from when the floor WAS fixed; they are
-            # kept only so the step from "off" is not a cliff.
-            self.rows.append(Row(
-                "Biggest blob (height)", "spin",
-                get=lambda: link.last.get("bhmax"),
-                set=lambda v: link.send("~cam=bhmax:%d" % v),
-                vals=(0, 8, 10, 12, 16, 24),
-                fmt=lambda v: "off" if not v else "%d rows" % v,
-                hint=self.bhmax_hint))
+            # THE gate, said as what it is doing and where its number came
+            # from, with the one press that measures it. No knob on this
+            # page: the ceilings are derived from this rig's own capture by
+            # the room-light step, and the hand rows live on the second page
+            # for the two cases that still need them.
+            self.rows.append(Row("Measure the shape gate",
+                                 act=self.app.begin_room_sweep,
+                                 hint=self.gate_status_hint))
+            # The LED shape the gun has measured is the floor under every
+            # ceiling. It is measured by itself while you play; the one thing
+            # a user has to do by hand is start over after changing the bar
+            # or the sensitivity, or the two rigs average into one wide
+            # spread that reads as "cannot be separated".
+            self.rows.append(Row("Reset LED shape", act=self.learn_reset,
+                                 hint=self.learn_status_hint))
             # The one control that acts BEFORE the sensor hands out its four
             # slots, right under the height gate (same question, other side of
             # the wire). A spin, not a button, so the row shows the state unselected.
@@ -1126,17 +1102,6 @@ class Camera(RowScreen):
                 "Auto light limit", "spin",
                 get=self.loop_value, set=self.loop_set,
                 vals=(0, 1), fmt=self.loop_show, hint=self.loop_hint))
-            # Measuring what an LED actually looks like on this rig, from the
-            # couch. The gun does the accumulating; both of these exist
-            # because the Pi has no console and the LED bar is at the TV, so
-            # a capture that could only be started over a serial terminal
-            # could never be taken from where the light actually goes wrong.
-            self.rows.append(Row("Learn LED shape", act=self.learn_toggle,
-                                 hint=self.learn_hint))
-            self.rows.append(Row("Log blobs to the stick", act=self.log_toggle,
-                                 hint=self.log_hint))
-            self.rows.append(Row("Write shape CSV to the stick",
-                                 act=self.shape_save, hint=self.shape_hint))
         else:
             self.subtitle = "aim for a blob noise floor under 0.30 px"
             for k, tip in (("thr", "threshold: raise it if the background shows up"),
@@ -1174,16 +1139,22 @@ class Camera(RowScreen):
         self.rows.append(Row("Back", act=self.app.to_menu))
 
     def build_advanced(self):
-        """Page two: set once, then left alone.
+        """Pages two and three: set once, then left alone.
 
         Everything here either has a working replacement on page one, gates
         INSIDE the sensor where a wrong value leaves the gun dark, or is a
         one-off check. None of it belongs in front of somebody trying to find
-        the sensitivity row while an LED bar is dropping corners.
+        the sensitivity row while an LED bar is dropping corners. Two pages
+        rather than one, so each still reads from a sofa: the hand gates on
+        the first, the sensor's own registers and the diagnostics on the
+        second.
         """
         link = self.app.link
+        if self.advanced >= 2:
+            self.build_sensor_page()
+            return
         self.title = "CAMERA TUNING -- ADVANCED"
-        self.subtitle = ("set once and left alone -- the height gate on the "
+        self.subtitle = ("set once and left alone -- the measured gate on the "
                          "first page replaces most of this")
         self.rows.append(Row(
             "Smallest blob kept", "spin",
@@ -1259,6 +1230,106 @@ class Camera(RowScreen):
             fmt=lambda v: "off" if not v else "%g:1" % (v / 8.0),
             hint="DEPRECATED and NOT recommended -- drops real LEDs at "
                  "sensitivity 2. Needs Blob detail 2"))
+        # ---- moved off the front page: the format is full by default and
+        # the ceilings are measured, so none of these is a normal user's ----
+        # Ambient light. The wiicam finds blobs in HARDWARE and reports
+        # four slots: a bright window does not add a fifth point, it TAKES
+        # one, and an LED goes missing. The only hardware fact that tells
+        # them apart is blob SIZE, which the basic report does not carry.
+        # Read the sizes first (the line under the preview), THEN set a
+        # window -- a gate guessed at is worth nothing.
+        #
+        # fmt is what the gun reports back; ext is the same answer from a
+        # gun on older firmware, which only ever knew two formats and does
+        # not send fmt at all. Without the fallback such a gun would show 0
+        # here while it was busily reporting sizes.
+        #
+        # And it is sent as ext: for 0 and 1 for the same reason. Both
+        # firmware generations take ext:; the older one has never heard of
+        # fmt and drops the key silently, so this row could never move off
+        # 0 on such a gun and every gate row below it stayed dead. Only
+        # full mode -- which the old firmware cannot do at all -- goes out
+        # as fmt:2.
+        self.rows.append(Row(
+            "Blob detail (sizes)", "spin",
+            get=lambda: link.last.get("fmt", link.last.get("ext")),
+            set=lambda v: link.send("~cam=%s:%d"
+                                    % ("fmt" if v == 2 else "ext", v)),
+            lo=0, hi=2, step=1,
+            hint="0 position only, 1 adds each blob's size, 2 adds its box "
+                 "and pixel count and fills the panel. Save to keep it"))
+        # THE gate, and the reason the other two are on the second page.
+        # Height is the one axis that still measures the SOURCE at every
+        # sensitivity: turn the gain up and the sensor smears a blob
+        # sideways -- the same LEDs went from a 2x2 box to 12x3 -- so
+        # width, area, pixel count and roundness all start measuring the
+        # gain instead. Height does not move.
+        #
+        # NO NUMBER IS SUGGESTED HERE, and none may be. The figure this
+        # row used to recommend was measured on ONE bar with two LEDs per
+        # corner; a bar with five LEDs in each cluster makes a blob
+        # several times taller, so that ceiling drops every real LED on
+        # such a gun -- and the owner sees a cursor that will not lock,
+        # with nothing anywhere pointing at a row they set weeks ago. The
+        # only defensible source for a non-zero value is '~camfit' on the
+        # rig it is going to run on, which is what the room-light sweep
+        # exists to feed. The hint points there instead.
+        #
+        # In ROWS, not pixels, and never "12 px": pxmax on the next page
+        # is a count of lit pixels and would read identically. Same units
+        # and same ladder as Studio's own row, so the two front ends
+        # cannot describe the same gate two different ways.
+        #
+        # The ladder is a list of plausible values, not a list of values
+        # worth choosing, and not a list of values the gun is guaranteed
+        # to take either. Its floor is no longer a fixed number: the gun
+        # refuses any ceiling BELOW the tallest LED this rig has been
+        # measured at, and with nothing measured it accepts anything. So a
+        # rung can be refused on a gun whose LEDs are taller than it --
+        # which is exactly the five-LED-cluster case -- and the refusal is
+        # surfaced as a toast rather than left as a row whose arrows
+        # visibly do nothing. The first non-zero rungs are the numbers
+        # this ladder was built from when the floor WAS fixed; they are
+        # kept only so the step from "off" is not a cliff.
+        self.rows.append(Row(
+            "Biggest blob (height)", "spin",
+            get=lambda: link.last.get("bhmax"),
+            set=lambda v: link.send("~cam=bhmax:%d" % v),
+            vals=(0, 8, 10, 12, 16, 24),
+            fmt=lambda v: "off" if not v else "%d rows" % v,
+            hint=self.bhmax_hint))
+        self.rows.append(Row(
+            "Biggest blob (width)", "spin",
+            get=lambda: link.last.get("bwmax"),
+            set=lambda v: link.send("~cam=bwmax:%d" % v),
+            vals=(0, 12, 16, 20, 24, 32),
+            fmt=lambda v: "off" if not v else "%d cols" % v,
+            hint=self.bwmax_hint))
+        self.rows.append(Row(
+            "Sensor & diagnostics", act=lambda: self.enter_advanced(2),
+            hint="the sensor's own registers, the connection test, the blob "
+                 "log and the shape CSV"))
+        self.rows.append(Row(
+            "Back", act=self.leave_advanced,
+            hint="back to the camera page -- Save to gun is there, and "
+                 "nothing on this page is kept until it is pressed"))
+
+    def build_sensor_page(self):
+        link = self.app.link
+        self.title = "CAMERA TUNING -- SENSOR & DIAGNOSTICS"
+        self.subtitle = ("the sensor's own registers and the tools that write "
+                         "to the stick")
+        # Measuring what an LED actually looks like on this rig, from the
+        # couch. The gun does the accumulating; both of these exist
+        # because the Pi has no console and the LED bar is at the TV, so
+        # a capture that could only be started over a serial terminal
+        # could never be taken from where the light actually goes wrong.
+        self.rows.append(Row("Learn LED shape", act=self.learn_toggle,
+                             hint=self.learn_hint))
+        self.rows.append(Row("Log blobs to the stick", act=self.log_toggle,
+                             hint=self.log_hint))
+        self.rows.append(Row("Write shape CSV to the stick",
+                             act=self.shape_save, hint=self.shape_hint))
         # The sensor's own thresholds. These gate INSIDE the camera, before
         # it hands out its four slots, so they are the only ones that stop
         # a stray source from costing a corner rather than being noticed
@@ -1315,19 +1386,21 @@ class Camera(RowScreen):
             hint="back to the camera page -- Save to gun is there, and "
                  "nothing on this page is kept until it is pressed"))
 
-    def enter_advanced(self):
-        self.advanced = True
+    def enter_advanced(self, level=1):
+        self.advanced = level
         self.build()
         self.sel = 0
 
     def leave_advanced(self):
-        self.advanced = False
+        # One page back, not all the way out: the third page's Back lands on
+        # the second, whose Back lands on the camera page.
+        self.advanced = 1 if self.advanced >= 2 else 0
         self.build()
         # Back onto the row that opened it rather than at the top of the
         # list: this is a page people step in and out of while a capture is
         # running, and landing on Sensitivity every time invites nudging it.
         self.sel = next((i for i, r in enumerate(self.rows)
-                         if r.label == "Advanced"), 0)
+                         if r.label in ("Advanced", "Sensor & diagnostics")), 0)
 
     def log_toggle(self):
         """Start or stop a CSV of every new camera frame, on the stick.
@@ -1346,7 +1419,7 @@ class Camera(RowScreen):
             return
         try:
             path, seq = recording_path("blobs")
-            self._log = BlobLog(path)
+            self._log = BlobLog(path, clock=self.app.link.clock)
             self._log_seq = seq
         except Exception as e:
             self.app.toast_now("could not open the log: %s" % e)
@@ -1515,6 +1588,47 @@ class Camera(RowScreen):
         return ("measures what a confirmed LED looks like here; set Blob "
                 "detail to 2 first")
 
+    def gate_status_hint(self):
+        """One line: is the gate on, and what did the gun measure."""
+        last = self.app.link.last
+        fit = self.app.fit
+        on = [k for k in ("bhmax", "bwmax") if last.get(k)]
+        state = ("on: " + ", ".join("%s %d" % ("height" if k == "bhmax" else "width",
+                                               last[k]) for k in on)) if on else "off"
+        if fit.verdict == "gate" and (fit.bhmax is not None or fit.bwmax is not None):
+            return "%s -- measured %s; select to review and apply" % (
+                state, RoomSweep.gate_words(fit))
+        if fit.verdict == "no_gate":
+            return "%s -- NO SAFE GATE on this rig; select to see why" % state
+        return "%s -- select to measure it on this rig (about 15 s)" % state
+
+    def learn_reset(self):
+        """Clear what was measured and start over. wl_enable clears on the
+        off -> on edge, so this is the toggle pressed twice."""
+        link = self.app.link
+        link.send("~camlearn=on:0")
+        link.send("~camlearn=on:1")
+        link.send("~camlearn?")
+        self._learn_t = time.monotonic()
+        self.app.toast_now("LED shape cleared -- measuring again from empty; "
+                           "aim at the bar from where you play")
+
+    def learn_status_hint(self):
+        frames, led, rej = self.app.link.hists.counts()
+        if self.learn_on():
+            return ("measuring by itself: %d frames, %d LED blobs, %d stray -- "
+                    "select to start over after changing the bar" % (frames, led, rej))
+        return ("measured %d frames, %d LED blobs, %d stray; not measuring -- "
+                "select to start over" % (frames, led, rej))
+
+    def bwmax_hint(self):
+        fit = self.app.fit
+        if fit.verdict == "gate" and fit.bwmax is not None:
+            return ("drops a blob wider than this. This gun measured %d "
+                    "columns. Needs Blob detail 2" % fit.bwmax)
+        return ("drops a blob wider than this; 0 is off. A window's slab is "
+                "wide, an LED is not. Needs Blob detail 2 and the room sweep")
+
     def bhmax_hint(self):
         """What this gate is, and where its number has to come from.
 
@@ -1553,7 +1667,7 @@ class Camera(RowScreen):
         exactly the rig every message below used to get wrong.
         """
         last = self.app.link.last
-        return [k for k in ("bhmax", "pxmax", "armax") if last.get(k)]
+        return [k for k in ("bhmax", "bwmax", "pxmax", "armax") if last.get(k)]
 
     def gate_off_clause(self, keys):
         """`keys` worded as the settings that zero them: 'bhmax:0', or
@@ -1838,8 +1952,10 @@ class Camera(RowScreen):
                     self.close_log()
         # The loop's counters, once a second, through the SAME arbitration as
         # every other question here (one wire; an answer is a frame that is
-        # not). One line of ~110 bytes, so it can be the fastest poll.
-        if (self.wiicam() and now_m - self._loop_t > 1.0
+        # not). One line of ~110 bytes, so it can be the fastest poll -- and
+        # while logging it runs at the blob cadence, or the rows pair each
+        # frame with a loop state up to a second old.
+        if (self.wiicam() and now_m - self._loop_t > every
                 and self.ask(now_m, self.LOOP_REPLY_S)
                 and self.app.link.send("~camloop?", poll=True)):
             self._loop_t = now_m
@@ -2931,7 +3047,7 @@ class RoomSweep:
             self.app.toast_now("there is nothing to apply: no height gate can "
                                "separate them on this rig")
             return
-        if fit.verdict != "gate" or fit.bhmax is None:
+        if fit.verdict != "gate" or (fit.bhmax is None and fit.bwmax is None):
             self.app.toast_now("not measured yet -- keep sweeping, or press "
                                "Esc to skip this step")
             return
@@ -2988,16 +3104,20 @@ class RoomSweep:
         also what makes the ceiling act. Everything this returns is read off
         what the gun said.
         """
-        rows = fit.bhmax or 0
+        want = {"fmt": 2}
+        if fit.bhmax is not None:
+            want["bhmax"] = fit.bhmax
+        if fit.bwmax is not None:
+            want["bwmax"] = fit.bwmax
         if fit.applied == "unsaved":
-            return ("Set to %d rows, but the gun could NOT save it -- it will "
-                    "be gone on the next power cycle." % rows)
-        ok = self.app.save_cam(fmt=2, bhmax=rows)
+            return ("Set to %s, but the gun could NOT save it -- it will "
+                    "be gone on the next power cycle." % self.gate_words(fit))
+        ok = self.app.save_cam(**want)
         self._saved = bool(ok)
         if not ok:
-            return ("Set to %d rows, but full detail could NOT be saved -- "
+            return ("Set to %s, but full detail could NOT be saved -- "
                     "the gate needs it, so it will not act after a power "
-                    "cycle." % rows)
+                    "cycle." % self.gate_words(fit))
         if fit.inert:
             # An older firmware saying it took the ceiling and cannot act on
             # it. It cannot happen on a build whose apply switches the format
@@ -3005,20 +3125,32 @@ class RoomSweep:
             # screen puts the gun in full mode before it ever asks -- so if it
             # does, something refused the format and the user has to be told
             # rather than reassured.
-            return ("Set to %d rows and saved, but the gun says the gate is "
+            return ("Set to %s and saved, but the gun says the gate is "
                     "INERT: it needs Blob detail 2 and this gun is not in it."
-                    % rows)
+                    % self.gate_words(fit))
         if fit.switched:
             # Said because it is a change to the gun nobody asked for by
             # name. It is the right change -- the ceiling was measured in full
             # mode and only acts in full mode -- but a report format that
             # moved on its own is exactly the kind of thing a user finds later
             # and cannot explain.
-            return ("Set to %d rows and saved. The gun switched itself to "
+            return ("Set to %s and saved. The gun switched itself to "
                     "full detail, which the gate needs to act, and kept it."
-                    % rows)
-        return ("Set to %d rows and saved, with full detail kept so the gate "
-                "can actually act. It will hold through a power cycle." % rows)
+                    % self.gate_words(fit))
+        return ("Set to %s and saved, with full detail kept so the gate "
+                "can actually act. It will hold through a power cycle."
+                % self.gate_words(fit))
+
+    @staticmethod
+    def gate_words(fit):
+        """'7 rows', '19 columns', or '7 rows and 19 columns' -- whichever
+        axes the fit named, in the words the rows above use."""
+        parts = []
+        if fit.bhmax is not None:
+            parts.append("%d rows" % fit.bhmax)
+        if fit.bwmax is not None:
+            parts.append("%d columns" % fit.bwmax)
+        return " and ".join(parts) or "nothing"
 
     def bars(self, sc, y):
         """The two halves of the measurement, against what the gun asked for.
@@ -3055,15 +3187,25 @@ class RoomSweep:
                 "Something in your room is the same size as your LEDs.",
                 "Move the bar, block that light, or use brighter LEDs.",
             ], C_BAD)
-        if fit.verdict == "gate" and fit.bhmax is not None:
-            out = ["MEASURED: anything taller than %d rows is not one of "
-                   "your LEDs." % fit.bhmax]
-            if fit.tight:
+        if fit.verdict == "gate" and (fit.bhmax is not None
+                                      or fit.bwmax is not None):
+            out = []
+            if fit.bhmax is not None:
+                out.append("MEASURED: anything taller than %d rows is not one "
+                           "of your LEDs." % fit.bhmax)
+            if fit.bwmax is not None:
+                out.append("MEASURED: anything wider than %d columns is not "
+                           "one of your LEDs." % fit.bwmax)
+            if fit.led_only:
+                out.append("From your LEDs alone, with a margin. Panning past "
+                           "a lamp with the screen in view tightens it.")
+            if fit.tight or fit.tight_w:
                 out.append("A TIGHT fit: one step apart. Worth sweeping "
                            "again.")
             out.append("Enter sets it on the gun and saves it.")
             return out, C_OK
         if fit.verdict == "need_stray":
+            # An older firmware, which refused to derive from the LEDs alone.
             return (["Keep sweeping: nothing but your LEDs has come into "
                      "the picture yet."], C_WARN)
         # Not a branch of its own: contamination can sit under any verdict,
@@ -3112,13 +3254,13 @@ class RoomSweep:
         # Locked on the real bar first, the window that pans in displaces an
         # LED, that corner is reconstructed, and the window sits far from it
         # -- which is what makes it a stray.
-        for ln in ("This teaches the gun the difference between your LEDs and "
-                   "the lights in your room, so a lamp can never take a corner "
-                   "from it.",
-                   "Start with only the LED bar in view and any bright light "
-                   "out of the picture. Then, KEEPING THE SCREEN IN VIEW, pan "
-                   "slowly for about 15 seconds so lamps, windows and "
-                   "reflections come in beside your LED bar."):
+        for ln in ("This sets the gun's shape gate from what it has measured "
+                   "of YOUR LEDs, so a lamp or a window can never take a "
+                   "corner from it.",
+                   "Aim at the LED bar from where you play. That alone gives "
+                   "a gate. Optional, to tighten it: KEEPING THE SCREEN IN "
+                   "VIEW, pan slowly for about 15 seconds so lamps, windows "
+                   "and reflections come in beside your LED bar."):
             head.extend(wrap(ln, wide))
         sc.lines(sc.w / 2, sc.h * 0.125, head, sc.f_s, C_DIM, step=1.35)
         if self.done:

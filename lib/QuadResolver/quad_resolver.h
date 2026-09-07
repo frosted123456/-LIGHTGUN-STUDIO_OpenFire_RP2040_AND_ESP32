@@ -47,6 +47,11 @@ struct QuadConfig {
                         // condemn a model the residual detector rejects
     bool  partial_lock; // let 3-real frames advance the lock, at half rate
     float cold_aniso_max;  // anisotropy ceiling before the rig has shown one
+    // Refuse to seed or re-seed on four blobs whose widest is more than this
+    // many times its narrowest: four LEDs of one bar are alike, a window's
+    // fragments never are. Relative, inside the frame -- no rig assumed.
+    // Needs quad_offer_widths() each frame; 0 = off (the OV path).
+    float seed_wratio;
 };
 
 // Returns the defaults, tuned for a 240x176 sensor at ~135 fps.
@@ -54,6 +59,9 @@ QuadConfig quad_default_config(void);
 
 void       quad_reset(const QuadConfig* cfg);   // cfg may be NULL -> defaults
 QuadResult quad_update(const float* xs, const float* ys, int n);  // n <= QUAD_MAX_IN
+// Box widths of the blobs the NEXT quad_update() is offered, in the same
+// order; consumed by that call. Only read when seed_wratio is set.
+void       quad_offer_widths(const int* w, int n);
 // State as of the last quad_update(). Both are for the CAMERA CORE only: they
 // read resolver state with no hold, so a serial-core caller can see it mid-update.
 bool       quad_locked(void);     // same flag the last QuadResult carried
@@ -79,7 +87,7 @@ struct QuadStats {
     uint32_t reshapes;      // locked-but-wrong assignment detected and rebuilt
     uint32_t worst_us;      // worst single quad_update(), microseconds
     uint32_t total_us;      // summed quad_update() time, microseconds
-    uint32_t giveups;       // veto_seed: a model dropped for refusing every re-acquire
+    uint32_t giveups;       // veto_seed: a model dropped -- refused every re-acquire, or a near blob it never matched
 };
 QuadStats quad_take_stats(void);
 

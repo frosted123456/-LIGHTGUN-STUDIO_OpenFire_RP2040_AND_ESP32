@@ -107,12 +107,13 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 // calibration BLOB, so every camreset in this file wiped the calibration while
 // leaving the loop's saved value in place, and the boot tests that read a
 // stored calibration back were reading a store that had already lost it.
+// "fit1" is the fifth: the LED width edge, beside fit0 and cleared with it.
 static bool is_u32key(const char* k){
     return k && (!strcmp(k, "gate0") || !strcmp(k, "gate1")
-                                     || !strcmp(k, "fit0")
+                                     || !strcmp(k, "fit0") || !strcmp(k, "fit1")
                                      || !strcmp(k, "hwl0")); }
 struct U32Slot { char key[16]; uint32_t v; bool have; };
-static U32Slot g_u32s[8];       // gate0 gate1 fit0 hwl0, plus room
+static U32Slot g_u32s[8];       // gate0 gate1 fit0 fit1 hwl0, plus room
 static U32Slot* u32_find(const char* k){
     for (auto& s : g_u32s) if (s.have && k && !strcmp(s.key, k)) return &s;
     return nullptr; }
@@ -200,6 +201,7 @@ static int t_sens_saved = 0;
 // restore apart from "nothing happened", since the level itself does not move.
 static int t_sens_sets = 0;
 static int fails = 0;
+static int g_bw_sink = 0;   // bwmax out-param for gate2 loads that do not care
 static void ck(bool ok, const char* m){ printf("  [%s] %s\n", ok?"PASS":"FAIL", m); if(!ok) fails++; }
 
 // One parsed Q line: Q,<ms>,<n>,x0,y0,..,x3,y3,<kind>,<real>,<ldx>,<ldy>.
@@ -526,12 +528,15 @@ int main()
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty()
-           && g_replies[0].find("fmt=0") != std::string::npos
-           && g_replies[0].find("ext=0") != std::string::npos
+           && g_replies[0].find("fmt=2") != std::string::npos
+           && g_replies[0].find("ext=1") != std::string::npos
            && g_replies[0].find("bmin=0") != std::string::npos
            && g_replies[0].find("bmax=15") != std::string::npos,
-           "the gate ships inert: basic format, window wide open -- the "
-           "sensor is read exactly as it was before this code existed");
+           "the gate ships inert -- window wide open -- but the report ships "
+           "FULL: the shape gate, the learning sink and the seed's width veto "
+           "all need the box, and a gun shipped in basic mode shipped with "
+           "all three dead. A sensor that cannot do full mode falls back on "
+           "its own");
 
         rig(px, py, 512, 384, 512, 288);
         int sz[4] = {3, 3, 3, 14};          // slot 3 is a big diffuse patch
@@ -812,9 +817,10 @@ int main()
 
         g_replies.clear();
         wiicam_cam_command("camreset");
-        ck(wiicam_aim_fmt() == WIICAM_FMT_BASIC,
-           "camreset turns the format back to basic -- from full as well as "
-           "from extended");
+        ck(wiicam_aim_fmt() == WIICAM_FMT_FULL,
+           "camreset puts the format back to the DEFAULT, which is full -- "
+           "from extended as well as from basic: the format cannot stop a gun "
+           "aiming, so the reset has no reason to take the box away");
         g_replies.clear();
         wiicam_cam_command("cam?");
         ck(!g_replies.empty() && g_replies[0].find("bmin=0") != std::string::npos
@@ -3071,10 +3077,11 @@ int main()
            "loses one line loses one of the three, not the answer");
         ck(!g_replies.empty()
            && g_replies[0] == "CAM: fit ledn=500 ledmaxh=5 straym=20 "
-                              "strayminh=9\n",
+                              "strayminh=9 ledmaxw=3 strayminw=3\n",
            "the first line is the raw measurement, both counts and both edges "
            "-- everything the verdict was computed from, so it can be checked "
-           "rather than believed");
+           "rather than believed -- with the width edges on the END, where a "
+           "tool parsing the four original fields by name never sees them");
         ck(g_replies.size() > 1
            && g_replies[1] == "CAM: fit bhmax=7 (LEDs reach 5, stray starts at "
                               "9)\n",
@@ -3264,6 +3271,113 @@ int main()
            "and strays SHORTER than the LEDs is the same verdict rather than a "
            "negative gap quietly halved into a ceiling below both");
 
+        // ---- the WIDTH axis: what the hardware capture actually looked like -
+        // LEDs 3..9 wide and 0..3 tall; strays of two kinds: a window's 3x0
+        // fragment, which no shape gate can catch, and its 30x2 slabs, which
+        // no LED resembles. Height catches nothing (the fragment is as short
+        // as an LED and the slab is 2 tall); width catches the slabs. The
+        // old fit called this NO SAFE GATE because ONE stray slipped under
+        // the height ceiling; a gate is judged by what it catches now.
+        {
+            wl_enable(0); wl_enable(1);
+            for (int w = 3; w <= 9; ++w)
+                for (int i = 0; i < 100; ++i)
+                    wl_note(0, 2, w, (w & 3), 100, 100, WL_HAS_BOX);
+            for (int i = 0; i < 10; ++i) wl_note(1, 1, 3, 0, 100, 100, WL_HAS_BOX);
+            for (int i = 0; i < 15; ++i) wl_note(1, 5, 30, 2, 100, 100, WL_HAS_BOX);
+            g_replies.clear();
+            wiicam_cam_command("camfit?");
+            ck(g_replies.size() == 3
+               && g_replies[0] == "CAM: fit ledn=700 ledmaxh=3 straym=25 "
+                                  "strayminh=0 ledmaxw=9 strayminw=3\n",
+               "the width edges are measured: LEDs reach 9 wide, the "
+               "narrowest stray is 3");
+            ck(g_replies.size() == 3
+               && g_replies[1] == "CAM: fit bwmax=19 (LEDs reach 9 wide, stray "
+                                  "starts at 30)\n",
+               "...and the verdict is a WIDTH ceiling, 9 + 21/2, with no "
+               "height line: height catches none of these strays and a gate "
+               "that catches nothing is not offered");
+            ck(g_replies.size() == 3
+               && g_replies[2].find("not applied") != std::string::npos,
+               "...and NO SAFE GATE appears nowhere: one stray a gate cannot "
+               "see does not refuse the gate that sees the other fifteen");
+            g_replies.clear();
+            wiicam_cam_command("cam=bwmax:5");
+            ck(!g_replies.empty()
+               && g_replies[0].find("below the widest LED") != std::string::npos,
+               "a hand-set bwmax under this rig's widest LED (9) is refused, "
+               "the same floor rule as bhmax");
+            g_replies.clear();
+            wiicam_cam_command("camfit=apply");
+            g_replies.clear();
+            wiicam_cam_command("cam?");
+            ck(!g_replies.empty()
+               && g_replies[0].find("bwmax=19") != std::string::npos
+               && g_replies[0].find("bhmax=0 ") != std::string::npos,
+               "apply sets bwmax=19 and leaves bhmax alone");
+            int gp = 0, ga = 0, gb = 0, gw = 0;
+            ck(aim_gate2_load(&gp, &ga, &gb, &gw) && gw == 19 && gb == 0,
+               "...and stores it in the gate word, beside the other three");
+            // ...and it GATES: a 30-wide blob in a full-mode poll is dropped.
+            wiicam_set_fullread_hook(full_hook);
+            g_ffail_on = 0; g_fdrift = 0; g_fhdrdrift = 0;
+            wiicam_cam_command("cam=res:0,dash:2,dashhz:0,mirx:1");
+            wiicam_cam_command("cam=bmin:0,bmax:15,rtol:0,pxmax:0,armax:0,bhmax:0,fmt:2");
+            int tpx[4] = {0,0,0,0}, tpy[4] = {0,0,0,0};
+            int tsz[4] = {-1,-1,-1,-1};
+            unsigned tseen = 0;
+            int tjit = 0;
+            auto wide_n = [&](const FullObj* o) {
+                memcpy(g_fobj, o, sizeof(g_fobj));
+                const int j = (tjit++ & 1) ? 1 : -1;
+                for (int k = 0; k < 4; ++k) g_fobj[k].x += j;
+                wiicam_aim_full_poll(tpx, tpy, tsz, &tseen);
+                g_lines.clear();
+                t += DT;
+                wiicam_aim_process_sz(tpx, tpy, tsz, tseen, t, &sx, &sy);
+                int nn = -1; unsigned long mm;
+                if (!g_lines.empty())
+                    sscanf(g_lines[0].c_str(), "Q,%lu,%d", &mm, &nn);
+                return nn;
+            };
+            static const FullObj NARROW[4] = {
+            //    x    y  sz  xmn ymn xmx ymx  px
+                { 256, 240, 1,  10, 20, 19, 22, 15 },   // 9 wide: the widest LED
+                { 768, 240, 1,  10, 20, 15, 22, 15 },
+                { 256, 528, 1,  10, 20, 15, 22, 15 },
+                { 768, 528, 1,  10, 20, 15, 22, 15 },
+            };
+            static const FullObj WIDE[4] = {
+                { 256, 240, 1,  10, 20, 15, 22, 15 },
+                { 768, 240, 1,  10, 20, 15, 22, 15 },
+                { 256, 528, 1,  10, 20, 15, 22, 15 },
+                { 768, 528, 5,  10, 20, 40, 22, 15 },   // 30 wide: a slab
+            };
+            ck(wide_n(NARROW) == 4,
+               "every LED this rig measured passes the width ceiling, the "
+               "widest one included");
+            ck(wide_n(WIDE) == 3,
+               "...and a 30-wide slab in the fourth slot is dropped by it");
+            wiicam_cam_command("cam=bwmax:0,fmt:0");
+            wiicam_set_fullread_hook(0);
+            aim_gate_clear();
+            aim_gate2_clear();
+            aim_fit_clear();
+        }
+        // A gate word written before bwmax existed reads back as bwmax off.
+        {
+            int gp = 0, ga = 0, gb = 0, gw = 0;
+            ck(aim_gate2_store(1, 2, 3, 0) && aim_gate2_load(&gp, &ga, &gb, &gw)
+               && gp == 1 && ga == 2 && gb == 3 && gw == 0,
+               "the three older gates round-trip with bwmax at 0 -- the bits "
+               "an older firmware never wrote");
+            ck(aim_gate2_store(1, 2, 3, 99) && aim_gate2_load(&gp, &ga, &gb, &gw)
+               && gw == 63 && gb == 3,
+               "...and bwmax clamps to its 6 bits without touching them");
+            aim_gate2_clear();
+        }
+
         // ---- NEEDS MORE LED DATA, at the boundary ---------------------------
         measure(499, 5, 20, 9);
         g_replies.clear();
@@ -3293,8 +3407,8 @@ int main()
         g_replies.clear();
         wiicam_cam_command("camfit?");
         ck(!g_replies.empty()
-           && g_replies[0] == "CAM: fit ledn=600 ledmaxh=-1 straym=20 "
-                              "strayminh=9\n",
+           && g_replies[0].rfind("CAM: fit ledn=600 ledmaxh=-1 straym=20 "
+                              "strayminh=9 ", 0) == 0,
            "600 extended-mode LED blobs report a count of 600 and an edge of "
            "-1 -- plenty of data, none of it a height");
         ck(g_replies.size() >= 2
@@ -3303,18 +3417,26 @@ int main()
            "count and the edge are tested separately because only one of them "
            "says a height was ever seen");
 
-        // ---- NO STRAY DATA, at the boundary ---------------------------------
+        // ---- no stray data: the LEDs alone, at the boundary ------------------
+        // A lamp sweep is a refinement, not a requirement. With fewer than 20
+        // strays the ceilings come from the LED body plus the automatic
+        // envelope's own margins -- two rows, twice the width -- so a gun that
+        // has only ever seen its bar still gets a gate, and applying it makes
+        // what the envelope already does explicit and persistent.
         measure(500, 5, 19, 9);
         g_replies.clear();
         wiicam_cam_command("camfit?");
-        ck(g_replies.size() == 2
-           && g_replies[1] == "CAM: fit NO STRAY DATA -- sweep the room with "
-                              "the screen in view so a lamp or window enters "
-                              "frame; 19 seen, 20 wanted. Your LEDs measured 5 "
-                              "tall.\n",
-           "19 strays is not enough -- and the reply hands back the LED "
-           "measurement anyway, which is the half of the answer that IS "
-           "finished and the half a user can act on");
+        ck(g_replies.size() == 5
+           && g_replies[1].rfind("CAM: fit no stray data yet (19 seen, 20 "
+                                 "wanted): ceilings from the LEDs alone", 0) == 0,
+           "19 strays is not enough for a measured gap, and the reply says so "
+           "-- then goes on, because the LED half of the answer IS finished");
+        ck(g_replies.size() == 5
+           && g_replies[2] == "CAM: fit bhmax=7 (LEDs reach 5, no stray measured)\n"
+           && g_replies[3] == "CAM: fit bwmax=6 (LEDs reach 3 wide, no stray measured)\n",
+           "...with a ceiling per axis from the LED body and the envelope's "
+           "margins: 5 + 2 rows, 3 x 2 wide -- and each says no stray was "
+           "measured, so nobody reads it as a gap");
         measure(500, 5, 20, 9);
         g_replies.clear();
         wiicam_cam_command("camfit?");
@@ -3388,7 +3510,7 @@ int main()
                    "...the live ceiling does not move");
                 fl = fs = fp = -1;
                 ck(!aim_fit_load(&fl, &fs, &fp)
-                   && !aim_gate2_load(&tgp, &tga, &tgb)
+                   && !aim_gate2_load(&tgp, &tga, &tgb, &g_bw_sink)
                    && !aim_gate_load(&tsf, &tsmn, &tsmx, &tsrt),
                    "...and not one of the three keys is written: no gate, no "
                    "shape word, no provenance, so a typo cannot leave anything "
@@ -3432,7 +3554,7 @@ int main()
            "...and the LIVE gate really is the ceiling that was printed");
         {
             int gp = -1, ga = -1, gb = -1;
-            ck(aim_gate2_load(&gp, &ga, &gb) && gb == 7,
+            ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gb == 7,
                "...saved to the shape gate's own key, so it survives the power "
                "cycle the whole capture was run to earn");
             ck(gp == 0 && ga == 0,
@@ -3589,8 +3711,8 @@ int main()
         g_replies.clear();
         wiicam_cam_command("camfit?");
         ck(g_replies.size() == 3
-           && g_replies[0] == "CAM: fit ledn=0 ledmaxh=-1 straym=0 "
-                              "strayminh=-1\n",
+           && g_replies[0].rfind("CAM: fit ledn=0 ledmaxh=-1 straym=0 "
+                              "strayminh=-1 ", 0) == 0,
            "with the histograms empty every live figure reads -1 and 0 -- not "
            "zero-tall LEDs, which is a rig on which no gate could ever work");
         ck(g_replies.size() > 1
@@ -3746,8 +3868,8 @@ int main()
         g_replies.clear();
         wiicam_cam_command("camfit?");
         ck(g_replies.size() == 4
-           && g_replies[0] == "CAM: fit ledn=11991 ledmaxh=7 straym=25 "
-                              "strayminh=11\n",
+           && g_replies[0].rfind("CAM: fit ledn=11991 ledmaxh=7 straym=25 "
+                              "strayminh=11 ", 0) == 0,
            "the counter line reports the BODY edge as ledmaxh -- 7, the number "
            "every other line and the floor agree on");
         ck(g_replies.size() == 4
@@ -3775,8 +3897,8 @@ int main()
            "lines, the same three as always: a warning that appeared on every "
            "clean capture would be a warning nobody reads");
         ck(g_replies.size() == 3
-           && g_replies[0] == "CAM: fit ledn=11959 ledmaxh=7 straym=25 "
-                              "strayminh=11\n",
+           && g_replies[0].rfind("CAM: fit ledn=11959 ledmaxh=7 straym=25 "
+                              "strayminh=11 ", 0) == 0,
            "...and the edge it reports is the SAME 7, off 11,959 samples "
            "instead of 11,991: the 32 outliers changed the count and never the "
            "answer, which is what 'set aside' has to mean");
@@ -3797,23 +3919,17 @@ int main()
         load(true, 0, 11);                    // sun in, no strays labelled
         g_replies.clear();
         wiicam_cam_command("camfit?");
-        ck(g_replies.size() == 3
-           && g_replies[0] == "CAM: fit ledn=11991 ledmaxh=7 straym=0 "
-                              "strayminh=-1\n"
+        ck(g_replies.size() >= 3
+           && g_replies[0].rfind("CAM: fit ledn=11991 ledmaxh=7 straym=0 "
+                              "strayminh=-1 ", 0) == 0
            && g_replies[1].find("32 LED samples ignored") != std::string::npos,
            "a contaminated capture with no strays still prints the ignored "
-           "line, BEFORE the refusal: the warning is emitted ahead of the "
-           "verdict, so it survives every path out of the command");
-        ck(g_replies.size() == 3
-           && g_replies[2] == "CAM: fit NO STRAY DATA -- sweep the room with "
-                              "the screen in view so a lamp or window enters "
-                              "frame; 0 seen, 20 wanted. Your LEDs measured 7 "
-                              "tall.\n",
-           "...and NO STRAY DATA quotes the BODY edge as what the LEDs "
-           "measured -- 7, not 31: the half of the answer that IS finished has "
-           "to be the same number every other line uses, and telling a user to "
-           "go find a lamp while one is in their LED class is the case this "
-           "warning was put ahead of the verdict for");
+           "line, BEFORE the verdict: the warning is emitted ahead of it, so "
+           "it survives every path out of the command");
+        ck(g_replies.size() >= 3
+           && g_replies[2].rfind("CAM: fit no stray data yet (0 seen", 0) == 0
+           && g_replies.back().find("not applied") != std::string::npos,
+           "...ahead of the LED-only verdict that follows");
         // NEEDS MORE LED DATA the same way. A short contaminated run is the
         // most useful moment of all to say so: the capture is going to be
         // repeated anyway, and it can be repeated with the blind pulled.
@@ -3829,8 +3945,8 @@ int main()
         g_replies.clear();
         wiicam_cam_command("camfit?");
         ck(g_replies.size() == 3
-           && g_replies[0] == "CAM: fit ledn=392 ledmaxh=7 straym=0 "
-                              "strayminh=-1\n"
+           && g_replies[0].rfind("CAM: fit ledn=392 ledmaxh=7 straym=0 "
+                              "strayminh=-1 ", 0) == 0
            && g_replies[1].find("32 LED samples ignored") != std::string::npos
            && g_replies[2].find("NEEDS MORE LED DATA") != std::string::npos,
            "and a 392-blob contaminated run prints it ahead of NEEDS MORE LED "
@@ -3864,24 +3980,33 @@ int main()
         for (int i = 0; i < 32; ++i) wl_note(0, 2, 1, 31, 100, 100, WL_HAS_BOX);
         g_replies.clear();
         wiicam_cam_command("camfit?");
-        ck(g_replies.size() == 2
-           && g_replies[0] == "CAM: fit ledn=62 ledmaxh=31 straym=0 "
-                              "strayminh=-1\n",
+        // Three lines here, not two: the sun's 32 samples are 1 wide against
+        // the LEDs' 3, so on the WIDTH axis the sun is the body and the LEDs
+        // are the outliers -- which is reported, the same way as height.
+        ck(g_replies.size() == 3
+           && g_replies[0].rfind("CAM: fit ledn=62 ledmaxh=31 straym=0 "
+                              "strayminh=-1 ", 0) == 0,
            "past the flip the edge really does read 31 -- the sun outweighs "
            "the LEDs, so the sun IS the body, and the reply says so rather "
            "than inventing a body out of the minority");
-        ck(g_replies.size() == 2
-           && g_replies[1].find("NEEDS MORE LED DATA") != std::string::npos
-           && g_replies[1].find("62 blobs so far, 500 wanted")
+        ck(g_replies.size() == 3
+           && g_replies[1].find("30 LED samples ignored") != std::string::npos
+           && g_replies[1].find("wide") != std::string::npos,
+           "...the width axis flips the other way -- 32 one-wide sun samples "
+           "outweigh 30 three-wide LEDs -- and says so");
+        ck(g_replies.size() == 3
+           && g_replies[2].find("NEEDS MORE LED DATA") != std::string::npos
+           && g_replies[2].find("62 blobs so far, 500 wanted")
               != std::string::npos,
            "...AND CAMFIT REFUSES IT. Sixty-two blobs is nowhere near 500, so "
            "the one capture where the mechanism gives the wrong edge is also a "
            "capture that cannot produce a ceiling: the sample gate is what "
            "makes the flip unreachable, and that is why it is asserted here "
            "and not merely relied on");
-        ck(g_replies.size() == 2
+        ck(g_replies.size() == 3
            && g_replies[0].find("bhmax=") == std::string::npos
-           && g_replies[1].find("bhmax=") == std::string::npos,
+           && g_replies[1].find("bhmax=") == std::string::npos
+           && g_replies[2].find("bhmax=") == std::string::npos,
            "...with no ceiling line anywhere in the reply: nothing was derived "
            "from a 31 that came out of a window");
         g_replies.clear();
@@ -4183,12 +4308,13 @@ int main()
         wiicam_aim_begin();
         g_replies.clear();
         wiicam_cam_command("cam?");
-        ck(wiicam_aim_fmt() == WIICAM_FMT_BASIC
+        ck(wiicam_aim_fmt() == WIICAM_FMT_FULL
            && !g_replies.empty()
            && g_replies[0].find("bmin=0") != std::string::npos
            && g_replies[0].find("bmax=15") != std::string::npos
            && g_replies[0].find("rtol=0") != std::string::npos,
-           "so the boot after that one really does come up inert");
+           "so the boot after that one really does come up inert -- gates "
+           "wide open, in the default full format");
     }
 
     // ---- the shape gate's OWN key -----------------------------------------
@@ -4203,8 +4329,8 @@ int main()
     // the other, or be readable out of the other's bits.
     {
         int gp = -1, ga = -1, gb = -1;
-        ck(aim_gate2_store(12, 20, 34), "the shape gate stores as one word");
-        ck(aim_gate2_load(&gp, &ga, &gb), "and loads back");
+        ck(aim_gate2_store(12, 20, 34, 0), "the shape gate stores as one word");
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink), "and loads back");
         ck(gp == 12 && ga == 20 && gb == 34,
            "with all three knobs intact and none of them swapped -- bhmax, "
            "pxmax and armax are the same width and none of the three values is "
@@ -4212,8 +4338,8 @@ int main()
            "three plausible numbers");
         // Six bits each, so an unclamped value does not merely come back
         // wrong: it bleeds into the field above it.
-        ck(aim_gate2_store(-3, 99, 200), "an out-of-range triple still stores");
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 0 && ga == 63 && gb == 63,
+        ck(aim_gate2_store(-3, 99, 200, 0), "an out-of-range triple still stores");
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 0 && ga == 63 && gb == 63,
            "clamped on the way in, each on its own, so an armax of 99 cannot "
            "land a carry bit in the pxmax field above it -- nor a bhmax of 200 "
            "spill out of the top field -- and turn a gate nobody set into one "
@@ -4223,14 +4349,14 @@ int main()
         // wrong: two of them sharing bits reads correctly whenever the shared
         // bits happen to agree. A one-hot store cannot hide that -- the value
         // has to appear in its own slot and in NEITHER of the other two.
-        ck(aim_gate2_store(9, 0, 0)
-           && aim_gate2_load(&gp, &ga, &gb) && gp == 9 && ga == 0 && gb == 0,
+        ck(aim_gate2_store(9, 0, 0, 0)
+           && aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 9 && ga == 0 && gb == 0,
            "a pxmax on its own reads back as a pxmax on its own");
-        ck(aim_gate2_store(0, 9, 0)
-           && aim_gate2_load(&gp, &ga, &gb) && gp == 0 && ga == 9 && gb == 0,
+        ck(aim_gate2_store(0, 9, 0, 0)
+           && aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 0 && ga == 9 && gb == 0,
            "...and an armax on its own as an armax");
-        ck(aim_gate2_store(0, 0, 9)
-           && aim_gate2_load(&gp, &ga, &gb) && gp == 0 && ga == 0 && gb == 9,
+        ck(aim_gate2_store(0, 0, 9, 0)
+           && aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 0 && ga == 0 && gb == 9,
            "...and a bhmax on its own as a bhmax: the field added last is the "
            "one that could have been laid on top of an existing one, and a gun "
            "with only bhmax set would then boot with a pixel-count gate it was "
@@ -4240,7 +4366,7 @@ int main()
         // the second key could be added without disturbing the first.
         nvs_set_u32(1, "gate1", 0x00005678u);
         gp = ga = gb = -1;
-        ck(!aim_gate2_load(&gp, &ga, &gb),
+        ck(!aim_gate2_load(&gp, &ga, &gb, &g_bw_sink),
            "an untagged word is 'nothing stored', not a shape gate");
         ck(gp == -1 && ga == -1 && gb == -1,
            "and the caller's own defaults are left exactly where they were -- "
@@ -4254,14 +4380,14 @@ int main()
         // height cut nobody set or loses the gate it did set.
         nvs_set_u32(1, "gate1", 0x6A000000u | (12u << 6) | 20u);
         gp = ga = gb = -1;
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 12 && ga == 20,
            "an old two-field word still loads its pxmax and its armax");
         ck(gb == 0,
            "...with bhmax reading 0 -- off, which is what a gun that never had "
            "the knob was running, and not whatever the bits above the old "
            "payload happen to hold");
         ck(aim_gate2_clear(), "clearing it succeeds");
-        ck(!aim_gate2_load(&gp, &ga, &gb), "after which nothing is stored");
+        ck(!aim_gate2_load(&gp, &ga, &gb, &g_bw_sink), "after which nothing is stored");
         ck(aim_gate2_clear(),
            "and clearing an ALREADY absent key is not a failure -- camreset "
            "erases both gates on every gun it runs on, including the ones that "
@@ -4269,26 +4395,26 @@ int main()
 
         // ---- the two keys do not touch each other --------------------------
         int sf = -1, smn = -1, smx = -1, srt = -1;
-        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34),
+        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34, 0),
            "a gun with both gates saved");
         ck(aim_gate_load(&sf, &smn, &smx, &srt)
            && sf == 1 && smn == 4 && smx == 11 && srt == 6,
            "the size window reads back its own four fields with a shape gate "
            "written after it");
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 12 && ga == 20 && gb == 34,
            "and the shape gate its own three -- one key never answers for the "
            "other, which sharing a key is precisely how they would");
         ck(aim_gate2_clear(), "clear the shape gate on its own");
-        ck(!aim_gate2_load(&gp, &ga, &gb), "...it is gone");
+        ck(!aim_gate2_load(&gp, &ga, &gb, &g_bw_sink), "...it is gone");
         sf = smn = smx = srt = -1;
         ck(aim_gate_load(&sf, &smn, &smx, &srt)
            && sf == 1 && smn == 4 && smx == 11 && srt == 6,
            "...and the size window is untouched: erasing one gate must not "
            "take the other down with it");
-        ck(aim_gate2_store(12, 20, 34) && aim_gate_clear(),
+        ck(aim_gate2_store(12, 20, 34, 0) && aim_gate_clear(),
            "now the other way up");
         ck(!aim_gate_load(&sf, &smn, &smx, &srt), "the size window is gone");
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 12 && ga == 20 && gb == 34,
            "...and the shape gate outlives it");
         // Corruption travels no further than its own key either. A word that
         // fails its tag check is one unreadable setting, not two.
@@ -4296,11 +4422,11 @@ int main()
         nvs_set_u32(1, "gate0", 0x00001234u);
         ck(!aim_gate_load(&sf, &smn, &smx, &srt),
            "a corrupt size-gate word reads as nothing stored");
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 12 && ga == 20 && gb == 34,
            "...and the shape gate beside it is still perfectly readable");
         ck(aim_gate_store(1, 4, 11, 6), "repair the size gate");
         nvs_set_u32(1, "gate1", 0x00005678u);
-        ck(!aim_gate2_load(&gp, &ga, &gb),
+        ck(!aim_gate2_load(&gp, &ga, &gb, &g_bw_sink),
            "and a corrupt shape-gate word reads as nothing stored too");
         sf = smn = smx = srt = -1;
         ck(aim_gate_load(&sf, &smn, &smx, &srt) && smn == 4 && smx == 11,
@@ -4343,7 +4469,7 @@ int main()
            "camsave names all three shape knobs it wrote alongside the size "
            "one, bhmax immediately before pxmax as everywhere else, so a tool "
            "can VERIFY what landed rather than assume it");
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 14 && ga == 20 && gb == 10,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 14 && ga == 20 && gb == 10,
            "...and the second word really holds all three knobs -- the reply "
            "is not the thing that decides what the next boot does");
         {
@@ -4367,7 +4493,7 @@ int main()
            "the only reason camreset has to erase it");
         g_replies.clear();
         wiicam_cam_command("camreset");
-        ck(!aim_gate2_load(&gp, &ga, &gb),
+        ck(!aim_gate2_load(&gp, &ga, &gb, &g_bw_sink),
            "camreset erases the saved shape gate too: a gate that stops the "
            "gun aiming would otherwise come back on the next boot and the one "
            "command a user reaches for when nothing works would fix the "
@@ -4507,12 +4633,12 @@ int main()
         // is checked here.
         int gp = -1, ga = -1, gb = -1;
         int sf = -1, smn = -1, smx = -1, srt = -1;
-        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34)
+        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34, 0)
            && aim_fit_store(7, 19, 42),
            "a gun with all three saved");
         ck(aim_fit_clear(), "clear the provenance on its own");
         ck(!aim_fit_load(&fl, &fs, &fp), "...it is gone");
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 12 && ga == 20 && gb == 34,
            "...and the shape gate is untouched: a bad write or a deliberate "
            "erase of the RECORD must never cost the setting the record "
            "describes, which is the one that changes what the gun does");
@@ -4534,13 +4660,13 @@ int main()
            "...leaves it alone as well");
 
         // Corruption travels no further than its own key in either direction.
-        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34),
+        ck(aim_gate_store(1, 4, 11, 6) && aim_gate2_store(12, 20, 34, 0),
            "all three stored again");
         nvs_set_u32(1, "fit0", 0x00005678u);
         ck(!aim_fit_load(&fl, &fs, &fp),
            "a corrupt provenance word reads as nothing stored");
         gp = ga = gb = -1;
-        ck(aim_gate2_load(&gp, &ga, &gb) && gp == 12 && ga == 20 && gb == 34,
+        ck(aim_gate2_load(&gp, &ga, &gb, &g_bw_sink) && gp == 12 && ga == 20 && gb == 34,
            "...and the shape gate beside it still loads, ceiling included: the "
            "gun keeps working and only loses the answer to 'where did this "
            "number come from'");
@@ -4549,7 +4675,7 @@ int main()
            "...as does the size window");
         ck(aim_fit_store(7, 19, 42), "repair the provenance");
         nvs_set_u32(1, "gate1", 0x00005678u);
-        ck(!aim_gate2_load(&gp, &ga, &gb),
+        ck(!aim_gate2_load(&gp, &ga, &gb, &g_bw_sink),
            "and a corrupt SHAPE gate reads as nothing stored");
         fl = fs = fp = -1;
         ck(aim_fit_load(&fl, &fs, &fp) && fl == 7 && fs == 19 && fp == 42,
@@ -4680,7 +4806,7 @@ int main()
            "refuses a pxmax");
 
         // camreset: all three keys AND the live histograms.
-        ck(aim_gate_store(2, 0, 15, 0) && aim_gate2_store(0, 0, 8),
+        ck(aim_gate_store(2, 0, 15, 0) && aim_gate2_store(0, 0, 8, 0),
            "a full gate is stored beside the provenance");
         g_replies.clear();
         wiicam_cam_command("camreset");
@@ -4691,7 +4817,7 @@ int main()
            "setting");
         {
             int gp2 = -1, ga2 = -1, gb2 = -1, sf2 = -1, a2 = -1, b2 = -1, c2 = -1;
-            ck(!aim_gate2_load(&gp2, &ga2, &gb2)
+            ck(!aim_gate2_load(&gp2, &ga2, &gb2, &g_bw_sink)
                && !aim_gate_load(&sf2, &a2, &b2, &c2),
                "...and both gate keys with it");
         }
@@ -5303,6 +5429,45 @@ int main()
             ck(quad_locked(),
                "...and the resolver stays locked through it, so the verdict is "
                "read off a geometry the firmware trusts rather than a guess");
+        }
+
+        // (b2) The window case, wider. Seen on hardware: a bright window is
+        // large enough to take TWO of the four slots, the resolver keeps the
+        // two corners it still has and reconstructs the rest, and the first
+        // oracle -- written for "three real, one far" -- read NONE frame after
+        // frame. The ceiling never came down. Two missing corners with two
+        // blobs far from every corner is the same STRAY, twice over.
+        load_rig();
+        lpx[2] = 512 - 40; lpy[2] = 384;    // the middle of the bar: ~68 px from
+        lpx[3] = 512 + 40; lpy[3] = 384;    // every corner, past any widened gate
+        wiicam_cam_command("cam=loop:1");
+        run(20, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(quad_locked(),
+               "two corners gone to a wide window: the resolver stays locked "
+               "on the two it has");
+            ck(L.stray == 20 && L.cut == 0 && L.clean == 0,
+               "...and the oracle reads STRAY every frame: two missing corners, "
+               "two blobs far from every corner, the count matches -- the "
+               "window that took two slots is still a window");
+        }
+        // ...but two missing corners with only ONE far blob is a frame the
+        // association cannot vouch for, and it moves nothing. The fourth blob
+        // here sits a few pixels from a corner that is already taken -- a
+        // reflection off the LED's own housing -- so it is neither a corner
+        // nor far from one.
+        load_rig();
+        lpx[2] = 512 - 40; lpy[2] = 384;
+        lpx[3] = lpx[0] + 30; lpy[3] = lpy[0] + 30;
+        wiicam_cam_command("cam=loop:1");
+        run(20, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(quad_locked() && L.stray == 0 && L.cut == 0 && L.clean == 0,
+               "two corners lost, one blob far and one hugging a taken corner: "
+               "no verdict at all -- the loop does not lower the ceiling on a "
+               "geometry the resolver only half explains");
         }
 
         // (c) The other arm of LOWER: four blobs the resolver REFUSES. Batch A
@@ -6173,9 +6338,11 @@ int main()
             wiicam_aim_process_sz(qx, qy, lsz, seen, t, &sx, &sy);
         };
 
-        // (u) B1. A room that never locks LOWERs on strays alone; if the
-        // bisection step lands where the LEDs are also cut there has never been
-        // a lock to make 'recent' from, and the old verdict could not see it.
+        // (u) B1/K4. A room that never locks LOWERs on strays alone; if the
+        // bisection step lands where the LEDs are also cut there has never
+        // been a lock to judge a cut on. A cut is only ever read off a lock
+        // now, so this case is caught at the DWELL: a LOWER after which the
+        // resolver never locked for a whole dwell is withdrawn.
         arm(2);
         load_bad();
         run(58, 0xF);                             // one LOWER dwell: hi=255, val=127
@@ -6185,6 +6352,7 @@ int main()
                "a room that never locks still LOWERs on its strays");
         }
         load_rig();
+        run(8, 0x3);                              // settle
         run(20, 0x3);
         {
             LoopLine L = loopq();
@@ -6192,25 +6360,97 @@ int main()
                "...two blobs with no lock ever is not a cut, even right after "
                "the LOWER: a glance away must not move the register");
         }
+        run(20, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 0 && L.val == 127 && !strcmp(L.state, "LOWER"),
+               "...and neither is three: with no lock there is no corner to be "
+               "missing from. Read as cuts, a window's flickering fragments "
+               "walked lo up through every value the LEDs had passed");
+        }
         g_reg.clear();
-        run(5, 0x7);
+        run(10, 0x7);                             // the dwell ends: 50 frames, no lock
         {
             LoopLine L = loopq();
             std::vector<int> w = regs06();
             ck(!strcmp(L.state, "RAISE") && L.lo == 127 && L.val == 254
                && w.size() == 1 && w[0] == 254,
-               "...but THREE blobs right after a LOWER is a cut with no lock "
-               "to vouch for it (K4): the value just written is untested, and "
-               "the loop climbs back to just under the value the stray got in at "
-               "instead of sitting on a cut LED for the rest of the session");
+               "...but a whole dwell after the LOWER with no lock at all is "
+               "the K4 case: the value just written is untested and may be "
+               "what cut the lock, so the loop climbs back to just under the "
+               "value the stray got in at instead of sitting there for the "
+               "rest of the session");
         }
-        run(5, 0x7);
+        run(8, 0x7); run(50, 0x7);                // a dwell at 254, still no lock
         {
             LoopLine L = loopq();
-            ck(!strcmp(L.state, "RAISE") && L.lo == 127 && L.val == 254,
-               "...and only after a LOWER: in RAISE with no lock, three blobs "
-               "is not read again, or a gun pointed away would walk lo up to "
-               "hi and declare NOSAFE from nothing");
+            ck(!strcmp(L.state, "HOLD") && L.lo == 0 && L.val == 254,
+               "...and that lo was provisional: the dwell at the raised value "
+               "never locked either, so 127 is not known to cut anything and "
+               "the bound is withdrawn -- a gun pointed away cannot walk lo up "
+               "to hi and declare NOSAFE from nothing");
+        }
+
+        // (u2) The 10:29:41 sequence from the hardware log, replayed. Locked
+        // on the bar, then the gun turned to a window: four fragments that
+        // never lock (LOWER), flickering to three (no cut now), a whole dwell
+        // without a lock (K4 RAISE, lo provisional), a stray dwell at the
+        // raised value that never locked either (LOWER again -- with lo
+        // WITHDRAWN, so the step is 127 and not 190), then the bar again.
+        // On the firmware that took the log this ended at lo=214/hi=233, a
+        // band with no LED in it, and the loop stayed there.
+        // Window fragments: nothing like the bar, nowhere near where the
+        // model expects a corner, and not a rectangle from anywhere.
+        auto load_window = [&](void){ rig(lpx, lpy, 300, 250, 160, 60);
+                                      lpx[3] = 300; lpy[3] = 240; };
+        arm(2);
+        lock_and_zero();
+        run(50, 0xF);                             // a clean dwell: 255 vouched
+        wiicam_cam_command("cam=loop:1");         // 255 not vouched: a cut would count
+        load_window();
+        run(3, 0x7);                              // three fragments, a moment after the lock
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 0 && L.dwell == 3 && L.val == 255,
+               "replay: three fragments right after the bar was lost are not "
+               "cuts -- 'a moment ago' is not enough any more, the corner has "
+               "to be missing from a LOCK");
+        }
+        run(37, 0x7);
+        for (int i = 0; i < 40; ++i) shot(0xF, 0);
+        ck(!quad_locked(), "replay: window fragments do not lock the resolver");
+        t += 1100000;                             // ...and has been unlocked a second
+        wiicam_cam_command("cam=loop:1");
+        run(58, 0xF);                             // stray dwell -> LOWER 127
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.val == 127 && L.hi == 255 && L.lo == 0,
+               "replay: the window's four fragments LOWER the ceiling to 127");
+        }
+        run(8, 0x7); run(50, 0x7);                // fragments flicker to three: no lock
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "RAISE") && L.val == 254 && L.lo == 127,
+               "replay: a dwell with no lock after the LOWER raises to 254, lo "
+               "provisionally 127");
+        }
+        load_window();
+        run(8, 0xF); run(50, 0xF);                // four fragments again at 254: strays
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.hi == 254 && L.lo == 0 && L.val == 127,
+               "replay: the stray dwell at 254 never locked, so 127 was NOT "
+               "measured to cut an LED -- lo is withdrawn and the next step is "
+               "(0+254)/2 = 127, not (127+254)/2 = 190. The log's firmware "
+               "kept 174 here and narrowed itself into 214..233");
+        }
+        load_rig();
+        run(8, 0xF); run(100, 0xF);               // the bar again, at 127: re-lock, clean
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.val == 127 && L.lo == 0 && L.hi == 254,
+               "replay: back on the bar, 127 holds a clean dwell and the bounds "
+               "still describe something real (lo=0, hi=254)");
         }
 
         // (v) S2. The pause menu and a profile switch rewrite 0x06 from the
@@ -6341,12 +6581,63 @@ int main()
                "a cut at 1 raises to 2, the only value left between the bounds");
         }
         run(8, 0x7);                              // settle
-        run(5, 0x7);                              // cut at 2: lo=2, hi-1 <= lo
+        run(5, 0x7);                              // cut at 2, still cutting after the RAISE
         {
             LoopLine L = loopq();
-            ck(!strcmp(L.state, "NOSAFE") && L.lo == 2 && L.hi == 3 && L.val == 255,
-               "a cut at 2 with the stray known at 3 is NOSAFE from the RAISE "
-               "path too: same-size strays, back to the preset (K5)");
+            ck(!strcmp(L.state, "HOLD") && L.lo == 0 && L.hi == 3 && L.val == 255,
+               "still cutting after the RAISE: the raise cured nothing, so the "
+               "corner was not MAXSIZE's to hide -- lo goes back to what it was "
+               "before the raise and the register to the preset, not NOSAFE. "
+               "Seen on hardware: an LED lost at the edge of the lens next to "
+               "a window walked lo up into hi and parked the loop at the preset "
+               "with the window admitted");
+            std::vector<int> w = regs06();
+            ck(!w.empty() && w.back() == 255,
+               "...and that is a real write of the preset, not a bookkeeping "
+               "change");
+        }
+        // Once is a hidden LED; three times in a row without a clean dwell in
+        // between is a room where lo and hi really do meet (K5).
+        for (int cyc = 2; cyc <= 3; ++cyc) {
+            run(8, 0xF);                          // settle at the preset
+            load_stray();
+            run(50, 0xF);                         // stray at 255: hi=255, val=127
+            load_rig();
+            run(8, 0x7); run(5, 0x7);             // cut at 127: lo=127, val=254
+            {
+                LoopLine L = loopq();
+                ck(!strcmp(L.state, "RAISE") && L.lo == 127 && L.val == 254,
+                   "the bound is recorded again on the next cut...");
+            }
+            run(8, 0x7); run(5, 0x7);             // cut at 254: uncured again
+            LoopLine L = loopq();
+            if (cyc < 3)
+                ck(!strcmp(L.state, "HOLD") && L.lo == 0 && L.val == 255,
+                   "...and withdrawn again when the raise cures nothing");
+            else
+                ck(!strcmp(L.state, "NOSAFE") && L.lo == 0 && L.val == 255,
+                   "...until the third uncured raise in a row, which is NOSAFE: "
+                   "back to the preset until a clean dwell (K5)");
+        }
+        // A clean dwell between two of them resets the count: each was a glance
+        // at a hidden LED, not one room refusing three times.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=hwmax:3");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        for (int cyc = 1; cyc <= 3; ++cyc) {
+            load_stray();
+            run(50, 0xF);                         // stray: LOWER
+            load_rig();
+            run(8, 0x7); run(5, 0x7);             // cut: RAISE
+            run(8, 0x7); run(5, 0x7);             // cut: uncured
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "HOLD") && L.val == 255,
+               "an uncured raise that followed a clean dwell is forgiven every "
+               "time -- three of them with clean dwells between never reach "
+               "NOSAFE");
+            run(8, 0xF); run(50, 0xF);            // a clean dwell at the preset
         }
 
         // (z) A BLIND sensor. A saved hwmax that lets nothing through sends the
@@ -6409,6 +6700,66 @@ int main()
             ck(!strcmp(L.state, "HOLD") && L.val == 100 && regs06().empty(),
                "a HOLD value the gun has locked at is not touched by an empty "
                "sensor: pointing away is not a cut");
+        }
+
+        // (aa) A vouched value cannot be what cut an LED. Seen on hardware: the
+        // weakest LED of the bar (4 px) dropped out at the preset, K2 read it
+        // as a cut, lo was poisoned and the loop ended NOSAFE for the session.
+        arm(2);
+        run(40, 0xF);
+        wiicam_cam_command("cam=hwmax:100");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        run(50, 0xF);                             // one clean dwell at 100: vouched
+        g_reg.clear();
+        run(20, 0x7);                             // a corner vanishes
+        {
+            LoopLine L = loopq();
+            ck(L.cut == 0 && L.val == 100 && !strcmp(L.state, "HOLD")
+               && regs06().empty(),
+               "an LED going missing at a value the LEDs have already passed is "
+               "a hidden LED, not a cut: nothing counted, nothing raised");
+        }
+        // ...but the same at an UNVOUCHED value is still the cut it always was.
+        wiicam_cam_command("cam=hwmax:90");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        run(5, 0x7);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "RAISE") && L.lo == 90,
+               "...while at a value no dwell has vouched for, five missing "
+               "corners raise at once, as before (K3)");
+        }
+
+        // (bb) Four blobs with no lock is a stray-only room only once the
+        // resolver has been unlocked for a second. A re-acquire after a move
+        // takes a few hundred ms and used to read as STRAY -> LOWER.
+        arm(2);
+        run(40, 0xF);                             // locked at the preset
+        // The bar seen 4:1 flatter: a convex rectangle the learned model
+        // refuses (anisotropy) until the 40-frame give-up, then a fresh seed.
+        // Four sensor blobs, no lock, for half a second -- a re-acquire.
+        rig(lpx, lpy, 200, 384, 512, 96);
+        run(100, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(L.stray == 0 && L.val == 255 && !strcmp(L.state, "HOLD"),
+               "four blobs and no lock right after a lock is a re-acquire, not "
+               "a stray: nothing counted, no LOWER");
+        }
+        // The stray-only room, by contrast: no lock for over a second.
+        arm(2);
+        run(40, 0xF);
+        load_bad();
+        // Not locked on this set: the size veto is off, so the fourth blob
+        // inside the triangle is refused at seed (non-convex) every frame.
+        run(260, 0xF);
+        {
+            LoopLine L = loopq();
+            ck(!strcmp(L.state, "LOWER") && L.val < 255,
+               "...and a room that stays unlocked for over a second is the "
+               "stray-only room the loop exists for: LOWER");
         }
 
         // camreset arms the capture, as boot does (G3): the loop's margin is

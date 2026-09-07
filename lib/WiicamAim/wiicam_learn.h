@@ -136,10 +136,19 @@ typedef struct {
     int stray_min_px;
     int led_abs_max_h;  // absolute highest LED-height bin, for the report
     unsigned long led_outliers_h;   // LED samples ABOVE the body: contamination
+    // Width, the same way. It is the feature that separates a window's flat
+    // fragments (13..93 wide on hardware) from an LED (never past 12).
+    int led_max_w, led_abs_max_w, stray_min_w;
+    unsigned long led_outliers_w;
     unsigned long led_n, stray_n;
 } wl_envelope_t;
 
 void wl_envelope(wl_envelope_t* out);
+// Samples of a class strictly above a bin, and the first occupied bin above
+// it (-1 if none): what a ceiling at 'bin' would catch, and how close the
+// nearest stray sits.
+unsigned long wl_above(int cls, int feat, int bin);
+int wl_next_above(int cls, int feat, int bin);
 
 #ifdef __cplusplus
 }

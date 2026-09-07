@@ -14,7 +14,7 @@ skippable with one press, and skipping it leaves the calibration finished.
 | 2 camera tuning | yes | sliders and auto-tune, or the wiicam's sensitivity |
 | 3 lens / FOV | yes | preset, 20 s measured sweep, dead-band |
 | 4 aim calibration | yes | five dots at two or three distances |
-| 4b room light sweep | yes | optional, ~15 s: measures your LEDs against the room so the gun can gate out a lamp |
+| 4b room light sweep | yes | optional: sets the shape gate from what the gun measured of your LEDs; ~15 s of panning past a lamp tightens it |
 | 5 fine tune | yes | iron sights, then smoothing, then lead |
 | 6 verify | yes | nine shots, pipeline error vs the OS cursor |
 

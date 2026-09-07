@@ -152,11 +152,29 @@ static int body_top(int cls, int feat, unsigned long* above)
     return best_top;
 }
 
+unsigned long wl_above(int cls, int feat, int bin)
+{
+    if (cls < 0 || cls >= WL_CLASSES || feat < 0 || feat >= WL_NFEAT) return 0;
+    unsigned long n = 0;
+    for (int i = bin + 1; i < WL_BINS; ++i) if (i >= 0) n += s_hist[cls][feat][i];
+    return n;
+}
+
+int wl_next_above(int cls, int feat, int bin)
+{
+    if (cls < 0 || cls >= WL_CLASSES || feat < 0 || feat >= WL_NFEAT) return -1;
+    for (int i = bin + 1; i < WL_BINS; ++i) if (i >= 0 && s_hist[cls][feat][i]) return i;
+    return -1;
+}
+
 void wl_envelope(wl_envelope_t* out)
 {
     if (!out) return;
     out->led_max_h     = body_top(0, WL_BH, &out->led_outliers_h);
     out->led_abs_max_h = top_bin(0, WL_BH);
+    out->led_max_w     = body_top(0, WL_BW, &out->led_outliers_w);
+    out->led_abs_max_w = top_bin(0, WL_BW);
+    out->stray_min_w   = bot_bin(1, WL_BW);
     out->led_max_px    = top_bin(0, WL_AREA);
     out->stray_min_h   = bot_bin(1, WL_BH);
     out->stray_min_px  = bot_bin(1, WL_AREA);

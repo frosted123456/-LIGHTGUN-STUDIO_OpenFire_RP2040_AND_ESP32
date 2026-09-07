@@ -93,7 +93,7 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 // taken -- and it does it in the direction that cannot be seen, since a floor
 // only ever refuses.
 struct U32Slot { char key[16]; uint32_t v; bool have; };
-static U32Slot g_u32s[4];       // gate0 gate1 fit0, plus room
+static U32Slot g_u32s[8];       // gate0 gate1 fit0 fit1 hwl0, plus room
 static U32Slot* u32_find(const char* k){
     for (auto& s : g_u32s) if (s.have && k && !strcmp(s.key, k)) return &s;
     return nullptr; }
@@ -103,7 +103,9 @@ static U32Slot* u32_find(const char* k){
 // -- wiping a setting the command never mentions while leaving the one it did.
 static bool is_u32key(const char* k){
     return k && (!strcmp(k, "gate0") || !strcmp(k, "gate1")
-                                     || !strcmp(k, "fit0")); }
+                                     || !strcmp(k, "fit0")
+                                     || !strcmp(k, "fit1")   // the width edge
+                                     || !strcmp(k, "hwl0")); }
 esp_err_t nvs_erase_key(nvs_handle_t, const char* k){
     if (is_u32key(k)) { if (U32Slot* s = u32_find(k)) s->have = false; }
     else if (is_lens(k)) g_lhave = false; else g_bhave = false;
@@ -215,7 +217,11 @@ static int      g_qsz[4] = {-1,-1,-1,-1};
 static unsigned g_qseen  = 0;
 static uint64_t g_t      = 1000000;
 static int      g_jit    = 0;
-static const uint64_t DT = 4785;           // ~209 Hz, like the stock poll timer
+// 100 ms a frame, not the sensor's 5: the sink only learns from a lock that
+// has LASTED a second of wall time, and at the stock rate every block here
+// would need two hundred frames of preamble before it could measure anything.
+// Nothing in the sink counts frames against the clock, so the rate is free.
+static const uint64_t DT = 100000;
 
 // Fill the slots, poll them the way the firmware does, and hand the poll's own
 // answer to the pipeline. The one pixel of jitter is not cosmetic: a
@@ -1130,20 +1136,29 @@ int main()
         wiicam_cam_command("cam=mirx:1");     // quad_reset(0): a cold resolver
         arm_clean();
         const unsigned long r4a = blobstat("br4=");
-        for (int i = 1; i <= 16 && !LOCK_N; ++i) {
+        int LOCKED_AT = 0;
+        for (int i = 1; i <= 30 && !LOCK_N; ++i) {
             frame(RIG);
+            if (!LOCKED_AT && quad_locked()) LOCKED_AT = i;
             if (wl_frames()) LOCK_N = i;
         }
+        // The lock lands where the resolver says; the sink waits a further
+        // second of wall time for it to LAST (LEARN_LOCK_AGE_US) before it
+        // believes it -- a window's junk lock never lives that long.
+        const int AGE_FRAMES = (int)(1000000u / DT);
+        ck(LOCKED_AT == PRELOCK + 1,
+           "the lock itself lands on the frame the resolver's lock_frames "
+           "predicts");
         static char msg_lock[512];
         snprintf(msg_lock, sizeof msg_lock,
                  "a genuine rectangle held steady STILL fills the positive "
-                 "class, and the first frame it fills from is the first LOCKED "
-                 "one: %d frames of it were needed, against the %d the "
-                 "resolver's own lock_frames=%d predicts. The fix must narrow "
+                 "class, and the first frame it fills from is the first one "
+                 "where the lock is a second old: %d frames of it were needed, "
+                 "against the %d that lock_frames=%d plus the age predict. The fix must narrow "
                  "this class, never starve it -- and a 1 here is the bug, "
                  "learning from the angular seed before anything was verified",
-                 LOCK_N, PRELOCK + 1, quad_default_config().lock_frames);
-        ck(LOCK_N == PRELOCK + 1 && wl_blobs(0) > 0u, msg_lock);
+                 LOCK_N, PRELOCK + 1 + AGE_FRAMES, quad_default_config().lock_frames);
+        ck(LOCK_N == PRELOCK + 1 + AGE_FRAMES && wl_blobs(0) > 0u, msg_lock);
         ck(blobstat("br4=") == r4a + (unsigned long)LOCK_N,
            "...and every single one of those frames was ALREADY four-real: "
            "what the class was waiting for was the lock, not the corners, "
@@ -1995,21 +2010,23 @@ int main()
             wiicam_cam_command("cam=bhmax:0");
         }
 
-        // ---- two far blobs: no sample, and worth being exact about why -----
-        // The guard reads like a tie-break and is not one. This sensor has
-        // four object slots; a blob the resolver ASSOCIATED is within one
-        // association radius of its corner and therefore can never be more
-        // than two away from it; so three real corners leave at most one blob
-        // in the frame that can be far. A second far blob is a third corner
-        // the resolver did not get, and the frame comes back with TWO real
-        // corners and never reaches the label at all.
+        // ---- two far blobs: TWO real corners, and both are learned ---------
+        // A blob the resolver ASSOCIATED is within one association radius of
+        // its corner and can never be two away from it, so three real corners
+        // leave at most one blob that can be far: a second far blob always
+        // costs the resolver a corner and the frame comes back with TWO real.
+        // The first version of this rule stopped there and learned nothing
+        // from such a frame. Hardware showed why that was wrong: a bright
+        // window is wide enough to take TWO of the sensor's four slots, the
+        // resolver locks on the two corners it still has, and the loop's
+        // oracle saw NONE frame after frame -- the sweep never came down and
+        // the gate never got a sample of the very thing it exists to reject.
         //
-        // Which is the point: the frame is not confirmed, so nothing is
-        // learned from it -- the safety property, arrived at from the
-        // direction that looks most like an exception to it. The nfar == 1
-        // guard is what keeps that true if the association radius, the slot
-        // count or the reconstruction ever change, because a label drawn from
-        // a geometry we do not trust is worse than no label at all.
+        // The guard that survives is the COUNT: exactly as many far blobs as
+        // missing corners. That is the case where each far blob can honestly
+        // be the thing standing in a missing LED's slot; any other count says
+        // the association itself is in doubt, and a label drawn from a
+        // geometry we do not trust is worse than no label at all.
         {
             relock();
             arm_clean();
@@ -2026,14 +2043,40 @@ int main()
             frame(two);
             ck(blobstat("br2=") == r2a + 1 && blobstat("br3=") == r3a,
                "two far blobs cost the resolver a second corner: the frame "
-               "comes back with TWO real corners, not the three the negative "
-               "label needs");
-            ck(wl_blobs(1) == 0u && blobstat("bfar=") == far_a,
-               "...so nothing is learned and nothing is counted -- a frame the "
-               "resolver could not confirm teaches the sink nothing, however "
-               "obviously strayish the blobs in it look");
+               "comes back with TWO real corners");
+            ck(wl_blobs(1) == 2u,
+               "...and BOTH far blobs are learned as strays: two missing "
+               "corners, two blobs far from everything, the count matches. "
+               "This is the window-took-two-slots frame from hardware");
+            ck(blobstat("bfar=") == far_a,
+               "...but bfar does not move: it counts shape-gate rejections the "
+               "resolver could place, and no gate rejected anything here");
             ck(wl_blobs(0) == 0u && wl_frames() == 0u,
-               "...and least of all in the positive class");
+               "...and nothing lands in the positive class");
+        }
+
+        // ---- two real corners, ONE far blob: the count does not match ------
+        // Same frame, but the fourth blob sits between one and two radii of
+        // its corner: not associated, not far. Two corners missing, one blob
+        // that could stand in for one of them, and one blob that is neither
+        // an LED nor provably a stray. That is the doubt the count guard is
+        // for, and the frame teaches nothing.
+        {
+            relock();
+            arm_clean();
+            FullObj mixed[4];
+            memcpy(mixed, SHAPE_RIG, sizeof(mixed));
+            mixed[2].x = SHAPE_RIG[2].x + DX_OUT;   // far
+            mixed[3].x = SHAPE_RIG[3].x - DX_IN;    // lost, but inside twice the radius
+            const unsigned long r2a = blobstat("br2=");
+            frame(mixed);
+            ck(blobstat("br2=") == r2a + 1,
+               "two real corners again -- the second moved blob is past the "
+               "resolver's own radius even though it is inside twice it");
+            ck(wl_blobs(1) == 0u && wl_blobs(0) == 0u,
+               "...and with only ONE far blob for TWO missing corners, nothing "
+               "is learned: the count guard is what keeps a half-explained "
+               "frame out of both classes");
         }
 
         // ---- just inside twice the radius, then just outside it ------------
@@ -2366,11 +2409,257 @@ int main()
            "outliers are and the first thing a truncation loses");
     }
 
+    // ---- the widths reach the resolver ---------------------------------
+    // The seed's four-of-a-kind test lives in the resolver and needs the box
+    // widths handed over each frame; a wiring mistake here would leave the
+    // veto silently off on the one path that uses it. Four convex blobs 4,
+    // 5, 4, 5 wide lock; the same geometry with one of them 40 wide does not
+    // -- and does once the format drops to basic, where there is no box to
+    // judge by.
+    {
+        static const FullObj ALIKE[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 2,  10, 20, 15, 22, 190 },
+        };
+        static const FullObj ONEWIDE[4] = {
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 2,  10, 20, 50, 22, 190 },   // 40 wide: a slab
+        };
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("camlearn=on:0");
+        wiicam_cam_command("cam=mirx:1");     // a cold resolver
+        for (int i = 0; i < 12; ++i) frame(ALIKE);
+        ck(quad_locked(), "four blobs alike in width seed the resolver from cold");
+        wiicam_cam_command("cam=mirx:1");
+        for (int i = 0; i < 30; ++i) frame(ONEWIDE);
+        ck(!quad_locked(),
+           "...the same corners with one 40-wide slab among 4s and 5s never "
+           "seed: the widths off the full report reach the resolver's veto");
+        wiicam_cam_command("cam=fmt:1");      // extended: sizes, no box
+        wiicam_cam_command("cam=mirx:1");
+        {
+            int rpx[4] = {256, 768, 256, 768};
+            int rpy[4] = {240, 240, 528, 528};
+            int rsz[4] = {2, 2, 2, 2};
+            float sx = 0.0f, sy = 0.0f;
+            for (int i = 0; i < 12; ++i) {
+                rpx[0] += (i & 1) ? 1 : -1;
+                g_t += DT;
+                wiicam_aim_process_sz(rpx, rpy, rsz, 0xF, g_t, &sx, &sy);
+            }
+        }
+        ck(quad_locked(),
+           "...and with no box in the report nothing is offered, so the same "
+           "four positions seed as before");
+        wiicam_cam_command("cam=fmt:2");
+    }
+
+    // ---- the automatic envelope --------------------------------------------
+    // Once this rig has measured its own LEDs, a blob wider than twice the
+    // widest or two rows taller than the tallest is not a corner, and it is
+    // dropped before the resolver with nothing applied and nothing typed.
+    // Seen on hardware: a stale model of the bar held two slots on a window's
+    // 45x7 fragments through the widened association gates for as long as
+    // the gun looked at the window. Margins over a measurement, never a
+    // number of their own, and trusted only once the capture holds the 500
+    // LED blobs camfit needs -- or the edge came from flash, which needed the
+    // same.
+    {
+        auto benv = [&]() { return blobstat("benv="); };
+        auto q_n = [&]() {
+            int nn = -1; unsigned long mm;
+            if (!g_lines.empty()) sscanf(g_lines.back().c_str(), "Q,%lu,%d", &mm, &nn);
+            return nn;
+        };
+        static const FullObj SLAB[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 6,  10, 20, 55, 27, 190 },   // 45 wide, 7 tall
+        };
+        static const FullObj TALL[4] = {
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 3,  10, 20, 16, 25, 190 },   // 6 wide, 5 tall: 3 over the body
+        };
+        static const FullObj JUST[4] = {
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 3,  10, 20, 29, 22, 190 },   // 19 wide, 2 tall: one over twice the width
+        };
+        static const FullObj NEAR[4] = {
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 3,  10, 20, 27, 24, 190 },   // 17 wide, 4 tall: inside both margins
+        };
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        // Raw passthrough with the Q line on every frame, so the count that
+        // comes out is the gate's and nothing else's.
+        wiicam_cam_command("cam=res:0,dash:2,dashhz:0");
+        wiicam_cam_command("camlearn=on:0");
+        aim_fit_clear();
+        // A thin capture: 40 blobs, 3..9 wide, 0..2 tall. Not trusted yet.
+        wl_enable(0); wl_enable(1);
+        for (int i = 0; i < 40; ++i) wl_note(0, 2, 3 + i % 7, i % 3, 100, 100, WL_HAS_BOX);
+        wl_enable(0);
+        const unsigned long e0 = benv();
+        g_lines.clear(); frame(SLAB); frame(SLAB);
+        ck(q_n() == 4 && benv() == e0,
+           "forty LED blobs are not an envelope: the slab passes, nothing is "
+           "counted -- a thin capture in a dim corner must not start cutting");
+        // Enough: 700 blobs of the same shape.
+        wl_enable(0); wl_enable(1);
+        for (int i = 0; i < 700; ++i) wl_note(0, 2, 3 + i % 7, i % 3, 100, 100, WL_HAS_BOX);
+        wl_enable(0);
+        g_lines.clear(); frame(SLAB); frame(SLAB);
+        ck(q_n() == 3 && benv() == e0 + 2,
+           "with 700 LED blobs measured (widest 9, tallest 2) a 45x7 slab is "
+           "dropped before the resolver, with every hand gate at 0, and "
+           "counted in benv");
+        g_lines.clear(); frame(TALL); frame(TALL);
+        ck(q_n() == 3 && benv() == e0 + 4,
+           "...so is a 6x5 blob: three rows over the tallest LED, the margin "
+           "is two");
+        g_lines.clear(); frame(JUST); frame(JUST);
+        ck(q_n() == 3 && benv() == e0 + 6,
+           "...and 19x2: one column over twice the widest LED, the factor is "
+           "two");
+        g_lines.clear(); frame(NEAR); frame(NEAR);
+        ck(q_n() == 4 && benv() == e0 + 6,
+           "...but 17x4 passes: inside twice the width and inside two rows -- "
+           "the margins are what keep a merged LED pair or a closer stance "
+           "from being cut by its own measurement");
+        // The edge survives the histograms: camsave records it, and after the
+        // sink is cleared the envelope runs from flash.
+        wiicam_cam_command("camsave");
+        int sw = -1;
+        ck(aim_fitw_load(&sw) && sw == 9,
+           "camsave stores the width edge (9) beside the height edge");
+        wiicam_cam_command("camlearn=reset");
+        static const FullObj WIDE2[4] = {
+            { 256, 240, 2,  10, 20, 14, 22,  60 },
+            { 768, 240, 2,  10, 20, 15, 22, 100 },
+            { 256, 528, 2,  10, 20, 14, 22, 140 },
+            { 768, 528, 5,  10, 20, 55, 22, 190 },   // 45 wide, 2 tall: width alone
+        };
+        g_lines.clear(); frame(WIDE2); frame(WIDE2);
+        ck(q_n() == 3 && benv() == e0 + 8,
+           "...and with the live histograms cleared a 45x2 slab is still "
+           "dropped, on width alone: the envelope reads the stored edges, so "
+           "it survives a power cycle");
+        aim_fit_clear();
+        g_lines.clear(); frame(SLAB); frame(SLAB);
+        ck(q_n() == 4 && benv() == e0 + 8,
+           "camreset's erase of the stored edges switches it off again: no "
+           "measurement, no envelope");
+        wiicam_cam_command("cam=res:2,dash:0");
+    }
+
+    // ---- the 11:49 window capture, replayed ------------------------------
+    // The gun locked on the bar, then looked straight at a window: four
+    // fragments a frame (45x7, 59x4, 28x7, 14x0), scattered. On the firmware
+    // that took the log the bar's model held two slots on them for the whole
+    // nine seconds (br2 +50 a row, br4 flat), the loop read those as STRAY
+    // and bisected to NOSAFE, and the shape sink learned nothing. Here: the
+    // fragments never reach the resolver (envelope), the model is given up,
+    // nothing is locked, the loop's lo stays 0, and the bar re-locks at once.
+    {
+        auto loopstat = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camloop?");
+            long v = -1;
+            if (!g_replies.empty()) {
+                const char* p = strstr(g_replies[0].c_str(), key);
+                if (p) sscanf(p + strlen(key), "%ld", &v);
+            }
+            return v;
+        };
+        static const FullObj WINDOW[4] = {
+        //    x    y  sz  xmn ymn xmx ymx  px
+            { 200, 460, 7,  10, 20, 55, 27, 200 },   // 45x7
+            { 640, 220, 6,  30, 40, 89, 44, 210 },   // 59x4
+            { 190, 440, 6,  50, 60, 78, 67, 190 },   // 28x7
+            { 520, 170, 2,  70, 30, 84, 30, 150 },   // 14x0
+        };
+        wiicam_cam_command("cam=fmt:2,res:2,dash:0,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("cam=loop:1");
+        // The rig measured: 700 LED blobs 3..9 wide, 3..5 tall (SHAPE_RIG's
+        // own boxes), so the envelope is 18 wide, 7 tall.
+        wl_enable(0); wl_enable(1);
+        for (int i = 0; i < 700; ++i) wl_note(0, 2, 3 + i % 7, 3 + i % 3, 100, 100, WL_HAS_BOX);
+        wl_enable(0);
+        wiicam_cam_command("cam=mirx:1");          // a cold resolver
+        for (int i = 0; i < 12; ++i) frame(SHAPE_RIG);
+        ck(quad_locked(), "replay: locked on the bar");
+        const unsigned long r2a = blobstat("br2="), r3a = blobstat("br3="), r4a = blobstat("br4=");
+        const unsigned long ea = blobstat("benv=");
+        const unsigned long da = blobstat("bdrop=");
+        int unlocked_at = -1;
+        unsigned long r2_mid = 0;
+        for (int i = 0; i < 60; ++i) {           // 6 s of window at 100 ms a frame
+            frame(WINDOW);
+            if (unlocked_at < 0 && !quad_locked()) unlocked_at = i + 1;
+            if (i == 44) r2_mid = blobstat("br2=");
+        }
+        {
+            char m[200];
+            snprintf(m, sizeof m, "replay: the bar's model is given up within "
+                     "REACQ_GIVEUP frames of the window -- it does not hold "
+                     "slots on fragments (unlocked at frame %d)", unlocked_at);
+            ck(unlocked_at > 0 && unlocked_at <= 45, m);
+        }
+        ck(!quad_locked() && blobstat("br4=") == r4a && blobstat("br3=") <= r3a + 6
+           && blobstat("br2=") <= r2a + 41 && blobstat("br2=") == r2_mid,
+           "replay: no lock on the window at all -- the model matched two "
+           "fragments for at most REACQ_GIVEUP frames, was given up, and br2 "
+           "stopped moving (the log's firmware counted it every frame for "
+           "nine seconds)");
+        ck(blobstat("bdrop=") >= da + 58,
+           "replay: and no quad was published from any of it -- an unlocked "
+           "model with two matched blobs is a guess, and the cursor holds "
+           "(the log's firmware moved the pointer on the reconstruction)");
+        ck(blobstat("benv=") >= ea + 170,
+           "replay: the fragments were dropped by the envelope, every frame, "
+           "before the resolver saw them");
+        ck(loopstat("lo=") == 0,
+           "replay: the loop's lo stays 0 -- nothing here was a cut, and a "
+           "window is not a bound on MAXSIZE (the log's firmware reached "
+           "lo=158/hi=159 NOSAFE)");
+        ck(wl_blobs(1) == 0u, "replay: and nothing was learned from any of it -- "
+                              "there was no lock to judge the fragments against");
+        int relock_at = -1;
+        for (int i = 0; i < 20 && relock_at < 0; ++i) {
+            frame(SHAPE_RIG);
+            if (quad_locked()) relock_at = i + 1;
+        }
+        {
+            char m[120];
+            snprintf(m, sizeof m, "replay: the bar re-locks from a clean seed "
+                     "within a few frames (%d)", relock_at);
+            ck(relock_at > 0 && relock_at <= 6, m);
+        }
+        wiicam_cam_command("camlearn=reset");
+        aim_fit_clear();
+    }
+
     // ---- camreset clears the capture and arms it again ------------------
     // It is the command a user reaches for when nothing works: what was
     // measured is about a gun that no longer exists, but the gun still has to
     // learn as you play from here (G3), so the capture comes back armed.
     {
+        // Lock on the rig with the capture OFF first, so what the count below
+        // says does not depend on the resolver state the last block left.
+        wiicam_cam_command("camlearn=on:0");
+        for (int i = 0; i < 12; ++i) frame(RIG);
         arm_clean();
         frame(RIG);
         ck(wl_enabled() == 1 && wl_frames() == 1u, "a capture is running");
@@ -2381,22 +2670,13 @@ int main()
            "...and CLEARED: the frame that was in it is gone. Stopping and "
            "keeping left the refusal floor reading the old bar's LEDs after "
            "the one command a user reaches for to start over");
-        // camreset also puts the format back to basic, so drive the plain
-        // entry point: the frames after it count from zero.
-        {
-            int rpx[4] = {256, 768, 256, 768};
-            int rpy[4] = {240, 240, 528, 528};
-            float sx = 0.0f, sy = 0.0f;
-            for (int i = 0; i < 4; ++i) {
-                rpx[0] += (i & 1) ? 1 : -1;
-                g_t += DT;
-                wiicam_aim_process(rpx, rpy, 0xF, g_t, &sx, &sy);
-            }
-        }
-        ck(wl_frames() == 3u,
-           "...and the frames after it are counted from zero (the first one "
-           "re-seeds the resolver and is not learned), so what the capture "
-           "holds is only ever about the gun as it is now");
+        // camreset leaves the format at the default, full, so the same
+        // full-mode frames drive it: the frames after it count from zero.
+        for (int i = 0; i < 4; ++i) frame(RIG);
+        ck(wl_frames() == 4u,
+           "...and the frames after it are counted from zero -- four driven, "
+           "four held, on a resolver that stayed locked across the reset -- "
+           "so what the capture holds is only ever about the gun as it is now");
     }
 
     printf("\nwiicam learn: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);

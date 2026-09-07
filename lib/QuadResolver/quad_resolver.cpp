@@ -79,6 +79,15 @@ int   banned_ttl = 0;
 // model that cannot re-acquire anything gives way, or the gun never locks again.
 const int REACQ_GIVEUP = 40;
 int   reacq_fail = 0;
+// veto_seed: frames in a row an UNLOCKED model kept one or two slots on
+// something without ever locking. A bar's model matching two window
+// fragments through the widened gates is a model of something not in view.
+int   stale_cnt = 0;
+// veto_seed: frames in a row an unmatched blob sat where the missing corner
+// belongs (the parallelogram the other three complete) while that slot was
+// reconstructed elsewhere. The model learned an impostor there; it gives way.
+const int STUCK_PARTIAL = 60;
+int   stuck_partial = 0;
 
 // Squared distance between two points.
 inline float d2(float ax, float ay, float bx, float by) {
@@ -494,6 +503,7 @@ QuadConfig quad_default_config(void)
     c.veto_seed      = false;
     c.partial_lock   = false;
     c.cold_aniso_max = ANISO_FLOOR;   // the existing floor
+    c.seed_wratio    = 0.0f;          // off: the OV path offers no widths
     return c;
 }
 
@@ -518,6 +528,8 @@ void quad_reset(const QuadConfig* cfg)
     reshape_bad = 0;
     stuck_cnt = 0;
     reacq_fail = 0;
+    stale_cnt = 0;
+    stuck_partial = 0;
     partial_phase = 0;
     banned_ttl = 0;
 }
@@ -531,10 +543,34 @@ QuadStats quad_take_stats(void)
 }
 
 // Resolves one frame of detected blobs into four identified corners.
+static int  s_ow[QUAD_MAX_IN];
+static int  s_own = 0;
+void quad_offer_widths(const int* w, int n)
+{
+    if (n > QUAD_MAX_IN) n = QUAD_MAX_IN;
+    for (int i = 0; i < n; ++i) s_ow[i] = w ? w[i] : -1;
+    s_own = w ? n : 0;
+}
+// seed_wratio: four offered blobs whose widths say they are not four of a
+// kind. Consumed here so a stale offer never judges a later frame.
+static bool shape_refused(int n)
+{
+    const int on = s_own; s_own = 0;
+    if (C.seed_wratio <= 0.0f || n != 4 || on < 4) return false;
+    int lo = s_ow[0], hi = s_ow[0];
+    for (int i = 1; i < 4; ++i) {
+        if (s_ow[i] < lo) lo = s_ow[i];
+        if (s_ow[i] > hi) hi = s_ow[i];
+    }
+    if (lo < 0) return false;             // a width the sensor did not report
+    return (float)hi > C.seed_wratio * (float)(lo < 1 ? 1 : lo);
+}
+
 QuadResult quad_update(const float* xs, const float* ys, int n)
 {
     QuadResult R;
     memset(&R, 0, sizeof(R));
+    const bool shape_bad = shape_refused(n);
 #ifdef QUAD_DEBUG_HOOK
     memset(&quad_dbg, 0, sizeof(quad_dbg));
     for (int i = 0; i < 4; ++i) { quad_dbg.slot_of[i] = -1; quad_dbg.d_hm[i] = -1.0f; }
@@ -561,7 +597,14 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     // with no model yet takes the angular seed.
     if (live < 4) {
         bool got = false;
-        if (n >= 4) got = reseed_with_model(xs, ys, n);
+        // A set the widths refuse is not offered to the model or to the
+        // angular seed -- but it DOES count against the model: a model fed
+        // nothing but refused sets for REACQ_GIVEUP frames is a model of
+        // something no longer in view (the bar, while the gun looks at a
+        // window), and keeping it alive let it hold two slots on window
+        // fragments through the widened gates for as long as the gun stayed
+        // there. Seen on hardware.
+        if (n >= 4 && !shape_bad) got = reseed_with_model(xs, ys, n);
         // A model refusing every four-set for REACQ_GIVEUP frames is a model
         // of something no longer in view; drop it and let seed() start over
         // (the ban still keeps a condemned set out).
@@ -580,7 +623,7 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         }
         // angular seed ONLY when there is no learned model: a failed re-acquire
         // must not overwrite MX/MY with whatever four blobs are in frame
-        if (!got && n == 4 && !model_valid) got = seed(xs, ys);
+        if (!got && n == 4 && !model_valid && !shape_bad) got = seed(xs, ys);
         if (got) {
             consec_bad = 0;
         } else {
@@ -670,6 +713,39 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         midx[k++] = s;
     }
     R.n_real = k;
+
+    // An unmatched blob sitting where the three real corners say the fourth
+    // must be is the fourth corner, and the model that put it elsewhere is
+    // wrong. A stray does not land on that spot; a hidden LED leaves it empty.
+    if (C.veto_seed) {
+        bool near_unmatched = false;
+        if (k == 3 && n >= 4) {
+            int m = 0;
+            while (m < 4 && slot_of[m] >= 0) ++m;          // the missing slot
+            // Slots are in angular order, so m's neighbours are m+1 and m+3
+            // and its opposite is m+2: corner = a + c - opposite.
+            const int a = (m + 1) & 3, o = (m + 2) & 3, c = (m + 3) & 3;
+            const float ex = ox[a] + ox[c] - ox[o], ey = oy[a] + oy[c] - oy[o];
+            const float g2 = C.gate * C.gate;
+            for (int b = 0; b < n; ++b)
+                if (!blob_used[b] && d2(xs[b], ys[b], ex, ey) <= g2) { near_unmatched = true; break; }
+        }
+        if (!near_unmatched) {
+            stuck_partial = 0;
+        } else if (++stuck_partial >= STUCK_PARTIAL) {
+            stuck_partial = 0;
+            for (int i = 0; i < 4; ++i) { S[i].live = false; S[i].miss = 0; S[i].vx = S[i].vy = 0; }
+            lock_count = 0; locked = false; Hr_valid = false;
+            reshape_bad = 0; stuck_cnt = 0; consec_bad = 0;
+            model_valid = false;
+            for (int i = 0; i < 4; ++i) { MX[i] = MY[i] = 0.0f; }
+            env_aniso_max = 1.0f; env_valid = false;
+            ST.giveups++;
+            R.count = 0; R.n_real = 0; R.locked = false; R.confidence = 0.0f;
+            ST.dropped_blobs += n;
+            return R;
+        }
+    }
 
     // ---- 3. RECONSTRUCT the rest: the homography ladder ---------------------
     // Anchored by Hr, the most recent effective homography; each rung is exact for
@@ -919,6 +995,27 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
         lock_count--;                      // total loss slowly un-locks
     }
     locked = (lock_count >= C.lock_frames);
+
+    // veto_seed: unlocked, and matching one or two blobs frame after frame,
+    // is not a lock coming back -- it is a model latched onto whatever
+    // resembles a corner. Give it up like a refused re-acquire; the seed's
+    // own vetoes decide what locks next. k == 0 is left to RESEED_AFTER: a
+    // gun turned away should keep its model for the return.
+    if (C.veto_seed) {
+        if (!locked && model_valid && k >= 1 && k <= 2) {
+            if (++stale_cnt >= REACQ_GIVEUP) {
+                stale_cnt = 0;
+                model_valid = false;
+                for (int i = 0; i < 4; ++i) { MX[i] = MY[i] = 0.0f; }
+                env_aniso_max = 1.0f; env_valid = false;
+                for (int i = 0; i < 4; ++i) { S[i].live = false; S[i].miss = 0; S[i].vx = S[i].vy = 0; }
+                lock_count = 0; consec_bad = 0; Hr_valid = false;
+                ST.giveups++;
+            }
+        } else {
+            stale_cnt = 0;
+        }
+    }
 
     // ---- 4b. GIVE UP AND RE-ACQUIRE ----------------------------------------
     // Sustained <2 real means we are extrapolating blind, so clear `live` and let

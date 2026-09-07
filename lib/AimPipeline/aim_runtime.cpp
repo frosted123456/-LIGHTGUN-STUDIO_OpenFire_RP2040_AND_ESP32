@@ -289,6 +289,7 @@ bool aim_dead_load(int* out_units)
 #define AIM_NVS_GATE "gate0"
 #define AIM_NVS_GATE2 "gate1"
 #define AIM_NVS_FIT  "fit0"
+#define AIM_NVS_FITW "fit1"   // the LED WIDTH edge, its own key: fit0's word is full
 #define AIM_NVS_HWL  "hwl0"
 #define AIM_GATE_TAG 0x6A000000u
 
@@ -361,7 +362,7 @@ bool aim_gate_clear(void)
 #endif
 }
 
-bool aim_gate2_store(int pxmax, int armax, int bhmax)
+bool aim_gate2_store(int pxmax, int armax, int bhmax, int bwmax)
 {
     if (pxmax < 0)  pxmax = 0;
     if (pxmax > 63) pxmax = 63;
@@ -369,7 +370,11 @@ bool aim_gate2_store(int pxmax, int armax, int bhmax)
     if (armax > 63) armax = 63;
     if (bhmax < 0)  bhmax = 0;
     if (bhmax > 63) bhmax = 63;
-    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)bhmax << 12)
+    if (bwmax < 0)  bwmax = 0;
+    if (bwmax > 63) bwmax = 63;
+    // bwmax in bits 18..23: a word saved before it existed reads back 0 = off.
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)bwmax << 18)
+                     | ((uint32_t)bhmax << 12)
                      | ((uint32_t)pxmax << 6) | (uint32_t)armax;
 #if defined(AIM_HAVE_STORE)
     nvs_handle_t h;
@@ -383,10 +388,10 @@ bool aim_gate2_store(int pxmax, int armax, int bhmax)
 #endif
 }
 
-bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax)
+bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax, int* out_bwmax)
 {
 #if defined(AIM_HAVE_STORE)
-    if (!out_pxmax || !out_armax || !out_bhmax) return false;
+    if (!out_pxmax || !out_armax || !out_bhmax || !out_bwmax) return false;
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
     uint32_t v = 0;
@@ -397,9 +402,10 @@ bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax)
     *out_pxmax = (int)((v >> 6) & 0x3F);
     *out_armax = (int)(v & 0x3F);
     *out_bhmax = (int)((v >> 12) & 0x3F);
+    *out_bwmax = (int)((v >> 18) & 0x3F);
     return true;
 #else
-    (void)out_pxmax; (void)out_armax; (void)out_bhmax; return false;
+    (void)out_pxmax; (void)out_armax; (void)out_bhmax; (void)out_bwmax; return false;
 #endif
 }
 
@@ -473,13 +479,50 @@ bool aim_fit_clear(void)
 #if defined(AIM_HAVE_STORE)
     nvs_handle_t h;
     if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
-    const esp_err_t e = nvs_erase_key(h, AIM_NVS_FIT);
-    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
+    esp_err_t e = nvs_erase_key(h, AIM_NVS_FIT);
+    bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
+    e = nvs_erase_key(h, AIM_NVS_FITW);
+    ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND) && ok;
     if (ok) nvs_commit(h);
     nvs_close(h);
     return ok;
 #else
     return true;
+#endif
+}
+
+bool aim_fitw_store(int led_max_w)
+{
+    if (led_max_w < 0)  led_max_w = 0;
+    if (led_max_w > 63) led_max_w = 63;
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | (uint32_t)led_max_w;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_u32(h, AIM_NVS_FITW, v) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)v; return true;
+#endif
+}
+
+bool aim_fitw_load(int* out_led_max_w)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_led_max_w) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint32_t v = 0;
+    const esp_err_t e = nvs_get_u32(h, AIM_NVS_FITW, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
+    *out_led_max_w = (int)(v & 0x3F);
+    return true;
+#else
+    (void)out_led_max_w; return false;
 #endif
 }
 

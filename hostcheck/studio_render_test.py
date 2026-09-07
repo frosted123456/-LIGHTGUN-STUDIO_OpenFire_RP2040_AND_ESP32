@@ -640,6 +640,29 @@ def driver():
                     "nothing usable: %r" % ((g.verdict, g.led_want),))
     if gun_studio.CamFit().feed("CAM: blobs 1,2,3,1"):
         errs.append("CamFit claimed a line that was not a fit reply")
+    # The width axis. The header carries both edges on the END; a width
+    # ceiling is a verdict on its own -- the capture that motivated it had no
+    # height gap at all (a 3x0 window fragment) and a 21-column one.
+    w = fit_of(HDR + " ledmaxw=9 strayminw=3",
+               "CAM: fit bwmax=19 (LEDs reach 9 wide, stray starts at 30)",
+               "CAM: fit not applied -- send camfit=apply to set and save it")
+    if (w.verdict, w.bhmax, w.bwmax, w.led_max_w, w.stray_min_w, w.tight_w) \
+            != ("ok", None, 19, 9, 3, False):
+        errs.append("a width-only verdict parsed as %r"
+                    % ((w.verdict, w.bhmax, w.bwmax, w.led_max_w,
+                        w.stray_min_w, w.tight_w),))
+    w = fit_of(HDR + " ledmaxw=9 strayminw=3",
+               "CAM: fit 30 LED samples ignored -- they reach 31 wide, far "
+               "past the 9 the rest stop at",
+               "CAM: fit bhmax=11 (LEDs reach 7, stray starts at 15)",
+               "CAM: fit bwmax=19 (LEDs reach 9 wide, stray starts at 30 -- "
+               "TIGHT, only one step between them)",
+               "CAM: fit applied and saved")
+    if (w.bhmax, w.bwmax, w.tight, w.tight_w, w.applied, w.ignored_w, w.ignored) \
+            != (11, 19, False, True, True, (30, 31, 9), None):
+        errs.append("both axes together parsed as %r"
+                    % ((w.bhmax, w.bwmax, w.tight, w.tight_w, w.applied,
+                        w.ignored_w, w.ignored),))
 
     # ---- a verdict is a PROPOSAL, not a setting ----------------------------
     # NAMED, because a later tidy-up of pump() is exactly what brings this
@@ -831,10 +854,11 @@ def driver():
     import csv as _csv
     _p = os.path.join(OUT, "loopcols.csv")
     _bl = gun_studio.BlobLog(_p)
-    if gun_studio.BlobLog.COLS[-2:] != ("loopv", "loops"):
-        errs.append("the loop columns are not the last two, so every capture "
-                    "already on a stick reads shifted: %r"
-                    % (gun_studio.BlobLog.COLS[-4:],))
+    _C = gun_studio.BlobLog.COLS
+    if _C.index("loopv") <= _C.index("bcold") or _C.index("loops") != _C.index("loopv") + 1:
+        errs.append("the loop columns moved, so every capture already on a "
+                    "stick reads shifted: %r" % (_C[-10:],))
+    _lv = slice(_C.index("loopv"), _C.index("loops") + 1)
     _bl.sample({"bframes": 1, "hwv": 63, "hws": "HOLD"},
                "CAM: blobs 1,2,3,1", 100.0)
     # ...and the row a gun too old to send them writes: BLANK, not 0 and not
@@ -849,9 +873,9 @@ def driver():
         errs.append("COLS and sample() are out of step: header %d, rows %s"
                     % (len(gun_studio.BlobLog.COLS),
                        [len(r) for r in _rows[1:]]))
-    elif _rows[1][-2:] != ["63", "HOLD"] or _rows[2][-2:] != ["", ""]:
+    elif _rows[1][_lv] != ["63", "HOLD"] or _rows[2][_lv] != ["", ""]:
         errs.append("the loop columns wrote %r / %r"
-                    % (_rows[1][-2:], _rows[2][-2:]))
+                    % (_rows[1][_lv], _rows[2][_lv]))
     # ...and they FOLLOW the loop during a capture. sample() reads hwv/hws
     # from last[], which 'cam?' fills only on connect and "Read from gun"; the
     # once-a-second '~camloop?' answer has to land there too, or every row of
@@ -872,10 +896,10 @@ def driver():
     _bl.close()
     with open(_p2) as _fh:
         _rows = list(_csv.reader(_fh))
-    if len(_rows) != 3 or _rows[1][-2:] != ["63", "HOLD"] \
-            or _rows[2][-2:] != ["40", "LOWER"]:
+    if len(_rows) != 3 or _rows[1][_lv] != ["63", "HOLD"] \
+            or _rows[2][_lv] != ["40", "LOWER"]:
         errs.append("loopv/loops did not follow the '~camloop?' answer: %r"
-                    % [r[-2:] for r in _rows[1:]])
+                    % [r[_lv] for r in _rows[1:]])
     if [L6.last.get(k) for k in ("loop", "hwlo", "hwhi")] != [1, 30, 63]:
         errs.append("the '~camloop?' answer did not refresh last[]: %r"
                     % {k: L6.last.get(k) for k in ("loop", "hwlo", "hwhi")})
@@ -1021,39 +1045,44 @@ def driver():
             errs.append("the camera panel has no Advanced disclosure: %s"
                         % [t for t in texts(root, []) if "Advanced" in t])
         elif "bhmax" not in gate_box:
-            errs.append("the camera panel has no blob-height control -- the "
-                        "one gate measured to work is the one that has to be "
-                        "in front (spinboxes: %s)"
+            errs.append("the camera panel has no blob-height control at all "
+                        "(spinboxes: %s)"
                         % [str(s.cget("values")) for s in spinboxes(root)])
         else:
             adv_btn = adv_btn[0]
-            # The shape-capture button answers to three labels, because the
-            # capture is armed at boot and this app does not know which state
-            # it is in until the gun says: "Shape capture ?" is what stands
-            # there in between. Pinned as a set rather than as the one label,
-            # so a pass that removed the unknown state would still be seen.
+            # What a normal user acts on, and nothing with a number in it:
+            # the format is full by default, the ceilings are measured, the
+            # LED shape measures itself. Sensitivity, the measured gate, a
+            # reset of the LED shape, the loop, Save.
             front = {"sensitivity": by_text(root, ("Default",), cls="Button"),
-                     "blob detail": by_text(root, ("full detail",)),
-                     "learn": by_text(root, ("Learn LED shape",
-                                             "Stop learning",
-                                             "Shape capture ?"),
-                                      cls="Button"),
+                     "measure": by_text(root, ("Measure the gate",), cls="Button"),
+                     "reset shape": by_text(root, ("Reset LED shape",), cls="Button"),
                      "auto limit": by_text(root, ("auto: on", "auto: off"),
                                            cls="Button"),
-                     "CSV": by_text(root, ("Shape CSV",), cls="Button"),
                      "save": by_text(root, ("Save to gun",), cls="Button")}
             missing = [k for k, v in front.items()
                        if not any(shown(w) for w in v)]
-            if missing or not shown(gate_box["bhmax"]):
+            if missing:
                 errs.append("a control a test needs is not on the front of "
-                            "the panel: %s"
-                            % (missing + ([] if shown(gate_box["bhmax"])
-                                          else ["blob height"])))
-            # ...and the rest is NOT, until it is asked for.
+                            "the panel: %s" % missing)
+            # ...and the rest is NOT, until it is asked for: the format, the
+            # hand-set height/width boxes, the capture toggle and its CSV,
+            # the size window, the superseded limits, the registers.
+            # The shape-capture button answers to three labels, because the
+            # capture is armed at boot and this app does not know which state
+            # it is in until the gun says: "Shape capture ?" is what stands
+            # there in between.
             hidden = {"bmin/bmax/rtol": [bspin for bspin in spinboxes(root)
                                          if str(bspin.cget("values")) == ""],
                       "pxmax": [gate_box["pxmax"]],
                       "armax": [gate_box["armax"]],
+                      "bhmax": [gate_box["bhmax"]],
+                      "blob detail": by_text(root, ("full detail",)),
+                      "learn": by_text(root, ("Learn LED shape",
+                                              "Stop learning",
+                                              "Shape capture ?"),
+                                       cls="Button"),
+                      "CSV": by_text(root, ("Shape CSV",), cls="Button"),
                       "full-mode register": by_text(root, ("0x55",)),
                       "sensor test": by_text(root,
                                              ("Test sensor connection",),

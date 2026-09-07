@@ -78,8 +78,8 @@ bool aim_gate_clear(void);
 // the shape gate is off, which is also its default.
 //   pxmax  largest blob PIXEL COUNT kept, 0 = off
 //   armax  longest/shortest side, in EIGHTHS (8 = 1:1, 16 = 2:1), 0 = off
-bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax);
-bool aim_gate2_store(int pxmax, int armax, int bhmax);
+bool aim_gate2_load(int* out_pxmax, int* out_armax, int* out_bhmax, int* out_bwmax);
+bool aim_gate2_store(int pxmax, int armax, int bhmax, int bwmax);
 bool aim_gate2_clear(void);
 
 // What THIS rig's LEDs have measured as, in a third key. Not a setting --
@@ -100,6 +100,9 @@ bool aim_gate2_clear(void);
 // gun at play distance, with the real, larger measurement sitting unused.
 bool aim_fit_load(int* out_led_max_h, int* out_stray_min_h, int* out_led_max_px);
 bool aim_fit_store(int led_max_h, int stray_min_h, int led_max_px);
+// The LED width edge, stored beside fit0 and cleared with it.
+bool aim_fitw_store(int led_max_w);
+bool aim_fitw_load(int* out_led_max_w);
 bool aim_fit_clear(void);
 
 // The hwmax loop's settled value, with the two bounds it was found between --

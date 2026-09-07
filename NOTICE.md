@@ -9,9 +9,17 @@ this file records what belongs to whom.
 This project is an overlay. It does not redistribute OpenFIRE.
 
 **OpenFIRE firmware** — not included. Download it yourself; `tools/patch_openfire.py`
-applies this overlay's changes to your copy. The two modified files are shipped
+applies this overlay's changes to your copy. The modified files are shipped
 here only as unified diffs under `patches/`. OpenFIRE firmware is LGPL-2.1; the
 OpenFIRE desktop app and board definitions are GPL-3.0.
+
+- RP2040: [TeamOpenFIRE/OpenFIRE-Firmware](https://github.com/TeamOpenFIRE/OpenFIRE-Firmware),
+  copyright TeamOpenFIRE and contributors.
+- ESP32-S3: [alessandro-satanassi/OpenFIRE-Firmware-ESP32](https://github.com/alessandro-satanassi/OpenFIRE-Firmware-ESP32),
+  Alessandro Satanassi's port of OpenFIRE with ESP-NOW wireless, itself LGPL-2.1
+  and derived from the TeamOpenFIRE code.
+
+The exact upstream commits are pinned in `patches/upstream.json`.
 
 **`lib/esp32-camera-ov2640/`** — a trimmed copy of Espressif's `esp32-camera`
 driver, Apache-2.0, plus OV2640 and SCCB sources from the OpenMV project, MIT.

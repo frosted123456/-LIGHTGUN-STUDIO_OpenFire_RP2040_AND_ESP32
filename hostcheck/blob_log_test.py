@@ -405,6 +405,80 @@ def main():
        "and the origin off the same line, so a capture can be plotted where "
        "the blobs actually were: %s" % {k: wire[k] for k in ("xm0", "ym0")})
 
+    # ---- the loop's own line, and how old it is ---------------------------
+    # '~camloop?' is a slower poll than '~camblob?', so a row's loop columns
+    # are up to a second older than its frame. Before these columns the 09:50
+    # hardware capture showed hwmax=63 beside loopv=126 and nothing in the
+    # file said which was current; and the dwell's clean/stray/cut counts --
+    # the one thing that says WHY a LOWER happened -- were never written.
+    tclk = [100.0]
+    link.clock = lambda: tclk[0]
+    link.src = type("S", (), {"q": _queue_of([
+        "CAM: loop on=1 state=LOWER val=127 lo=0 hi=255 dwell=12/50 "
+        "clean=2 stray=9 cut=1 settled=0 saved=0\n"])})()
+    link.pump()
+    tclk[0] = 100.35
+    log5 = BlobLog(os.path.join(d, "loop.csv"), clock=lambda: tclk[0])
+    ck(log5.sample(dict(link.last, bframes=1901),
+                   "CAM: blobs 30,40,3,1,8,12,200,20,14", None) is True,
+       "a row after a loop reply is written")
+    log5.close()
+    with open(os.path.join(d, "loop.csv")) as fh:
+        lh, lr = [r.split(",") for r in fh.read().strip().split("\n")[:2]]
+    lp = dict(zip(lh, lr))
+    ck(lp["loopv"] == "127" and lp["loops"] == "LOWER" and lp["loopl"] == "0"
+       and lp["looph"] == "255" and lp["loopdw"] == "12" and lp["loopcl"] == "2"
+       and lp["loopst"] == "9" and lp["loopcu"] == "1" and lp["loopsv"] == "0",
+       "the loop's bounds and this dwell's verdict counts land in their own "
+       "columns: %s" % {k: lp[k] for k in ("loopv", "loops", "loopl", "looph",
+                                            "loopdw", "loopcl", "loopst",
+                                            "loopcu", "loopsv")})
+    ck(lp["loopage"] == "350",
+       "...with the age of that loop line in ms, so a reader knows how far "
+       "the loop columns lag the frame (%r)" % lp["loopage"])
+    ck(tuple(BlobLog.COLS[-9:]) == ("loopl", "looph", "loopdw", "loopcl",
+                                    "loopst", "loopcu", "loopsv", "loopage",
+                                    "bwmax"),
+       "and they are on the END, behind loopv/loops, like every column since "
+       "the first file -- with the width gate behind them")
+    log6 = BlobLog(os.path.join(d, "noloop.csv"))
+    nl = {k: v for k, v in link.last.items() if not k.startswith("loop")
+          and k not in ("hwv", "hws", "hwlo", "hwhi")}
+    ck(log6.sample(dict(nl, bframes=1902), "CAM: blobs 30,40,3,1", None) is True,
+       "a gun that never answered '~camloop?' still writes rows")
+    log6.close()
+    with open(os.path.join(d, "noloop.csv")) as fh:
+        nh, nr = [r.split(",") for r in fh.read().strip().split("\n")[:2]]
+    np_ = dict(zip(nh, nr))
+    ck(all(np_[k] == "" for k in ("loopl", "loopcl", "loopage")),
+       "...with the loop columns blank, not zero: a 0 age would claim a loop "
+       "line that was never received")
+
+    # ---- what reaches the medium when the Pi dies ---------------------------
+    # flush() hands a row to the kernel; only fsync() puts it on the card. A
+    # power pull or a stick yanked mid-capture keeps what was synced. Once a
+    # second and on close, counted rather than trusted.
+    import gun_studio as _gs
+    syncs = []
+    real_fsync = _gs.os.fsync
+    _gs.os.fsync = lambda fd: syncs.append(fd)
+    try:
+        tclk[0] = 200.0
+        log7 = BlobLog(os.path.join(d, "sync.csv"), clock=lambda: tclk[0])
+        base = dict(link.last)
+        for i in range(5):
+            tclk[0] += 0.3
+            log7.sample(dict(base, bframes=3000 + i), "CAM: blobs 30,40,3,1", None)
+        n_mid = len(syncs)
+        ck(n_mid == 1,
+           "five rows over 1.5 s cost one fsync, not five: a card is not "
+           "asked to commit four times a second (%d)" % n_mid)
+        log7.close()
+        ck(len(syncs) == n_mid + 1, "...and close() syncs once more, so the "
+           "last rows are on the card before the file is reported written")
+    finally:
+        _gs.os.fsync = real_fsync
+
     # A gun that has said nothing yet must not produce a row.
     log2 = BlobLog(os.path.join(d, "empty.csv"))
     ck(log2.sample({}, "", None) is False,

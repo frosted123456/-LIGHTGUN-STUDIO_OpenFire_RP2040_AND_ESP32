@@ -20,6 +20,26 @@ it. Studio detects which gun is plugged in and adapts.
 
 Please test. You get extremely accurate aim with snappy aim. No springy effect when fine tunning is properly performed. Give me your feedback!
 
+## Thanks
+
+This project is an overlay on other people's work, and none of it would exist
+without them:
+
+- **[TeamOpenFIRE](https://github.com/TeamOpenFIRE/OpenFIRE-Firmware)** — the
+  OpenFIRE firmware (LGPL-2.1) and the OpenFIRE App (GPL-3.0). The RP2040 build
+  here is stock OpenFIRE with this overlay's patches applied on top.
+- **[Alessandro Satanassi](https://github.com/alessandro-satanassi/OpenFIRE-Firmware-ESP32)**
+  — the ESP32-S3 port of OpenFIRE with ESP-NOW wireless (LGPL-2.1). The ESP32
+  build here is his firmware with this overlay's patches applied on top.
+- The **DFRobot / PixArt** sensor driver authors, **Espressif** and **OpenMV**
+  for the camera driver code, and the authors of the papers the maths comes
+  from (see `NOTICE.md`).
+
+OpenFIRE is not redistributed here. `tools/patch_openfire.py` fetches the
+pinned upstream commits (`patches/upstream.json`) and applies the diffs in
+`patches/`, so the original authors' code stays theirs and this repository
+stays a set of changes to it. Licences and what belongs to whom: `NOTICE.md`.
+
 ---
 
 ## 1. What you need
@@ -254,38 +274,44 @@ sweep doubles as a check: whenever fewer than four dots are detected the
 preview freezes on the last full frame and says so, making contamination and
 dropouts visible at a glance.
 
-**2b — RP2040 (wiicam).** Four steps, top to bottom. Leave *Advanced* alone.
+**2b — RP2040 (wiicam).** Three steps, top to bottom. Leave *Advanced* alone.
 
 1. **Sensitivity — press `Max`.** Lets the gun see the LEDs from further
    away. A new gun already starts there; press it anyway.
 
-2. **Blob detail — press `full detail`.** Lets the gun tell an LED from a
-   lamp or a window.
-
-3. **Teach it your room.** Press `Learn LED shape`. Point at the LED bar for a
-   few seconds with no bright light in view. Then, keeping the screen in
-   view, pan slowly so your lamp or window comes into the picture too. Press
-   `Measure the gate`, then `Apply`.
+2. **Measure the gate.** Point at the LED bar from where you play for a few
+   seconds, press `Measure the gate`, then `Apply`. The gun measures what
+   *your* LEDs look like by itself from the moment it boots (full blob
+   detail is the default), and the gate is derived from that measurement —
+   there is no number to pick. Optional, to tighten it: keeping the screen in
+   view, pan slowly so your lamp or window comes into the picture too, then
+   measure again.
    If it says *no safe gate* — your LEDs and your room light look the same to
    the sensor. Leave the gate off; move the bar or block the light instead.
    Doing this right after step 4 (aim calibration) is even better, since the
    gun will have seen your LEDs from every distance — but it is not required.
+   Changed the bar or the sensitivity? Press `Reset LED shape` and measure
+   again, or the two rigs average into one wide spread.
 
-4. **Press `Save to gun`.**
+3. **Press `Save to gun`.**
 
 That's it. The *Auto light limit* row shows the gun tuning its own sensor
 limit as you play — leave it on; it saves its value by itself. If the cursor
 ever sticks or jumps later, the tab says which limit is doing it and how to
 switch it off. In the live preview a hollow corner is one the gun filled in
 itself (that LED was hidden or cut) and the small arrow is the motion lead —
-the quad is drawn where the gun actually saw it.
+the quad is drawn where the gun actually saw it. Even with no gate applied,
+a blob twice as wide or two rows taller than any LED the gun has measured
+never reaches the resolver.
 
-*Advanced* holds the older limits. None of them is needed; the serial table at
-the end of this README describes each one.
+*Advanced* holds the report format, the hand-set limits, the shape capture's
+stop/start and CSV, and the sensor's own registers. None of them is needed;
+the serial table at the end of this README describes each one.
 
-On pical the same four steps are built into the calibration flow, and the
-room sweep from step 3 is offered as its own screen right after the last
-stance (step 4b).
+On pical the same three steps are built into the calibration flow: the
+camera page has `Measure the shape gate` and `Reset LED shape`, and the
+measurement is offered as its own screen right after the last stance (step
+4b).
 
 **3 — Lens / FOV** *(skip on both stock lenses)*. The stock 66° OV2640 lens and
 the wiicam's 33° lens need nothing here. A wide or fisheye lens bends the LED
@@ -385,11 +411,11 @@ the fit will refuse. It ends by sending the calibration to the gun and reading
 it back to confirm.
 
 **4b — Room light sweep** *(RP2040 only, optional, skippable with one key)*.
-Step 3 of the camera tab, offered here because this is the best moment for
-it: the gun has just seen your LEDs from every distance. Start with the bar
-clean and any bright light out of view, then pan slowly with the **screen
-still in view** so the lamp or window comes in beside the LEDs. pical shows it
-as its own screen; in Studio it is `Measure the gate` on the Camera tab.
+Step 2 of the camera tab, offered here because this is the best moment for
+it: the gun has just seen your LEDs from every distance, and that alone gives
+a gate. To tighten it, pan slowly with the **screen still in view** so the
+lamp or window comes in beside the LEDs. pical shows it as its own screen; in
+Studio it is `Measure the gate` on the Camera tab.
 
 Why it exists: the sensor reports only four blobs, so a bright window does not
 merely add a fifth point, it **takes an LED's slot**. A size ceiling that drops
@@ -609,26 +635,27 @@ All are prefixed `~` on the native USB port.
 | `~cam=lens:2,lfeq:900,lfpx:840` | Set the lens correction live |
 | `~cam=sens:1` | wiicam sensitivity 0–2 (RP2040 board only). Changing it while a shape capture is running clears the capture and says so — the same LEDs go from a 2x2 box to 12x3 between sensitivities, and a histogram spanning both measures neither. `hwmax`/`hwmin` changes do the same |
 | `~cam=beta:24` | Smoothing speed sensitivity, 0–60; −1 = default (15) |
-| `~cam=fmt:1` | Sensor report format (wiicam only): 0 basic, 1 extended (adds each blob's size, 0–15), 2 full (adds the blob's bounding box and an 8-bit intensity). Basic by default. **Saved by `~camsave` in full, full mode included** — it used to be clamped to extended on the way to flash, which meant a saved `bhmax` came back into a gun that could never run it and the shape gate died silently on every power cycle. `~cam=ext:` is the old name and still works |
+| `~cam=fmt:1` | Sensor report format (wiicam only): 0 basic, 1 extended (adds each blob's size, 0–15), 2 full (adds the blob's bounding box and an 8-bit intensity). **Full by default** — the shape gate, the learning sink and the seed's width veto all need the box; a sensor that cannot do full mode falls back on its own, and `camreset` returns to full. **Saved by `~camsave` in full, full mode included** — it used to be clamped to extended on the way to flash, which meant a saved `bhmax` came back into a gun that could never run it and the shape gate died silently on every power cycle. `~cam=ext:` is the old name and still works |
 | `~cam=fullreg:85` | The byte written to the mode register for full mode — 85 (0x55) or 5 (0x05). The driver's working constants for the other two formats are the doubled nibble, so 0x55 is the default; try 5 if full mode returns nonsense. Not saved |
 | `~cam=bmin:2,bmax:9` | Blob size window. Blobs outside it are dropped before the quad resolver, so a bright window is refused instead of taking an LED's slot. Needs `fmt:1` or higher; 0–15 accepts everything |
 | `~cam=rtol:3` | Odd-one-out gate, in blob-size STEPS (0–15) — nothing to do with shape. Drops a blob whose reported size differs by more than this from the median of the others in the same frame. Because it compares a blob against its neighbours rather than against a fixed number, it needs no distance tuning; 0 = off |
 | `~cam=bhmax:0` | Largest blob box HEIGHT kept, and **the only shape gate worth using — but do not pick the number yourself, let `~camfit` measure it.** Height rather than width or area because at sensitivity 2 the sensor smears horizontally: the same LEDs go from a 2x2 box to 12x3 when the gain goes up, width x5.5 against height x1.5, so width measures the gain and height still measures the source. Ships at 0 (off). A value below what this gun has measured its own LEDs at is refused, and the refusal names the figure — that bound is the larger of the live capture and the one stored in flash, so it survives a power cycle and a thin capture in a dim room cannot lower it. Needs `fmt:2`, and a value set outside full mode says so rather than sitting there doing nothing |
+| `~cam=bwmax:0` | Largest blob box WIDTH kept. The other half of the shape gate, and the half a **window** answers to: on hardware a window looked at straight on came in as flat slabs 13–93 wide, while an LED never passed 12 — height cannot separate those (the slab is 1–2 tall) and width does. Same rules as `bhmax`: ships at 0, refused below this gun's own widest measured LED, derived by `~camfit` from the capture rather than chosen, needs `fmt:2`. `~camfit` names either ceiling, both, or neither, judged by what each actually catches |
 | `~cam=pxmax:0` | Largest blob PIXEL COUNT kept. Superseded by `bhmax` and weak where it was measured — 16 of 19 strays sat inside the LED range, and the largest blobs in that capture turned out to be two LEDs merged rather than strays. Ships at 0 (off); refused below this gun's own measured LEDs. That bound is measured from the blob's bounding-box area, which is an upper limit on its pixel count — so it refuses a slightly wider band than strictly needed, the safe direction. On a rig whose LED blobs run past what that measurement can express, every non-zero value is refused and it says to use `bhmax` instead, rather than accepting a ceiling it cannot vouch for. Needs `fmt:2` |
 | `~cam=armax:0` | **Deprecated.** Roundness limit — longest side over shortest, in EIGHTHS (16 = 2:1). It was chosen at sensitivity 1 as the one feature that survives changing the bar, because an LED is a point source and 63% of blobs came out exactly square. Sensitivity 2 is the default now and its horizontal smear puts the median LED near 4:1, so the feature did not survive the change it was picked for. Still loads and still applies, so a setting already in a gun's flash keeps its meaning; nothing suggests a value and `~camfit` never sets it. Ships at 0 (off) |
 | `~cam=hwmax:-1` | The sensor's OWN maximum blob size, register 0x06 — the only gate that acts before the camera allocates its four object slots, so the only one that can stop a stray from displacing an LED. Normally driven by the gun's auto light limit loop (see `~camloop?`). Setting it by hand switches that loop OFF; a hand-set value is not saved. −1 leaves the register alone |
 | `~cam=hwmin:3` | The sensor's own minimum blob size, register 0x1B — never written by the stock driver, so it otherwise sits at an unknown default. −1 leaves it alone |
-| `~cam=loop:1` | The auto light limit loop (wiicam only, on by default). It moves `hwmax` by itself: down when the resolver keeps seeing a fourth blob that is not a corner, straight back up the moment an LED goes missing, and it saves the value once it has held clean for a second. `loop:1` turns it on and starts the search over from the register's current value; `loop:0` turns it off and hands the register back to the sensitivity preset. A hand `hwmax:` also turns it off |
+| `~cam=loop:1` | The auto light limit loop (wiicam only, on by default). It moves `hwmax` by itself: down when the resolver keeps seeing a fourth blob that is not a corner, straight back up the moment an LED goes missing **while the others are still tracked** (a lost lock — the gun turned to a window — counts for nothing), and it saves the value once it has held clean for a second. A raise records a lower bound only provisionally: it stands once the LEDs are seen again at the raised value, and is withdrawn otherwise, so a corner hidden by the lens edge or a window cannot walk the bounds shut. `loop:1` turns it on and starts the search over from the register's current value; `loop:0` turns it off and hands the register back to the sensitivity preset. A hand `hwmax:` also turns it off |
 | `~camloop?` | The loop's state in one line: `CAM: loop on=1 state=HOLD val=255 lo=0 hi=256 dwell=12/50 clean=12 stray=0 cut=0 settled=0 saved=1`. `state` is HOLD, LOWER, RAISE, NOSAFE (lo and hi have met: the room's strays are LED-sized, back at the preset) or OFF; `hi=256` means no value has admitted a stray yet. Both tools show this as the "Auto light limit" row |
 | `~camblob?` | Each blob the sensor last reported — position, size, and whether a gate kept it, plus its bounding box and intensity in full mode — the share of recent frames that saw four, three or two LEDs, how many blobs the shape gate refused that sat nowhere near a corner (`bfar`, strays it was right about) versus exactly where a missing LED should have been (`bnear`, the false-negative meter — a ceiling that is too tight shows up here long before the cursor sticks); both count on every frame, capture or no capture, and the gun's frame counter and clock, from which the camera's true frame rate is measured |
 | `~camreset` | Undo everything that can stop a gun aiming: lens, lead, the software blob gate and the shape gate with their saved copies, the stored `~camfit` provenance, and the sensor's own thresholds, which go back to the sensitivity preset. The auto light limit loop restarts from the preset and its saved value (`hwl0`) is erased; the shape capture is emptied and armed again. Every key is attempted even if an earlier one fails to erase |
 | `~camlearn=on:1` | Start measuring what an LED actually looks like on this rig. Both tools switch this on for you during calibration and the room sweep, so the normal path needs no command at all. Two histograms per feature — blobs the quad resolver confirmed as corners, and blobs it placed nowhere near one — so the question "can a window and an LED be told apart at all" is answered from data instead of guessed. Needs `fmt:2` for anything beyond size. Starting clears; nothing is gated on it and nothing is saved |
 | `~camlearn?` | The histograms: a summary line, then one line per class and feature |
 | `~camlearn=reset` | Clear the capture without stopping it |
-| `~camfit?` | What the capture says the gate should be, without changing anything. Answers in one of four ways: it needs more LED data, it has no stray data yet (sweep the room with the screen still in view), the two overlap so **no size gate can work on this rig** and it says so instead of offering a number, or it names a `bhmax` and shows what it was derived from. If some "LED" samples sit far above the rest — the sun, learned while the resolver locked on it at a cold start — it says how many it set aside and where they reached, rather than letting them inflate the answer silently |
+| `~camfit?` | What the capture says the gate should be, without changing anything. Answers in one of four ways: it needs more LED data, the LEDs alone give a ceiling (no stray measured yet: two rows over the tallest LED, twice the widest — a sweep past a lamp with the screen in view tightens it), the two overlap so **no size gate can work on this rig** and it says so instead of offering a number, or it names a `bhmax` and/or a `bwmax` — one ceiling per axis that keeps every LED this gun has measured and catches strays above it; an axis that catches nothing is not offered, and NO SAFE GATE means neither does — and shows what each was derived from. If some "LED" samples sit far above the rest — the sun, learned while the resolver locked on it at a cold start — it says how many it set aside and where they reached, rather than letting them inflate the answer silently |
 | `~camfit=apply` | The same verdict, and set + save the `bhmax` it names. It **switches the gun to full mode itself and saves that too**, because the shape gate only runs in full mode, the ceiling could only have been measured in it, and a ceiling saved without it is a gate that works until the next power cycle. Says so on the way if it had to switch. Matched exactly, so a typo like `camfit=applyfoo` reads as a query and writes nothing |
 | `~camdiag` | Sensor connection test: power, both data wires, swapped lines, the sensor itself, and whether frames actually flow |
-| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens, temporal mode, the software blob gate (`fmt`, `bmin`, `bmax`, `rtol`), the shape gate (`bhmax`, `pxmax`, `armax`) and and — once a capture holds 500 confirmed LED blobs — the tallest and largest LED this gun has ever measured, which is the refusal floor under `bhmax`/`pxmax` after a power cycle. That record is only ever **raised** by a save, never lowered: a thin capture in a dim corner cannot talk the gun into accepting a ceiling that blinds it at play distance. `hwmin` and a hand-set `hwmax` are NOT saved (they are the settings that can leave a gun dark, so a power cycle stays a way out); the loop's own `hwmax` is saved by the loop itself when it settles. `sens` lives in the OpenFIRE profile. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
+| `~camsave` | Persist camera settings, lead, smoothing, beta, dead-band, lens, temporal mode, the software blob gate (`fmt`, `bmin`, `bmax`, `rtol`), the shape gate (`bhmax`, `bwmax`, `pxmax`, `armax`) and — once a capture holds 500 confirmed LED blobs — the tallest and largest LED this gun has ever measured, which is the refusal floor under `bhmax`/`pxmax` after a power cycle. That record is only ever **raised** by a save, never lowered: a thin capture in a dim corner cannot talk the gun into accepting a ceiling that blinds it at play distance. `hwmin` and a hand-set `hwmax` are NOT saved (they are the settings that can leave a gun dark, so a power cycle stays a way out); the loop's own `hwmax` is saved by the loop itself when it settles. `sens` lives in the OpenFIRE profile. Replies `CAM: saved ...` (or `CAM: SAVE FAILED ...`) listing the values written, so a tool can verify rather than assume |
 | `~fx?` | Recoil engine state: every knob, dry-fire and quiet countdowns, and the trigger path's last temperature reading |
 | `~fx=on:1,drive:45,hold:0` | Tune the recoil engine live. `on:0` is stock OpenFIRE behaviour |
 | `~fx=quiet:1` / `:0` | Silence the gun: nothing fires, and the engine holds both the solenoid and the rumble motor so OpenFIRE's own recoil cannot run either. Used by the calibration screens; lapses by itself after five minutes |

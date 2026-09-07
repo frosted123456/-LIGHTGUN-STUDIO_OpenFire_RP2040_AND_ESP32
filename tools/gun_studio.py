@@ -564,12 +564,29 @@ class BlobLog:
             # The loop's limit (hwv) and state (hws), on the end like the rest.
             # They say why blob sizes changed mid-capture; 'hwmax' above is the
             # register as 'cam?' last showed it (-1 = handed back to the preset).
-            "loopv", "loops")
+            "loopv", "loops",
+            # The loop's bounds and its current dwell's verdict counts, and
+            # how old that answer is (ms) -- '~camloop?' is a separate, slower
+            # poll, so a row pairs this frame with a loop line up to a second
+            # older, and a LOWER/RAISE read off these columns alone would be
+            # dated wrong. On the end, like everything since the first file.
+            "loopl", "looph", "loopdw", "loopcl", "loopst", "loopcu", "loopsv",
+            "loopage",
+            # The width gate in force, beside nothing it belongs with -- on
+            # the end, like every column since the first file.
+            "bwmax")
 
-    def __init__(self, path):
+    # Pushed to the medium this often, on top of the per-row flush: a
+    # flush() only hands the row to the kernel, and a Pi that loses power or
+    # a stick pulled mid-capture keeps only what fsync() got onto the card.
+    SYNC_S = 1.0
+
+    def __init__(self, path, clock=time.monotonic):
         self.path = path
         self.rows = 0
         self._last_frames = None
+        self._clock = clock
+        self._synced = clock()
         self._f = open(path, "w")
         try:
             self._f.write(",".join(self.COLS) + "\n")
@@ -632,17 +649,36 @@ class BlobLog:
         # nothing, and 'OFF' in loops is a claim about a loop that is not there.
         vals.append(last.get("hwv", ""))
         vals.append(last.get("hws", ""))
+        for k in ("hwlo", "hwhi", "loopdw", "loopcl", "loopst", "loopcu",
+                  "loopsv"):
+            vals.append(last.get(k, ""))
+        t_loop = last.get("loop_t")
+        vals.append(int(round((self._clock() - t_loop) * 1000.0))
+                    if t_loop is not None else "")
+        vals.append(last.get("bwmax", ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
         # an empty file, because the writes are still in the page cache.
         self._f.flush()
         self.rows += 1
+        now = self._clock()
+        if now - self._synced >= self.SYNC_S:
+            self._synced = now
+            self._sync()
         return True
+
+    def _sync(self):
+        try:
+            os.fsync(self._f.fileno())
+        except Exception:
+            pass                    # a medium without fsync still has the flush
 
     def close(self):
         """Returns False if the final flush failed -- a caller that reports
         "N rows written" should not claim rows that never reached the disk."""
         try:
+            self._f.flush()
+            self._sync()
             self._f.close()
             return True
         except Exception:
@@ -875,6 +911,13 @@ class CamFit:
         self.verdict = ""
         self.bhmax = None       # the number, and ONLY on a real verdict
         self.tight = False      # one row between the LEDs and the stray light
+        # The width axis, measured the same way: LEDs never past 12 wide on
+        # hardware, a window's slabs 13..93. Either ceiling alone is a verdict.
+        self.led_max_w = self.stray_min_w = None
+        self.bwmax = None
+        self.tight_w = False
+        self.ignored_w = None   # (samples, width reached, where the rest stop)
+        self.led_only = False   # ceilings from the LED body alone, no stray gap
         self.applied = None     # True saved, False save failed, None neither
         # (samples, how tall they reached, where the rest stop) for LED
         # samples the gun set aside as contamination -- the sun or a window
@@ -938,6 +981,21 @@ class CamFit:
                     self.stray_n = n
                 elif k == "strayminh":
                     self.stray_min_h = n
+                elif k == "ledmaxw":
+                    self.led_max_w = n
+                elif k == "strayminw":
+                    self.stray_min_w = n
+            return True
+        if rest.startswith("no stray data yet"):
+            self.led_only = True
+            return True
+        if "LED samples ignored" in rest and "wide" in rest:
+            try:
+                n = int(rest.split()[0])
+            except (ValueError, IndexError):
+                return True
+            self.ignored_w = (n, self._num(rest, "they reach", "wide"),
+                              self._num(rest, "far past the", "the rest"))
             return True
         if "LED samples ignored" in rest:
             # 'CAM: fit 32 LED samples ignored -- they reach 31 tall, far
@@ -995,6 +1053,14 @@ class CamFit:
                 return True
             self.verdict = "ok"
             self.tight = "TIGHT" in rest
+            return True
+        if rest.startswith("bwmax="):
+            try:
+                self.bwmax = int(rest[6:].split()[0].strip("(,"))
+            except (ValueError, IndexError):
+                return True
+            self.verdict = "ok"
+            self.tight_w = "TIGHT" in rest
             return True
         if rest.startswith("applied and saved"):
             self.applied = True
@@ -1393,11 +1459,14 @@ class Link:
             # from there, and 'cam?' is only asked on connect and "Read from
             # gun" -- without this the CSV's loopv/loops froze for a capture.
             for src, dst in (("on", "loop"), ("val", "hwv"), ("lo", "hwlo"),
-                             ("hi", "hwhi")):
+                             ("hi", "hwhi"), ("dwell", "loopdw"),
+                             ("clean", "loopcl"), ("stray", "loopst"),
+                             ("cut", "loopcu"), ("saved", "loopsv")):
                 if src in d:
                     self.last[dst] = d[src]
             if d.get("state") in LOOP_STATES:
                 self.last["hws"] = d["state"]
+            self.last["loop_t"] = self.clock()   # BlobLog's 'loopage'
 
     def pump(self):
         """drain the stream; keep the last ~2 s of quads; write the next queued line"""
@@ -1545,6 +1614,7 @@ class Link:
                                                  # send the gun a setting the
                                                  # user never chose.
                                                  "bhmax", "pxmax", "armax",
+                                                 "bwmax",
                                                  # bsv: seed-veto count, added after bnear.
                                                  # bcold: no-model/refused-seed frames, after bsv.
                                                  "bsrej", "bfar", "bnear", "bsv",
@@ -2264,7 +2334,14 @@ def main():
     # be done is refuse the impostor, so the resolver rebuilds the missing
     # corner from the three real ones instead of trusting four points one of
     # which is a lie.
-    rowb = tk.Frame(frame_wii, bg=C_BG); rowb.pack(fill="x")
+    # The Advanced disclosure, built here so the rows below can live in it.
+    # Packed only when its button says so (adv_toggle, further down); pack
+    # order is the order of pack calls, so building it early costs nothing.
+    frame_adv = tk.Frame(frame_wii, bg=C_BG)
+    # Report format and the hand-set shape boxes: Advanced. The format is
+    # full by default and the ceilings are measured, so a normal user never
+    # touches either -- and a spinbox on the front read as a knob to turn.
+    rowb = tk.Frame(frame_adv, bg=C_BG); rowb.pack(fill="x")
     # Three report formats, not a switch: each one costs a longer read per
     # frame, so the question is how much detail is worth the bus time and not
     # whether sizes are on. Named for what the user gets rather than for the
@@ -2391,6 +2468,11 @@ def main():
     # pixels -- two different things that would otherwise both read "12 px".
     BHMAX_STEPS = (("off", 0), ("8 rows", 8), ("10 rows", 10),
                    ("12 rows", 12), ("16 rows", 16), ("24 rows", 24))
+    # Width, in sensor COLUMNS. The smear inflates it, which is exactly why a
+    # window's flat slab (13..93 wide on hardware) and an LED (never past 12)
+    # sit so far apart on this axis; 'Measure the gate' derives the number.
+    BWMAX_STEPS = (("off", 0), ("12", 12), ("16", 16), ("20", 20),
+                   ("24", 24), ("32", 32))
     PXMAX_STEPS = (("off", 0), ("12 px", 12), ("13 px", 13), ("14 px", 14),
                    ("16 px", 16), ("20 px", 20), ("24 px", 24))
     ARMAX_STEPS = (("off", 0), ("2:1", 16), ("2.5:1", 20), ("3:1", 24),
@@ -2473,7 +2555,10 @@ def main():
     # five per cluster the LEDs themselves are taller than that, so the hint
     # was an instruction to blind the gun. The row under this one carries what
     # the gun measured on ITS OWN bar instead.
-    shape_box(rowb, "bhmax", "biggest blob height", BHMAX_STEPS, width=7)
+    shape_box(rowb, "bhmax", "blob height max", BHMAX_STEPS, width=7)
+    # Beside it, terse: the panel is a few px from its edge here and one
+    # from its bottom, so the width rungs are bare numbers (sensor columns).
+    shape_box(rowb, "bwmax", "width max", BWMAX_STEPS, width=4)
 
     # ---- the only defensible height: the one this gun measured -------------
     # '~camfit' reads the two distributions the shape capture has been filling
@@ -2599,12 +2684,14 @@ def main():
         # panel reads "off" over a gun that is gating at 11.
         held = link.last.get("bhmax") or 0
         odd = bool(held) and held not in shape_var["bhmax"][2]
+        held_w = link.last.get("bwmax") or 0
+        odd = odd or (bool(held_w) and held_w not in shape_var["bwmax"][2])
         # Which of the three shape limits are actually SET, and what the user
         # would have to type to switch each of them off. The shape gate is
         # bhmax OR pxmax OR armax: a warning that says "bhmax:0 turns it off"
         # to somebody whose gate is pxmax is advice that changes nothing, and
         # they have no way to find out it was the wrong advice.
-        on = [k for k in ("bhmax", "pxmax", "armax") if link.last.get(k)]
+        on = [k for k in ("bhmax", "bwmax", "pxmax", "armax") if link.last.get(k)]
         gate_on = bool(on)
         off_hint = ("%s turn%s it off"
                     % (" and ".join("%s:0" % k for k in on),
@@ -2723,17 +2810,28 @@ def main():
             return ("gate fit: NO SAFE GATE -- LEDs reach %s, stray starts "
                     "at %s%s" % (num(f.led_max_h), num(f.stray_min_h),
                                  ign)), C_WARN
-        if f.verdict == "ok" and f.bhmax is not None:
+        if f.verdict == "ok" and (f.bhmax is not None or f.bwmax is not None):
+            # One or both axes named a ceiling; the line says which.
+            parts = []
+            if f.bhmax is not None:
+                parts.append("bhmax %d (LEDs %s, stray %s)%s"
+                             % (f.bhmax, num(f.led_max_h), num(f.stray_min_h),
+                                " TIGHT" if f.tight else ""))
+            if f.bwmax is not None:
+                parts.append("bwmax %d (LEDs %s wide, stray %s)%s"
+                             % (f.bwmax, num(f.led_max_w), num(f.stray_min_w),
+                                " TIGHT" if f.tight_w else ""))
+            gates = " + ".join(parts)
+            if f.led_only:
+                gates += " (from the LEDs alone; a lamp sweep tightens it)"
             if f.applied is True:
-                return ("gate fit: bhmax %d applied and saved%s%s"
-                        % (f.bhmax, "  no step for it in the box"
+                return ("gate fit: %s applied and saved%s%s"
+                        % (gates, "  no step for it in the box"
                            if odd else "", ign)), C_OK
             if f.applied is False:
-                return ("gate fit: bhmax %d set but NOT SAVED -- gone at "
-                        "power-off" % f.bhmax), C_BAD
-            return ("gate fit: bhmax %d (LEDs %s, stray %s)%s -- Apply saves "
-                    "it%s" % (f.bhmax, num(f.led_max_h), num(f.stray_min_h),
-                              " TIGHT" if f.tight else "", ign)), C_OK
+                return ("gate fit: %s set but NOT SAVED -- gone at "
+                        "power-off" % gates), C_BAD
+            return ("gate fit: %s -- Apply saves it%s" % (gates, ign)), C_OK
         if f.seq:
             # A header and no outcome this parsing knows: a firmware that has
             # grown a case since. The counts it did send are still worth
@@ -2743,8 +2841,9 @@ def main():
         if odd:
             # Said before anyone has asked for a fit, because it is the panel
             # contradicting itself: the gun is gating and the box says 'off'.
-            return ("gate fit: the gun holds bhmax %d, no step for it in the "
-                    "box" % held), C_WARN
+            return ("gate fit: the gun holds %s, no step for it in the box"
+                    % " and ".join(["bhmax %d" % held] * bool(held)
+                                   + ["bwmax %d" % held_w] * bool(held_w))), C_WARN
         return "gate fit: press Measure -- it reads this gun's own LEDs", C_DIM
 
     def fit_tick():
@@ -2756,7 +2855,8 @@ def main():
                 gate_lbl.config(fg=col)
             # Only ever enabled on a verdict that named a number.
             want = "normal" if (link.fit.verdict == "ok"
-                                and link.fit.bhmax is not None) else "disabled"
+                                and (link.fit.bhmax is not None
+                                     or link.fit.bwmax is not None)) else "disabled"
             if str(btn_fit_apply.cget("state")) != want:
                 btn_fit_apply.config(state=want)
         except Exception as e:
@@ -2960,16 +3060,32 @@ def main():
             root.after(100, check)
         root.after(100, check)
 
-    tk.Button(barw, text="Shape CSV", command=shape_save, font=F,
+    # The capture runs by itself from boot. What a user does by hand is
+    # start it OVER after changing the bar or the sensitivity: the off->on
+    # edge clears it. The stop/start toggle and the CSV are diagnostics and
+    # live in Advanced.
+    def learn_reset():
+        link.send("~camlearn=on:0")
+        link.send("~camlearn=on:1")
+        link.send("~camlearn?")
+        learn_state["on"] = True
+        btn_learn.config(text=learn_label())
+        log("LED shape cleared -- measuring again from empty. Aim at the bar "
+            "from where you play; the gate is derived from what it measures.")
+    tk.Button(barw, text="Reset LED shape", command=learn_reset, font=F,
               bg="#161b22", fg=C_FG, relief="flat", padx=12,
               pady=0).pack(side="right")
+    # The capture toggle and its CSV go on the diagnostics row of Advanced,
+    # beside the sensor test (rowdg, below): one row, because the panel has
+    # one pixel to spare with the disclosure open.
     # A fixed width in characters, so the label swapping between "Learn LED
     # shape" and "Stop learning" cannot change how wide this row is: a row that
     # grows past the panel runs off the right-hand edge with nothing to say so.
-    btn_learn = tk.Button(barw, text=learn_label(), command=learn_toggle,
+    btn_learn = tk.Button(frame_adv, text=learn_label(), command=learn_toggle,
                           font=F, width=15, bg="#161b22", fg=C_FG,
                           relief="flat", padx=6, pady=0)
-    btn_learn.pack(side="right", padx=(0, 8))
+    btn_csv = tk.Button(frame_adv, text="Shape CSV", command=shape_save, font=F,
+                        bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=0)
 
     # ---- everything set once, or not at all --------------------------------
     # Hidden by default, and not because any of it is dangerous: it is because
@@ -3003,14 +3119,12 @@ def main():
     # The list is what makes a disclosure findable rather than a place things
     # go to hide, and it is measured to the width the panel actually has: 154
     # px of button and 8 of gap leave 421, and this is 392 of them.
-    lab(rowadv, "size window, odd-one-out, superseded limits, sensor "
-        "registers/test", (F[0], 8), C_DIM).pack(side="left", padx=(8, 0))
+    lab(rowadv, "format, hand-set limits, size window, shape capture, "
+        "sensor registers/test", (F[0], 8), C_DIM).pack(side="left", padx=(8, 0))
     # Packed only when the button says so. Built now so nothing here has to be
     # created on a click -- a widget built inside a Tk callback that raises
     # leaves the disclosure permanently empty with only a traceback on a
     # stderr the user does not have.
-    frame_adv = tk.Frame(frame_wii, bg=C_BG)
-
     # No pady between these four rows, unlike every row on the front: 2 px a
     # row is 8 px of the 36 the panel has left over with this open, and these
     # are spinboxes set once rather than a readout scanned mid-test.
@@ -3129,11 +3243,12 @@ def main():
                                log("~camdiag sent -- the gun answers with "
                                    "CAM: diag lines; the VERDICT line names "
                                    "what is broken"))).pack(side="left")
-    # One line and a short one: measured, the button takes 229 px of the 590
-    # this panel gets and a Tk label that overruns its frame is clipped in
-    # silence -- the reader simply never sees the end of the sentence.
-    lab(rowdg, "checks power, both wires, swapped lines and the sensor",
-        (F[0], 8), C_DIM, justify="left").pack(side="left", padx=8)
+    # The shape capture's toggle and CSV, on the same row: 229 px of button,
+    # then ~120 and ~90, of the 590 this panel gets. The sentence that used to
+    # sit here ("checks power, both wires...") is what the log says when the
+    # test runs, so the row loses nothing a user needed before the click.
+    btn_learn.pack(in_=rowdg, side="left", padx=(8, 0))
+    btn_csv.pack(in_=rowdg, side="left", padx=(8, 0))
 
     # Which notebook pages the blob poll has to keep running for. Two names
     # when the preview has a tab of its own, the same name twice when it does
