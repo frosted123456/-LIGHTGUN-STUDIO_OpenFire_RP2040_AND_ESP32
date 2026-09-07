@@ -619,7 +619,9 @@ clean under `pio run`, and `~ping` answers after a flash.
 
 ## 6. Useful serial commands
 
-All are prefixed `~` on the native USB port.
+All are prefixed `~` on the native USB port. What the wiicam's registers are, what
+each preset writes into them and what we measured about them is in
+[`docs/wiicam_registers.md`](docs/wiicam_registers.md).
 
 | Command | Effect |
 |---|---|
