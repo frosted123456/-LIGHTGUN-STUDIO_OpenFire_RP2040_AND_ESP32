@@ -291,6 +291,7 @@ bool aim_dead_load(int* out_units)
 #define AIM_NVS_FIT  "fit0"
 #define AIM_NVS_FITW "fit1"   // the LED WIDTH edge, its own key: fit0's word is full
 #define AIM_NVS_HWL  "hwl0"
+#define AIM_NVS_HWG  "hwg0"   // the gain loop: its own key, its own bounds
 #define AIM_GATE_TAG 0x6A000000u
 
 bool aim_gate_store(int fmt, int bmin, int bmax, int rtol)
@@ -571,6 +572,71 @@ bool aim_hwloop_load(int* out_val, int* out_lo, int* out_hi)
     return true;
 #else
     (void)out_val; (void)out_lo; (void)out_hi; return false;
+#endif
+}
+
+// ---- the gain loop's settled value -----------------------------------------
+// Same three bytes, about register 0x08 instead of 0x06, and the bounds run
+// the other way: a HIGHER byte is LESS gain, so lo is the highest byte still
+// seen to merge two LEDs into one blob and hi the lowest byte seen to cut an
+// LED outright. 0 in either means "never seen"; hi reads back as 256 for it,
+// the way the hwmax loop encodes its own unknown. Its own key so a bad write
+// here can never cost the hwmax loop the value that keeps the gun seeing.
+bool aim_hwgain_store(int val, int lo, int hi)
+{
+    if (val < 0)   val = 0;
+    if (val > 255) val = 255;
+    if (lo  < 0)   lo  = 0;
+    if (lo  > 255) lo  = 255;
+    if (hi  < 0)   hi  = 0;
+    if (hi  > 255) hi  = 0;              // 256 (unknown) and anything above it
+    const uint32_t v = (uint32_t)AIM_GATE_TAG | ((uint32_t)val << 16)
+                     | ((uint32_t)lo << 8) | (uint32_t)hi;
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const bool ok = (nvs_set_u32(h, AIM_NVS_HWG, v) == ESP_OK);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    (void)v; return true;
+#endif
+}
+
+bool aim_hwgain_load(int* out_val, int* out_lo, int* out_hi)
+{
+#if defined(AIM_HAVE_STORE)
+    if (!out_val || !out_lo || !out_hi) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    uint32_t v = 0;
+    const esp_err_t e = nvs_get_u32(h, AIM_NVS_HWG, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    if ((v & 0xFF000000u) != (uint32_t)AIM_GATE_TAG) return false;
+    *out_val = (int)((v >> 16) & 0xFF);
+    *out_lo  = (int)((v >> 8) & 0xFF);
+    const int hi = (int)(v & 0xFF);
+    *out_hi  = hi ? hi : 256;            // 0 is the "never cut an LED" encoding
+    return true;
+#else
+    (void)out_val; (void)out_lo; (void)out_hi; return false;
+#endif
+}
+
+bool aim_hwgain_clear(void)
+{
+#if defined(AIM_HAVE_STORE)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    const esp_err_t e = nvs_erase_key(h, AIM_NVS_HWG);
+    const bool ok = (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND);
+    if (ok) nvs_commit(h);
+    nvs_close(h);
+    return ok;
+#else
+    return true;
 #endif
 }
 

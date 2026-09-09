@@ -63,6 +63,7 @@
 // It is the same flag wiicam_aim.cpp gates its size veto and its lead on, and
 // the deferred quad_reset() is only observable through it.
 #include "quad_resolver.h"
+#include "recoil_fx.h"
 #include "nvs.h"
 
 // ---- fake NVS (same shape as esp_link_test's) ----------------------------
@@ -111,9 +112,10 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 static bool is_u32key(const char* k){
     return k && (!strcmp(k, "gate0") || !strcmp(k, "gate1")
                                      || !strcmp(k, "fit0") || !strcmp(k, "fit1")
-                                     || !strcmp(k, "hwl0")); }
+                                     || !strcmp(k, "hwl0")
+                                     || !strcmp(k, "hwg0")); }   // the gain loop
 struct U32Slot { char key[16]; uint32_t v; bool have; };
-static U32Slot g_u32s[8];       // gate0 gate1 fit0 fit1 hwl0, plus room
+static U32Slot g_u32s[9];       // gate0 gate1 fit0 fit1 hwl0 hwg0, plus room
 static U32Slot* u32_find(const char* k){
     for (auto& s : g_u32s) if (s.have && k && !strcmp(s.key, k)) return &s;
     return nullptr; }
@@ -192,6 +194,9 @@ static void reply_sink_racing(const char* s)
     }
 }
 
+// The host build freezes esp_timer_get_time() at 0, which is also what the
+// firmware's fx_now() returns here, so the recoil engine's clock is 0 too.
+static uint64_t fx_now_test(void) { return 0; }
 static int t_sens = 0;
 static int t_sens_saved = 0;
 // How many times the sensitivity has been RE-APPLIED. The hwmax loop's
@@ -984,21 +989,115 @@ int main()
         wiicam_aim_hw_tick();
         ck(g_reg.empty(), "and is not rewritten every loop");
 
+        // ONE register per tick. Every write stops the solenoid for tens of
+        // ms (fx_glue_shutdown) and takes the camera bus off the poll loop,
+        // so three in one pass is a stutter the user feels and a halved frame
+        // rate; three consecutive ticks, microseconds apart, are neither.
         wiicam_cam_command("cam=hwmin:3");
         g_reg.clear();
         wiicam_aim_hw_tick();
-        ck(g_reg.size() == 2 && g_reg[1].first == 0x1B && g_reg[1].second == 3,
+        ck(g_reg.size() == 1 && g_reg[0].first == 0x1B && g_reg[0].second == 3,
            "hwmin reaches register 0x1B, MINSIZE -- which the stock driver "
-           "has never written on any gun");
+           "has never written on any gun -- and it is the ONLY register this "
+           "tick writes: 0x06 already holds what it should");
 
         // A camera rebuild re-runs the sensitivity preset, which rewrites
-        // 0x06. Ours has to go back or it is silently lost.
+        // 0x06, 0x08 and 0x1A. Everything we hold has to go back or it is
+        // silently lost -- one per tick, and the work is not forgotten.
         wiicam_aim_format_dirty();
         g_reg.clear();
+        int worst_per_tick = 0, n06 = 0, n1b = 0;
+        for (int i = 0; i < 6; ++i) {
+            const size_t before = g_reg.size();
+            wiicam_aim_hw_tick();
+            const int this_tick = (int)(g_reg.size() - before);
+            if (this_tick > worst_per_tick) worst_per_tick = this_tick;
+        }
+        for (size_t i = 0; i < g_reg.size(); ++i) {
+            if (g_reg[i].first == 0x06) ++n06;
+            if (g_reg[i].first == 0x1B) ++n1b;
+        }
+        {
+            char m[240];
+            snprintf(m, sizeof m, "a camera rebuild re-applies every register "
+                     "we hold -- 0x06 x%d, 0x1B x%d in %d writes over six "
+                     "ticks -- because the preset wiped them all", n06, n1b,
+                     (int)g_reg.size());
+            ck(n06 == 1 && n1b == 1 && g_reg.size() == 2, m);
+        }
+        {
+            char m[240];
+            snprintf(m, sizeof m, "...and never more than ONE register in a "
+                     "single tick (worst %d): each write stops the solenoid "
+                     "for tens of ms and takes the camera bus, and two of them "
+                     "back to back is a stutter the user feels", worst_per_tick);
+            ck(worst_per_tick == 1, m);
+        }
+        // ...and then it goes quiet: nothing is rewritten while the sensor
+        // already holds it.
+        g_reg.clear();
+        for (int i = 0; i < 4; ++i) wiicam_aim_hw_tick();
+        ck(g_reg.empty(),
+           "...and stops: a register the sensor already holds is never written "
+           "again, so an idle gun pays no solenoid stutter at all");
+        // A register write must never land mid-shot. The patch's write hook
+        // forces both output pins low before every write -- it has to, because
+        // the core is about to stop for tens of ms and a solenoid left
+        // energised is a burnt solenoid -- so a write that lands during a
+        // pulse cuts the shot in half. That is what a user feels as the
+        // solenoid "lagging" whenever the loops move.
+        wiicam_cam_command("cam=hwmax:70");
+        fx_fire_forced(fx_now_test());
+        g_reg.clear();
+        for (int i = 0; i < 10; ++i) wiicam_aim_hw_tick();
+        ck(fx_busy(fx_now_test()) && g_reg.empty(),
+           "with the recoil engine mid-shot, ten ticks write the sensor NOT "
+           "ONCE: the write waits for the shot, the shot does not pay for the "
+           "write");
+        // The host clock is frozen at 0, so the post-shot quiet spacing the
+        // sequence earned can never expire on its own -- re-init the engine to
+        // stand in for "the shot is over".
+        {
+            fx_params_t fp = *fx_get();
+            fx_cancel();
+            fx_init(&fp, 1);
+        }
+        ck(!fx_busy(fx_now_test()), "the recoil engine is idle again");
         wiicam_aim_hw_tick();
-        ck(g_reg.size() == 2,
-           "a camera rebuild re-applies both: begin() rewrites 0x06 from the "
-           "preset and would otherwise undo ours without a word");
+        ck(g_reg.size() == 1 && g_reg[0].first == 0x06 && g_reg[0].second == 70,
+           "...and the moment the shot is over the write lands: deferred, not "
+           "dropped");
+
+        // The regression this exists for, as a property: ONE loop moving must
+        // not drag the other's register along. Before the shadow, any dirty
+        // mark rewrote every register we held -- an extra fx_glue_shutdown()
+        // and 10 ms of taken camera bus per register, to put back a byte the
+        // sensor already had. On hardware that was a stuttering solenoid and
+        // a halved frame rate, and the gain loop doubled how often it
+        // happened by giving the tick a second register to hold.
+        wiicam_cam_command("cam=hwgain:96");     // both registers now held
+        for (int i = 0; i < 4; ++i) wiicam_aim_hw_tick();
+        g_reg.clear();
+        for (int i = 0; i < 20; ++i) {
+            wiicam_cam_command("cam=hwmax:80");  // MAXSIZE, over and over
+            wiicam_aim_hw_tick();
+        }
+        {
+            int n06 = 0, n08 = 0;
+            for (size_t i = 0; i < g_reg.size(); ++i) {
+                if (g_reg[i].first == 0x06) ++n06;
+                if (g_reg[i].first == 0x08) ++n08;
+            }
+            char m[240];
+            snprintf(m, sizeof m, "twenty passes with MAXSIZE re-sent to the "
+                     "same value write 0x06 once (%d) and GAIN not at all "
+                     "(%d): a byte the sensor already holds is never re-sent, "
+                     "whichever loop asked", n06, n08);
+            ck(n06 == 1 && n08 == 0, m);
+        }
+        wiicam_cam_command("cam=hwgain:-1");
+        wiicam_cam_command("cam=gloop:1");
+        for (int i = 0; i < 4; ++i) wiicam_aim_hw_tick();
 
         wiicam_cam_command("cam=hwmax:999,hwmin:-5");
         g_replies.clear();
@@ -5407,6 +5506,37 @@ int main()
                 if (g_reg[i].first == 0x06) v.push_back(g_reg[i].second);
             return v;
         };
+        // The same for GAIN. The gain loop's whole claim is that it moves this
+        // register; a controller that only moved its own idea of the byte
+        // would satisfy every state assertion and change nothing the LEDs feel.
+        auto regs08 = [&]() {
+            std::vector<int> v;
+            for (size_t i = 0; i < g_reg.size(); ++i)
+                if (g_reg[i].first == 0x08) v.push_back(g_reg[i].second);
+            return v;
+        };
+        struct GainLine {
+            int on, val, lo, hi, dwell, dwmax, clean, merge, cut;
+            int imin, wmed, icut, phold, settled, saved;
+            char state[16];
+        };
+        auto gainq = [&]() {
+            GainLine G;
+            memset(&G, 0, sizeof(G));
+            G.on = G.val = G.lo = G.hi = G.dwell = G.dwmax = -1;
+            G.clean = G.merge = G.cut = G.phold = G.settled = G.saved = -1;
+            g_replies.clear();
+            wiicam_cam_command("camgain?");
+            if (!g_replies.empty())
+                sscanf(g_replies[0].c_str(),
+                       "CAM: gain on=%d state=%15s val=%d lo=%d hi=%d "
+                       "dwell=%d/%d clean=%d merge=%d cut=%d imin=%d wmed=%d "
+                       "icut=%d phold=%d settled=%d saved=%d",
+                       &G.on, G.state, &G.val, &G.lo, &G.hi, &G.dwell, &G.dwmax,
+                       &G.clean, &G.merge, &G.cut, &G.imin, &G.wmed, &G.icut,
+                       &G.phold, &G.settled, &G.saved);
+            return G;
+        };
 
         // ---- the rigs ------------------------------------------------------
         // One frame of whatever is currently loaded into lpx/lpy. The 1-unit
@@ -6937,6 +7067,338 @@ int main()
             ck(!strcmp(L.state, "HOLD") && L.val == 255 && regs06().empty(),
                "...judged by the dwell's majority: LED-sized on two frames in "
                "three, bigger on the third, it still holds");
+        }
+
+        // ==================================================================
+        // THE GAIN LOOP -- register 0x08, against MERGES
+        // ==================================================================
+        // A merge is two LEDs the sensor reported as one blob. MAXSIZE cannot
+        // touch it (the object is labelled before any size gate) and it costs
+        // TWO corners at once. What makes them touch is blob width, which on
+        // this sensor is readout smear proportional to how far the lit pixels
+        // sit over its threshold -- and GAIN sets that. A HIGHER byte is LESS
+        // gain here, so this loop walks the byte UP from the preset, the
+        // mirror image of hwmax.
+        printf("\n  -- the gain loop (register 0x08) --\n");
+        {
+            // A rig 30 px across in 240-space: the midpoint of a pair is then
+            // inside both corners' gates, which is what makes the resolver
+            // call a blob there ambiguous -- the merge fingerprint, without
+            // needing full mode's boxes.
+            auto load_small = [&](void){ rig(lpx, lpy, 512, 384, 128, 128); };
+            // Three blobs: the two top corners, and one where the bottom pair
+            // would be if the sensor had run them together.
+            auto merge_shot = [&](void) {
+                const int bx = lpx[2], by = lpy[2];
+                lpx[2] = 512; lpy[2] = 448;
+                shot(0x7, 0);
+                lpx[2] = bx; lpy[2] = by;
+            };
+            // The frames a write is given to land, as the firmware counts
+            // them (LOOP_SETTLE). Named here so a test never guesses it.
+            const int LOOP_SETTLE_N = 8;
+            auto gain_arm = [&](void) {
+                // begin() reinstates a saved byte, so a block that wants to
+                // start from the preset has to say so -- the same reason the
+                // hwmax blocks call aim_hwloop_clear() in arm().
+                aim_hwgain_clear();
+                arm(2);
+                // The hwmax loop off: one register at a time is the rule, and
+                // with it running its own dwells would vouch for values and
+                // mask the cut verdicts this block needs.
+                wiicam_cam_command("cam=loop:0");
+                load_small();
+                run(40, 0xF);              // lock on the small rig
+                // Hand the register back first: begin() does not clear it (the
+                // same note arm() carries for hwmax), so without this a block
+                // would start from the byte the previous one left in it.
+                wiicam_cam_command("cam=hwgain:-1");
+                wiicam_cam_command("cam=gloop:1");
+                wiicam_aim_hw_tick();
+                g_reg.clear();
+            };
+
+            // (1) A dwell of merges buys ONE step, and it reaches the register.
+            gain_arm();
+            {
+                GainLine G = gainq();
+                ck(G.on == 1 && G.val == 0x0C && G.lo == 0 && G.hi == 256
+                   && !strcmp(G.state, "HOLD"),
+                   "the gain loop starts at the sensitivity preset (0x0C at "
+                   "sens 2) with no bound known in either direction");
+            }
+            for (int i = 0; i < 55; ++i) merge_shot();
+            {
+                GainLine G = gainq();
+                std::vector<int> w = regs08();
+                char m[220];
+                snprintf(m, sizeof m, "a dwell of merged pairs LOWERS the gain: "
+                         "the byte doubles 0x0C -> 0x18 (val %d), the byte that "
+                         "merged is recorded as lo (%d), and 0x08 was written "
+                         "once (%d writes)", G.val, G.lo, (int)w.size());
+                ck(G.val == 0x18 && G.lo == 0x0C && !strcmp(G.state, "LOWER")
+                   && w.size() == 1 && w[0] == 0x18, m);
+            }
+            // (2) ...and one step per dwell, doubling into the unknown: five
+            //     steps cross the whole range 0x0C -> 0xC0.
+            {
+                static const int WANT[3] = { 0x30, 0x60, 0xC0 };
+                bool seq = true;
+                for (int d = 0; d < 3; ++d) {
+                    for (int i = 0; i < 58; ++i) merge_shot();
+                    wiicam_aim_hw_tick();
+                    if (gainq().val != WANT[d]) seq = false;
+                }
+                ck(seq, "...and one step per dwell after that, doubling into "
+                        "the unknown: 0x18 0x30 0x60 0xC0 crosses the whole "
+                        "range in four dwells");
+                for (int i = 0; i < 58; ++i) merge_shot();
+                wiicam_aim_hw_tick();
+                GainLine G = gainq();
+                ck(!strcmp(G.state, "NOSAFE") && G.val == 0x0C && G.lo == 0x60,
+                   "...and a room that still merges at the far end is NOSAFE: "
+                   "back to the preset, because no gain this codebase ships "
+                   "stops these two LEDs touching");
+            }
+            // (3) Clean dwells: nothing moves, and the value settles to flash.
+            gain_arm();
+            for (int i = 0; i < 55; ++i) merge_shot();   // one step down
+            wiicam_aim_hw_tick();
+            g_reg.clear();
+            {
+                const int stepped = gainq().val;
+                for (int d = 0; d < 5; ++d) run(58, 0xF);
+                wiicam_aim_hw_tick();
+                GainLine G = gainq();
+                int fv = 0, flo = 0, fhi = 0;
+                ck(G.val == stepped && regs08().empty() && G.settled == 1,
+                   "four clean dwells at a stepped-down gain move nothing: the "
+                   "register is not written again and the value is settled");
+                ck(G.saved == 1 && aim_hwgain_load(&fv, &flo, &fhi) && fv == stepped,
+                   "...and it is in flash, with the bounds that justify it");
+            }
+            // (4) K3: five cut frames raise the gain back AT ONCE, and the
+            //     byte that cut is recorded as hi.
+            gain_arm();
+            for (int i = 0; i < 55; ++i) merge_shot();   // step down to 0x18
+            wiicam_aim_hw_tick();
+            run(LOOP_SETTLE_N, 0xF);                     // let the write land
+            g_reg.clear();
+            run(5, 0x7);                                 // a corner gone
+            {
+                GainLine G = gainq();
+                std::vector<int> w = regs08();
+                char m[320];
+                snprintf(m, sizeof m, "five frames with a corner gone RAISE the "
+                         "gain immediately (K3): the byte that cut it becomes hi "
+                         "(%d), and the register goes back INTO the known band "
+                         "-- halfway to the byte that merged, not all the way "
+                         "to the preset (val %d, was 24)", G.hi, G.val);
+                ck(!strcmp(G.state, "RAISE") && G.hi == 0x18 && G.lo == 0x0C
+                   && G.val == 0x12 && w.size() == 1 && w[0] == 0x12, m);
+            }
+            // (5) A room that merges at every gain the LEDs survive: the
+            //     search bisects from both ends until the bounds meet, and
+            //     then says so instead of hunting (K5).
+            gain_arm();
+            {
+                int rounds = 0;
+                while (rounds < 12 && strcmp(gainq().state, "NOSAFE")) {
+                    ++rounds;
+                    for (int i = 0; i < 58; ++i) merge_shot();   // merges: less gain
+                    wiicam_aim_hw_tick();
+                    run(LOOP_SETTLE_N, 0xF);
+                    run(5, 0x7);                                 // ...and it cuts
+                    wiicam_aim_hw_tick();
+                    run(LOOP_SETTLE_N, 0xF);
+                }
+                GainLine G = gainq();
+                char m[220];
+                snprintf(m, sizeof m, "a room that merges at every gain the LEDs "
+                         "survive closes the bracket from both ends and lands on "
+                         "NOSAFE at the preset in %d rounds (lo %d, hi %d)",
+                         rounds, G.lo, G.hi);
+                ck(!strcmp(G.state, "NOSAFE") && G.val == 0x0C
+                   && (G.hi - G.lo) <= 2 && rounds < 12, m);
+            }
+            // (6) In basic mode there is no intensity byte, so the curve
+            //     stays empty and the rail never arms off a stale one. (The
+            //     curve and the rail themselves are driven in full mode, in
+            //     the learn suite.)
+            gain_arm();
+            for (int i = 0; i < 58; ++i) run(1, 0xF);
+            ck(gainq().imin == -1,
+               "in basic mode the dwell reports no intensity at all rather "
+               "than the last full frame's leftover byte: the rail has nothing "
+               "to arm against and cannot freeze the search");
+
+            // (7) A hand-set gain switches the loop off and is refused where
+            //     it would kill the sensor.
+            gain_arm();
+            g_replies.clear();
+            wiicam_cam_command("cam=hwgain:4");
+            ck(!g_replies.empty()
+               && g_replies[0].find("refused") != std::string::npos
+               && gainq().on == 1,
+               "'hwgain:4' is refused -- below the sensitivity preset, which is "
+               "as much gain as the level gives -- and the loop keeps running");
+            wiicam_aim_hw_tick();
+            g_reg.clear();
+            wiicam_cam_command("cam=hwgain:64");
+            wiicam_aim_hw_tick();
+            {
+                std::vector<int> w = regs08();
+                ck(gainq().on == 0 && w.size() == 1 && w[0] == 64,
+                   "...while a value at or above the preset is written and "
+                   "switches the loop OFF: a hand-set register is not fought "
+                   "for, the same rule as hwmax");
+            }
+            wiicam_cam_command("cam=gloop:1");
+            ck(gainq().on == 1 && gainq().val == 64,
+               "...and 'gloop:1' resumes the search from whatever the register "
+               "holds");
+
+            // (8) Arbitration: while the hwmax loop is mid-search the gain
+            //     loop holds. Frames taken under a moving MAXSIZE say nothing
+            //     about gain, and two registers moving at once cannot be told
+            //     apart afterwards.
+            arm(2);
+            load_rig();
+            run(40, 0xF);
+            wiicam_cam_command("cam=loop:1");
+            wiicam_cam_command("cam=gloop:1");
+            wiicam_aim_hw_tick();
+            load_stray();                     // strays: the hwmax loop's food
+            lsz[3] = 5;                       // bigger than the LEDs, so cuttable
+            run(58, 0xF);
+            wiicam_aim_hw_tick();
+            {
+                LoopLine L = loopq();
+                ck(!strcmp(L.state, "LOWER"),
+                   "arbitration: a stray dwell puts the hwmax loop in LOWER");
+                const int gval = gainq().val;
+                const int gd0  = gainq().dwell;
+                run(30, 0xF);
+                GainLine G = gainq();
+                ck(G.val == gval && G.dwell == gd0,
+                   "...and while it is mid-search the gain loop does not count "
+                   "a single frame, let alone move its register: one loop owns "
+                   "the sensor at a time");
+            }
+            // (9) camreset puts the gain back and erases its saved value.
+            gain_arm();
+            for (int i = 0; i < 55; ++i) merge_shot();
+            wiicam_aim_hw_tick();
+            aim_hwgain_store(0x30, 0x18, 0x60);
+            wiicam_cam_command("camreset");
+            wiicam_aim_hw_tick();
+            {
+                int fv = 0, flo = 0, fhi = 0;
+                GainLine G = gainq();
+                ck(G.val == 0x0C && G.on == 1 && !aim_hwgain_load(&fv, &flo, &fhi),
+                   "camreset puts the gain back to the preset and erases the "
+                   "saved byte: the one command for a gun that has gone dim "
+                   "must undo the register that can dim it");
+            }
+            // (10) The line a tool reads, verbatim.
+            gain_arm();
+            g_replies.clear();
+            wiicam_cam_command("camgain?");
+            ck(!g_replies.empty() && g_replies[0] ==
+               "CAM: gain on=1 state=HOLD val=12 lo=0 hi=256 dwell=0/50 "
+               "clean=0 merge=0 cut=0 imin=-1 wmed=-1 icut=-1 phold=0 "
+               "settled=0 saved=0\n",
+               "and '~camgain?' is the whole controller in one line, verbatim");
+
+            // (10a) The two registers share one restore. Putting either back
+            //       means re-selecting the sensitivity level, and the preset
+            //       rewrites 0x06, 0x08 and 0x1A together -- so a restore
+            //       asked for by ONE loop wipes the other's byte unless both
+            //       sentinels are resolved before either value is written.
+            gain_arm();
+            wiicam_cam_command("cam=hwmax:100");
+            wiicam_cam_command("cam=hwgain:64");
+            wiicam_aim_hw_tick();
+            g_reg.clear();
+            {
+                const int sets0 = t_sens_sets;
+                wiicam_cam_command("cam=gloop:0");     // GAIN asks for a restore
+                wiicam_aim_hw_tick();
+                std::vector<int> w6 = regs06();
+                char m[240];
+                snprintf(m, sizeof m, "a gain restore really re-selects the "
+                         "sensitivity level (%d -> %d sets) and MAXSIZE is put "
+                         "back after it (0x06 written %d times, last %d): one "
+                         "loop's restore cannot silently wipe the other's byte",
+                         sets0, t_sens_sets, (int)w6.size(),
+                         w6.empty() ? -1 : w6.back());
+                ck(t_sens_sets == sets0 + 1 && !w6.empty() && w6.back() == 100, m);
+            }
+            wiicam_cam_command("cam=hwmax:-1");
+            wiicam_cam_command("cam=hwgain:-1");
+            wiicam_aim_hw_tick();
+
+            // (10b) A saved byte from a MORE sensitive level is clamped up to
+            //       the current preset at boot: at sensitivity 0 the preset
+            //       IS 0xC0, and a 0x30 saved at sensitivity 2 would be more
+            //       gain than this level gives.
+            aim_hwgain_clear();
+            aim_hwgain_store(0x30, 0, 256);
+            t_sens = 0;
+            wiicam_cam_command("cam=hwmax:-1,hwmin:-1");
+            wiicam_aim_begin();
+            wiicam_cam_command("camlearn=on:0");
+            wiicam_cam_command("cam=res:2,dash:0,mirx:1,lead:0,bmin:0,bmax:15,"
+                               "rtol:0,bhmax:0,pxmax:0,armax:0,fmt:0");
+            {
+                GainLine G = gainq();
+                char m[200];
+                snprintf(m, sizeof m, "a byte saved at a more sensitive level "
+                         "is clamped up to this one's preset at boot: 0x30 out "
+                         "of flash reads back as %d at sensitivity 0, where the "
+                         "preset is 192", G.val);
+                ck(G.val == 0xC0, m);
+            }
+            t_sens = 2;
+            aim_hwgain_clear();
+
+            // (11) A byte out of flash is reinstated at boot and put back on
+            //      probation: a gain that cuts the LEDs never lets the
+            //      resolver lock, so a whole dwell without one is the evidence
+            //      that it is wrong for this rig (K4).
+            aim_hwgain_clear();
+            aim_hwgain_store(0x60, 0x30, 0xC0);
+            arm(2);
+            wiicam_cam_command("cam=loop:0");
+            wiicam_aim_hw_tick();
+            {
+                GainLine G = gainq();
+                std::vector<int> w = regs08();
+                ck(G.val == 0x60 && G.saved == 1 && !w.empty() && w.back() == 0x60,
+                   "a saved gain byte is reinstated at boot and written to the "
+                   "sensor: what the last session measured about this rig is "
+                   "not thrown away on a power cycle");
+            }
+            // A whole dwell in which the resolver never locks. Four blobs in
+            // a shape no rectangle projects to, not an empty report: identical
+            // empty frames are ONE judged frame (the duplicate cache), and a
+            // dwell needs fifty.
+            load_bad();
+            g_reg.clear();
+            run(60, 0xF);
+            {
+                GainLine G = gainq();
+                std::vector<int> w = regs08();
+                ck(G.val == 0x0C && !w.empty() && w.back() == 0x0C,
+                   "...but nothing has vouched for it: a dwell in which the "
+                   "resolver never locked once puts it back to the preset, so "
+                   "a byte measured in another room cannot leave the gun dim");
+            }
+            aim_hwgain_clear();
+            wiicam_cam_command("cam=loop:1");
+            wiicam_cam_command("cam=gloop:1");
+            rig(px, py, 512, 384, 512, 384);
+            rig(lpx, lpy, 512, 384, 512, 384);
         }
 
         // camreset arms the capture, as boot does (G3): the loop's margin is

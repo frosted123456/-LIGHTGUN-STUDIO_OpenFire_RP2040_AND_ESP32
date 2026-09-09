@@ -24,14 +24,21 @@ they are the only controls that act before the four slots are handed out.
 | `0x01` `0x02` | — | Unknown. Zero in every known preset. | `0x00` | — | — | Undocumented |
 | `0x03` `0x04` | — | Unknown, but *pinned*: the Wii writes `0x71` and `0x01` on all five levels; the community presets leave both at zero and work. | `0x71` / `0x01` | not written | not written | Undocumented |
 | `0x06` | **MAXSIZE** | Maximum blob size. Blobs above it are not reported. Whether an oversized blob is discarded, clamped or split is stated nowhere. **`0` blinds the sensor** (no blobs at all) — the loop never writes below 1. | `0x64`–`0xC8` | `0x90` / `0x90` / `0xFF` | the auto light limit loop bisects it between 1 and the preset; `~cam=hwmax:` by hand | Named only; blinding at 0 is Confirmed |
-| `0x08` | **GAIN** | Sensor gain. **Smaller value = more gain.** WiiBrew calls the same byte "intensity sensitivity, increasing values reducing the sensitivity". | `0xFE` → `0x20` | `0xC0` / `0x41` / `0x0C` | not written (the preset owns it) | Confirmed |
-| `0x1A` | **GAINLIMIT** | Gain limit; must be less than GAIN or the camera does not function. Holds for all eight known presets; equals GAIN − 1 in all five of Nintendo's. | GAIN − 1 | `0x40` / `0x40` / `0x00` | not written | Confirmed |
+| `0x08` | **GAIN** | Sensor gain. **Smaller value = more gain.** WiiBrew calls the same byte "intensity sensitivity, increasing values reducing the sensitivity". | `0xFE` → `0x20` | `0xC0` / `0x41` / `0x0C` | the gain loop walks it UP from the preset to `0xC0` when LEDs merge; `~cam=hwgain:` by hand | Confirmed |
+| `0x1A` | **GAINLIMIT** | Gain limit; must be less than GAIN or the camera does not function. Holds for all eight known presets; equals GAIN − 1 in all five of Nintendo's. | GAIN − 1 | `0x40` / `0x40` / `0x00` | not written; the gain loop refuses any `0x08` at or below it | Confirmed |
 | `0x1B` | **MINSIZE** | Minimum blob size. Range corroborated by Nintendo's own presets; rejection direction inferred from the name. Never written by the stock driver, so it sits at an unknown default. | `3`–`5` | not written | `~cam=hwmin:` by hand only; never saved | Named only |
 | `0x30` | Enable | `0x08` is the only value at which the camera outputs data — at anything else it returns all `0xFF`. The Wii writes `0x01` before changing mode or sensitivity, then `0x08`. | `0x01` then `0x08` | same | same (driver) | Confirmed |
 | `0x33` | Mode | Output format: `1` basic (10 B), `3` extended (12 B), `5` full (36 B). | | `1` / `3` | `1` / `3` / **`0x55`** for full | Confirmed |
 | `0x33` = `0x55` | — | Also selects full mode on our sensor; what the high nibble does is unknown. `0x05` works too (`~cam=fullreg:5`). We ship `0x55` because that is what was confirmed first; both are accepted. | | — | `0x55` default, not saved | Confirmed on our sensor |
 | `0x36` | Data (with header) | Reading from `0x36` yields 37 bytes in full mode: one junk/header byte, then the 36 data bytes. The driver reads from here. | | | | Confirmed |
 | `0x37` | Data | Object data proper, 36 bytes. | 36 bytes | | | Confirmed |
+
+Register `0x08` is now driven: sensitivity 2 ships GAIN `0x0C` with GAINLIMIT `0x00`, the fully
+open corner, and in sun that is where LED blobs bloom horizontally until neighbouring pairs
+touch. The gain loop walks the byte up on merge evidence and back down on a cut, bracketed by
+this rig's own measurements. **One consequence to remember when reading captures:** re-selecting
+the sensitivity level is the only "restore" the driver has and it rewrites `0x06`, `0x08` and
+`0x1A` together, so a restore asked for by either loop puts the other's byte back too.
 
 The Wii's five levels write a whole block (`0x00`–`0x08`, then `0x1A`–`0x1B`) at
 once; the OpenFIRE driver writes only `0x06`, `0x08`, `0x1A`. That is why "Max"

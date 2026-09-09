@@ -584,7 +584,17 @@ class BlobLog:
             # three. loopuc: this dwell's stray frames where the stray was no
             # bigger than the LEDs in the sensor's size byte (MAXSIZE cannot
             # reach it; the loop holds). On the end.
-            "bmerge", "bwide", "loopuc")
+            "bmerge", "bwide", "loopuc",
+            # The gain loop (register 0x08): where it is, its state, the
+            # bracket it is searching, and the two things it measures -- the
+            # dimmest corner's intensity and the median LED width at that
+            # gain. On the end, like everything since the first file.
+            "gval", "gstate", "glo", "ghi", "gimin", "gwmed",
+            # Register writes since boot, and refusals. Each one stops the
+            # solenoid for tens of ms and takes the camera bus off the poll
+            # loop, so this is the column that says whether a stutter the user
+            # felt was the gun writing registers. On the end.
+            "bregw", "bregf")
 
     # Pushed to the medium this often, on top of the per-row flush: a
     # flush() only hands the row to the kernel, and a Pi that loses power or
@@ -671,6 +681,9 @@ class BlobLog:
         vals.append(last.get("bmerge", ""))
         vals.append(last.get("bwide", ""))
         vals.append(last.get("loopuc", ""))
+        for k in ("gval", "gstate", "glo", "ghi", "gimin", "gwmed",
+                  "bregw", "bregf"):
+            vals.append(last.get(k, ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
         # an empty file, because the writes are still in the page cache.
@@ -1218,6 +1231,11 @@ class Link:
         # not all ints, and half a dict would misread as a gun that sent less.
         # Empty until the gun answers (an older firmware never does).
         self.loop = {}
+        # ...and the gain loop's, the same way. Its own dict: the two answers
+        # share field names (val, lo, hi, state) about two different
+        # registers, and merging them would read one loop's bracket as the
+        # other's.
+        self.gain = {}
         # Writes that failed. A serial write throwing is how a gun that
         # rebooted or re-enumerated announces itself, and swallowing it made a
         # dead link look exactly like a screen whose keys had stopped working.
@@ -1484,6 +1502,47 @@ class Link:
                 self.last["hws"] = d["state"]
             self.last["loop_t"] = self.clock()   # BlobLog's 'loopage'
 
+    def feed_gain(self, line):
+        """One '~camgain?' answer into self.gain, whole or not at all.
+
+        'CAM: gain on=1 state=HOLD val=24 lo=12 hi=256 dwell=9/50 clean=8
+        merge=1 cut=0 imin=60 wmed=4 icut=-1 phold=0 settled=0 saved=0'.
+        Same rules as feed_loop: a fresh dict swapped in, nothing raises, and
+        'on' is what says this was an answer at all rather than another line
+        that happens to start the same way."""
+        d = {}
+        for tok in line[len("CAM: gain "):].split():
+            k, sep, v = tok.partition("=")
+            if not sep:
+                continue
+            if k == "state":
+                d[k] = v
+                continue
+            if k == "dwell":
+                a, _s, b = v.partition("/")
+                try:
+                    d["dwell"], d["dwelln"] = int(a), int(b)
+                except ValueError:
+                    pass
+                continue
+            try:
+                d[k] = int(v)
+            except ValueError:
+                pass
+        if "on" in d:
+            self.gain = d
+            # Mirrored into last[] for BlobLog, the way the loop's fields are:
+            # 'cam?' carries gval/glo/ghi too, but it is only asked on connect
+            # and on "Read from gun", so without this the CSV's gain columns
+            # would freeze for the length of a capture.
+            for src, dst in (("val", "gval"), ("lo", "glo"), ("hi", "ghi"),
+                             ("imin", "gimin"), ("wmed", "gwmed"),
+                             ("icut", "gicut"), ("phold", "gphold")):
+                if src in d:
+                    self.last[dst] = d[src]
+            if d.get("state") in LOOP_STATES:
+                self.last["gstate"] = d["state"]
+
     def pump(self):
         """drain the stream; keep the last ~2 s of quads; write the next queued line"""
         if not self.src: return
@@ -1526,6 +1585,9 @@ class Link:
             # would push everything else out of a six-line log.
             if line.startswith("CAM: loop "):
                 self.feed_loop(line)
+                continue
+            if line.startswith("CAM: gain "):
+                self.feed_gain(line)
                 continue
             # Two lines name the format the GUN is really in, and both name
             # it with a colon -- so the key/value sweep below is blind to
@@ -1644,13 +1706,21 @@ class Link:
                                                  # slow host.
                                                  "bpolls", "benv",
                                                  # bmerge: merged-pair refusals; bwide: corners the
-                                                 # LED class left unlearned. After benv.
-                                                 "bmerge", "bwide",
+                                                 # LED class left unlearned; bsplit: frames whose
+                                                 # merged pair was split back into two corners.
+                                                 "bmerge", "bwide", "bsplit",
+                                                 # Register writes and refusals. Each write stops the
+                                                 # solenoid for tens of ms and takes the camera bus,
+                                                 # so these say whether a stutter was the gun writing.
+                                                 "bregw", "bregf",
                                                  # The loop's four off 'cam?': on, held limit, bracket.
                                                  # hwmax above is the register (-1 = back on the preset);
                                                  # hwhi 256 = no ceiling known yet, shown as '?'.
                                                  "loop", "hwv", "hwlo",
-                                                 "hwhi"):
+                                                 "hwhi",
+                                                 # ...and the gain loop's four.
+                                                 "gloop", "gval", "glo",
+                                                 "ghi"):
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -3854,6 +3924,11 @@ def main():
             if now_m - loop_state["t"] >= 1.0:
                 loop_state["t"] = now_m
                 link.send("~camloop?", poll=True)
+                # ...and the gain loop's, on the same tick and the same wire.
+                # It moves at the same cadence and a CSV row that pairs this
+                # frame with one loop's state and not the other's is worse
+                # than one that pairs it with both, a second old.
+                link.send("~camgain?", poll=True)
             # When the gun last sent a NEW frame, which is what the gate
             # warnings are allowed to speak for. Stamped on the frame counter
             # MOVING rather than on a reply arriving: a gun whose camera has

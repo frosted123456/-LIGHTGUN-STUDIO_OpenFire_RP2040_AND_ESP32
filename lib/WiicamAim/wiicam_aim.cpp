@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 // Per-axis normalisation from 1024x768 to 240x176. The small aspect
 // difference is a fixed linear map the calibration absorbs.
@@ -343,6 +344,25 @@ static uint32_t s_bsrej = 0;   // blobs the shape gate wanted to reject
 // the other.
 static volatile int16_t s_hwmax = WIICAM_HW_LEAVE;   // register 0x06
 static volatile int16_t s_hwmin = WIICAM_HW_LEAVE;   // register 0x1B
+static volatile int16_t s_hwgain = WIICAM_HW_LEAVE;  // register 0x08
+// What the SENSOR is believed to hold, as opposed to what we want it to hold.
+// Every write costs a fx_glue_shutdown() -- which blocks the core the solenoid
+// runs on for tens of ms -- plus the camera bus taken from the poll loop and
+// the driver's 10 ms settling delay. The three values above are never cleared
+// once set, so before this shadow existed ANY s_hw_dirty mark rewrote all of
+// them, at that price, to put back bytes the sensor already had. Seen on
+// hardware as a stuttering solenoid and the frame rate halving. -1 = unknown,
+// which is what a preset rewrite leaves behind and what forces a real write.
+#define HWSH_UNKNOWN (-1)
+static int16_t s_hwmax_at  = HWSH_UNKNOWN;
+static int16_t s_hwmin_at  = HWSH_UNKNOWN;
+static int16_t s_hwgain_at = HWSH_UNKNOWN;
+static void hw_shadow_lost(void)      // the preset has rewritten the block
+{
+    s_hwmax_at = s_hwmin_at = s_hwgain_at = HWSH_UNKNOWN;
+}
+static uint32_t s_bregw = 0;   // register writes that reached the sensor
+static uint32_t s_bregf = 0;   // ...and ones it refused
 // Set whenever the values must be (re)written to the sensor. Writing them
 // costs tens of milliseconds, so it happens on the serial-pump core rather
 // than in the camera poll -- and it has to happen again after any CameraSet,
@@ -423,6 +443,11 @@ static int loop_preset(void)
     return (lv >= 2) ? LOOP_PRESET_MAX : LOOP_PRESET_LOW;
 }
 
+// Two loops, one sensor: whichever is mid-search owns it, and a cut backs off
+// whichever moved last. Declared here because loop_write() sets it.
+enum { MOVER_NONE = 0, MOVER_MAX, MOVER_GAIN };
+static int  s_last_mover = MOVER_NONE;
+
 static void loop_new_dwell(void)
 {
     s_loop_dwell = 0;
@@ -457,6 +482,7 @@ static void loop_write(int v)
     s_loop_settle = LOOP_SETTLE;
     s_loop_saved = false;                // a new value is not the saved one
     s_loop_vouched = false;
+    s_last_mover = MOVER_MAX;
 }
 
 // lo cuts an LED, hi admits a stray, nothing in between: a room problem, not
@@ -650,6 +676,275 @@ static void loop_blind(uint64_t now_us)
 static const char* loop_state_name(void)
 {
     switch (s_loop_state) {
+        case LOOP_LOWER:  return "LOWER";
+        case LOOP_RAISE:  return "RAISE";
+        case LOOP_NOSAFE: return "NOSAFE";
+        case LOOP_OFF:    return "OFF";
+        default:          return "HOLD";
+    }
+}
+
+// ---- the gain loop --------------------------------------------------------
+// The same controller on register 0x08, against a different failure. MAXSIZE
+// cannot touch a MERGE: the sensor labels two LEDs that touch as one object
+// before any size gate runs, and a merged pair costs TWO corners at once,
+// which is the worst thing that happens to this pipeline. What makes them
+// touch is blob width, and width here is readout smear along a row --
+// proportional to how far the lit pixels sit over the sensor's threshold.
+// GAIN sets that distance directly.
+//
+// Direction is the trap: on this part a HIGHER byte is LESS gain (WiiBrew:
+// "smaller values = higher gain", and Nintendo's own presets walk 0xFE down
+// to 0x20 as they get more sensitive). So the loop RAISES the byte to lower
+// the gain, starting from the sensitivity preset, which is therefore the
+// floor of the search and not its ceiling -- the mirror image of hwmax.
+//
+//   s_gl_lo   highest byte still seen to MERGE   (too much gain)   0 = none
+//   s_gl_hi   lowest byte seen to CUT an LED     (too little gain) 256 = none
+//   safe band: lo < val < hi, and the search bisects into it.
+//
+// The rails are the same two the hwmax loop uses -- a cut raises immediately
+// (K3), lo and hi meeting is NOSAFE (K5) -- plus one this loop needs and that
+// one did not: gain has a floor below which the LEDs stop being seen at all,
+// and the intensity byte says how close we are to it. Every settled dwell
+// records (byte, dimmest corner's intensity); with two points the loop can
+// PREDICT the intensity at the byte it is about to try, and refuse a step
+// that would take the dimmest LED below the intensity at which a cut has
+// actually happened on this rig. It stops before blinding the gun instead of
+// learning where the edge is by falling off it.
+#define GL_CEIL         0xC0  // OpenFIRE's own sensitivity-0 gain: the least
+                              // gain this codebase already ships to users, and
+                              // the far end of the search. Not a tuning value.
+#define GL_HI_UNKNOWN   256   // no byte is known to cut an LED yet
+#define GL_MERGE_N     (LOOP_DWELL / 4)  // merge frames in a dwell that buy a step
+#define GL_CURVE_N      8     // settled dwells kept for the intensity curve
+
+static volatile bool s_gl_on = true;
+static volatile bool s_gl_store_req = false;   // settled: store hwg0 from the pump core
+static volatile bool s_gl_saved = false;
+static int  s_gl_state = LOOP_HOLD;
+static int  s_gl_val   = 0;            // what we last asked 0x08 for; 0 = preset
+static int  s_gl_lo    = 0;            // highest byte seen to merge
+static int  s_gl_hi    = GL_HI_UNKNOWN;// lowest byte seen to cut an LED
+static int  s_gl_dwell = 0, s_gl_settle = 0;
+static int  s_gl_nclean = 0, s_gl_nmerge = 0, s_gl_ncut = 0;
+static int  s_gl_cut_run = 0, s_gl_hold_run = 0, s_gl_dwell_nlock = 0;
+static bool s_gl_from_flash = false;
+static int  s_gl_imin = -1;            // dimmest matched corner this dwell
+static int  s_gl_wmed = -1;            // median matched-corner width this dwell
+static int  s_gl_imin_last = -1;       // ...and what the last finished dwell saw
+static int  s_gl_wmed_last = -1;
+static int  s_gl_icut = -1;            // intensity on the dwell that last cut
+static uint32_t s_gl_pred_hold = 0;    // steps the prediction refused
+static uint32_t s_gl_prev_ambig = 0;   // quad_ambig_total() at the last frame
+static int  s_gl_cn = 0;               // curve points held
+static int  s_gl_cbyte[GL_CURVE_N], s_gl_cimin[GL_CURVE_N];
+// The byte the sensitivity preset puts in 0x08. The loop never goes below it:
+// more gain than the preset is not ours to give.
+static int gl_preset(void)
+{
+    const int lv = s_sens_get ? s_sens_get() : 2;
+    return (lv >= 2) ? 0x0C : ((lv == 1) ? 0x41 : 0xC0);
+}
+// GAINLIMIT (0x1A) must stay below GAIN or the camera stops working. The
+// preset satisfies it and the loop only ever raises the byte, so this is a
+// guard rather than a rule -- but it is the one mistake that kills the sensor
+// outright, so it is checked where the write happens.
+static int gl_limit(void)
+{
+    const int lv = s_sens_get ? s_sens_get() : 2;
+    return (lv >= 2) ? 0x00 : 0x40;
+}
+
+static void gl_new_dwell(void)
+{
+    s_gl_dwell = 0;
+    s_gl_nclean = 0; s_gl_nmerge = 0; s_gl_ncut = 0;
+    s_gl_cut_run = 0; s_gl_dwell_nlock = 0;
+    s_gl_imin = -1; s_gl_wmed = -1;
+}
+
+static void gl_write(int v)
+{
+    const int preset = gl_preset();
+    if (v < preset) v = preset;          // never more gain than the preset
+    if (v > GL_CEIL) v = GL_CEIL;
+    if (v <= gl_limit()) v = gl_limit() + 1;
+    s_gl_val = v;
+    s_hwgain = (int16_t)v;
+    s_hw_dirty = true;
+    s_gl_settle = LOOP_SETTLE;
+    s_gl_saved = false;
+    s_last_mover = MOVER_GAIN;
+}
+
+static void gl_reset(int val)
+{
+    s_gl_lo = 0;
+    s_gl_hi = GL_HI_UNKNOWN;
+    s_gl_val = val;
+    s_gl_state = LOOP_HOLD;
+    s_gl_hold_run = 0;
+    s_gl_saved = false;
+    s_gl_from_flash = false;
+    s_gl_settle = 0;
+    s_gl_icut = -1;
+    s_gl_imin_last = -1; s_gl_wmed_last = -1;
+    s_gl_cn = 0;
+    gl_new_dwell();
+}
+
+// lo and hi have met: this room merges at every gain the LEDs survive. Back to
+// the preset, which is the one value the rig was calibrated at (K5).
+static void gl_nosafe(void)
+{
+    gl_write(gl_preset());
+    s_gl_state = LOOP_NOSAFE;
+    s_gl_hold_run = 0;
+    gl_new_dwell();
+}
+
+// A cut: this byte is too little gain for this rig at this distance. Record it
+// and go back toward the preset, bisecting into the band above the merge bound.
+static void gl_raise(void)
+{
+    const int preset = gl_preset();
+    if (s_gl_val <= preset) {            // already at full preset gain: not ours
+        gl_new_dwell();
+        return;
+    }
+    s_gl_hi = s_gl_val;
+    s_gl_icut = s_gl_imin;               // the intensity at which it happened
+    if (s_gl_lo + 1 >= s_gl_hi) { gl_nosafe(); return; }
+    int nv = (s_gl_lo > 0) ? (s_gl_lo + s_gl_val) / 2 : preset;
+    if (nv >= s_gl_hi) nv = s_gl_hi - 1;
+    gl_write(nv);
+    s_gl_state = LOOP_RAISE;
+    s_gl_hold_run = 0;
+    gl_new_dwell();
+}
+
+// The learning: intensity against gain byte, from this rig's own settled
+// dwells. Returns the predicted dimmest-corner intensity at `byte`, or -1 with
+// fewer than two points to fit. Linear: over the range one loop walks, the
+// sensor's response is monotone and a straight line through the two nearest
+// measurements is enough to say "this step goes under the cut level".
+static int gl_predict(int byte)
+{
+    if (s_gl_cn < 2) return -1;
+    int a = 0, b = 1;                    // the two points nearest `byte`
+    for (int i = 0; i < s_gl_cn; ++i) {
+        if (abs(s_gl_cbyte[i] - byte) < abs(s_gl_cbyte[a] - byte)) { b = a; a = i; }
+        else if (i != a && abs(s_gl_cbyte[i] - byte) < abs(s_gl_cbyte[b] - byte)) b = i;
+    }
+    const int dx = s_gl_cbyte[b] - s_gl_cbyte[a];
+    if (!dx) return s_gl_cimin[a];
+    const int dy = s_gl_cimin[b] - s_gl_cimin[a];
+    return s_gl_cimin[a] + (dy * (byte - s_gl_cbyte[a])) / dx;
+}
+
+static void gl_curve_note(void)
+{
+    if (s_gl_imin >= 0) s_gl_imin_last = s_gl_imin;
+    if (s_gl_wmed >= 0) s_gl_wmed_last = s_gl_wmed;
+    if (s_gl_imin < 0) return;
+    for (int i = 0; i < s_gl_cn; ++i)    // one point per byte, the newest wins
+        if (s_gl_cbyte[i] == s_gl_val) { s_gl_cimin[i] = s_gl_imin; return; }
+    if (s_gl_cn < GL_CURVE_N) { s_gl_cbyte[s_gl_cn] = s_gl_val; s_gl_cimin[s_gl_cn] = s_gl_imin; ++s_gl_cn; return; }
+    for (int i = 1; i < GL_CURVE_N; ++i) { s_gl_cbyte[i-1] = s_gl_cbyte[i]; s_gl_cimin[i-1] = s_gl_cimin[i]; }
+    s_gl_cbyte[GL_CURVE_N-1] = s_gl_val; s_gl_cimin[GL_CURVE_N-1] = s_gl_imin;
+}
+
+static void gl_dwell_end(void)
+{
+    if (s_gl_state == LOOP_NOSAFE) {
+        if (s_gl_nclean >= LOOP_DWELL / 2) {
+            s_gl_lo = 0; s_gl_hi = GL_HI_UNKNOWN;
+            s_gl_state = LOOP_HOLD;
+            s_gl_hold_run = 0;
+            s_gl_saved = false;
+        }
+        gl_new_dwell();
+        return;
+    }
+    // K4: a byte out of flash that never let the resolver lock for a whole
+    // dwell is a byte that cut the LEDs on this rig. Back to the preset.
+    if (s_gl_from_flash && s_gl_dwell_nlock == 0) {
+        s_gl_from_flash = false;
+        if (s_gl_val > gl_preset()) { gl_raise(); return; }
+        gl_new_dwell();
+        return;
+    }
+    gl_curve_note();
+    // Merges, and no cut: less gain. One step per dwell, bisecting toward the
+    // byte that cut if one is known and doubling into the unknown if not --
+    // 0x0C, 0x18, 0x30, 0x60, 0xC0 is five steps across the whole range.
+    if (s_gl_ncut == 0 && s_gl_nmerge >= GL_MERGE_N) {
+        int nv = (s_gl_hi < GL_HI_UNKNOWN) ? (s_gl_val + s_gl_hi) / 2
+                                           : (s_gl_val * 2);
+        if (nv > GL_CEIL) nv = GL_CEIL;
+        if (nv <= s_gl_val) { gl_nosafe(); return; }
+        // The prediction rail. A cut has been measured on this rig, so the
+        // intensity that goes with it is known; a step whose predicted
+        // dimmest corner falls to it would blind the gun for a dwell to
+        // learn what the curve already says. Hold instead, and count it.
+        const int pred = gl_predict(nv);
+        if (s_gl_icut >= 0 && pred >= 0 && pred <= s_gl_icut) {
+            ++s_gl_pred_hold;
+            s_gl_state = LOOP_HOLD;
+            gl_new_dwell();
+            return;
+        }
+        s_gl_lo = s_gl_val;
+        gl_write(nv);
+        s_gl_state = LOOP_LOWER;
+        s_gl_hold_run = 0;
+        gl_new_dwell();
+        return;
+    }
+    s_gl_state = LOOP_HOLD;
+    if (s_gl_nclean >= LOOP_DWELL / 2) {
+        if (s_gl_hold_run < LOOP_SETTLED) ++s_gl_hold_run;
+    }
+    if (s_gl_hold_run >= LOOP_SETTLED && !s_gl_saved && s_gl_val > gl_preset())
+        s_gl_store_req = true;
+    gl_new_dwell();
+}
+
+// One judged frame. `merged` is this frame's merge fingerprint, `imin` the
+// dimmest matched corner's intensity byte and `wmed` the median matched width
+// (-1 for either when the frame cannot measure it).
+static void gl_tick(int verdict, bool locked, bool merged, int imin, int wmed)
+{
+    if (!s_gl_on) return;
+    if (s_hw_dirty) return;              // a write has not landed yet
+    if (s_gl_settle > 0) { --s_gl_settle; return; }
+    // Arbitration: while the hwmax loop is mid-search the sensor is its, and
+    // frames taken under a moving MAXSIZE say nothing about gain.
+    if (s_loop_on && (s_loop_state == LOOP_LOWER || s_loop_state == LOOP_RAISE))
+        return;
+    if (locked) ++s_gl_dwell_nlock;
+    if (imin >= 0 && (s_gl_imin < 0 || imin < s_gl_imin)) s_gl_imin = imin;
+    if (wmed >= 0) s_gl_wmed = wmed;
+    if      (verdict == V_CUT) ++s_gl_ncut;
+    else if (merged)           ++s_gl_nmerge;
+    else if (verdict == V_CLEAN) ++s_gl_nclean;
+    ++s_gl_dwell;
+    if (verdict == V_CUT) ++s_gl_cut_run;
+    else                  s_gl_cut_run = 0;
+    // K3, and the arbitration's other half: a cut backs off whichever loop
+    // moved last. If that was MAXSIZE, this one holds and lets it raise.
+    if (s_gl_state != LOOP_NOSAFE && s_gl_cut_run >= LOOP_RAISE_N
+        && s_last_mover != MOVER_MAX) {
+        gl_raise();
+        return;
+    }
+    if (s_gl_dwell >= LOOP_DWELL) gl_dwell_end();
+}
+
+static const char* gl_state_name(void)
+{
+    switch (s_gl_state) {
         case LOOP_LOWER:  return "LOWER";
         case LOOP_RAISE:  return "RAISE";
         case LOOP_NOSAFE: return "NOSAFE";
@@ -860,6 +1155,7 @@ void wiicam_aim_format_dirty(void)
     s_ext_state = (((cur >> 3) + 1) << 3) | (cur & 7);
     // A rebuilt camera has been re-initialised from the sensitivity preset,
     // which writes register 0x06 -- so our MAXSIZE is gone and has to go back.
+    hw_shadow_lost();
     s_hw_dirty = true;
 }
 
@@ -871,10 +1167,28 @@ void wiicam_aim_hw_tick(void)
     // The loop's settled value goes to flash from here, not from the camera
     // poll: a flash write parks both cores, so the recoil outputs are dropped
     // first the way camsave does it.
+    // Nothing that blocks this core runs while the recoil engine is playing.
+    // The write hook forces both output pins low before every register write
+    // (it has to: the core is about to stop for tens of ms and a solenoid
+    // left energised is a burnt solenoid), so a write that lands mid-pulse
+    // cuts the shot in half -- which is what a user feels as the solenoid
+    // "lagging" when the loops move. A flash write is worse still: it parks
+    // BOTH cores. Both loops are patient by construction -- one step per
+    // quarter-second dwell -- so the write waits for the shot to finish
+    // rather than the shot paying for the write.
+    // Both the dirty mark and the store requests persist, so leaving is all
+    // that deferring takes; the next tick is microseconds away.
+    if (fx_busy(fx_now())) return;
     if (s_loop_store_req) {
         s_loop_store_req = false;
         if (s_preflash) s_preflash();
         s_loop_saved = aim_hwloop_store(s_loop_val, s_loop_lo, s_loop_hi);
+        if (s_postflash) s_postflash();
+    }
+    if (s_gl_store_req) {
+        s_gl_store_req = false;
+        if (s_preflash) s_preflash();
+        s_gl_saved = aim_hwgain_store(s_gl_val, s_gl_lo, s_gl_hi);
         if (s_postflash) s_postflash();
     }
     if (!s_hw_dirty || !s_blobreg) return;
@@ -893,11 +1207,12 @@ void wiicam_aim_hw_tick(void)
     // survives instead of being wiped by our own success.
     s_hw_dirty = false;
     int done = 1;
-    if (s_hwmax == WIICAM_HW_RESTORE) {
-        // Back to whatever the sensitivity preset writes into 0x06. That IS
-        // the restore: the preset is the only value we know is sane for this
-        // sensor, and re-selecting the current level rewrites it.
-        //
+    // Re-selecting the sensitivity level is the ONLY restore we have, and it
+    // rewrites the whole preset -- 0x06, 0x08 and 0x1A together. So it runs
+    // once, first, for whichever register asked for it, and the values are
+    // written after it: the other loop's byte would otherwise be wiped by a
+    // restore it never asked for, silently, with cam? still reporting it.
+    if (s_hwmax == WIICAM_HW_RESTORE || s_hwgain == WIICAM_HW_RESTORE) {
         // The sentinel is consumed only if that actually happened. Clearing it
         // unconditionally left MAXSIZE at our value with no way to notice --
         // the reset reported success and changed nothing.
@@ -906,25 +1221,54 @@ void wiicam_aim_hw_tick(void)
             if (lv < 0) lv = 0;
             if (lv > 2) lv = 2;          // SetIrSensitivity refuses anything else
             s_sens_set(lv);
-            s_hwmax = WIICAM_HW_LEAVE;
+            // The preset just rewrote 0x06, 0x08 and 0x1A: nothing we thought
+            // the sensor held is true any more.
+            hw_shadow_lost();
+            if (s_hwmax  == WIICAM_HW_RESTORE) s_hwmax  = WIICAM_HW_LEAVE;
+            if (s_hwgain == WIICAM_HW_RESTORE) s_hwgain = WIICAM_HW_LEAVE;
         } else {
             done = 0;                    // no way to restore it yet; try later
         }
-    } else if (s_hwmax != WIICAM_HW_LEAVE) {
-        if (!s_blobreg(0x06, s_hwmax)) done = 0;
     }
-    if (s_hwmin == WIICAM_HW_RESTORE) {
+    // ONE register per tick, and only one that actually needs it. Each write
+    // stops the solenoid and the camera for tens of ms; three in a row is a
+    // visible stutter and a halved frame rate, for no gain over doing them on
+    // three consecutive ticks a few hundred microseconds apart. Whatever is
+    // left keeps s_hw_dirty set and goes on the next pass.
+    // 'more' is work DEFERRED to the next tick; 'done' is a write that
+    // FAILED. Only the second arms the one-second dead-sensor backoff --
+    // conflating them made the second register wait a full second behind the
+    // first, which is the opposite of what one-write-per-tick is for.
+    int more = 0;
+    if (s_hwgain >= 0 && s_hwgain <= gl_limit())
+        s_hwgain = (int16_t)(gl_limit() + 1);   // never at or below GAINLIMIT
+    const bool need_max  = (s_hwmax  >= 0 && s_hwmax  != s_hwmax_at);
+    const bool need_gain = (s_hwgain >= 0 && s_hwgain != s_hwgain_at);
+    const bool need_min  = (s_hwmin  >= 0 && s_hwmin  != s_hwmin_at);
+    if (need_max) {
+        if (s_blobreg(0x06, s_hwmax)) { s_hwmax_at = s_hwmax; ++s_bregw; }
+        else                          { done = 0;             ++s_bregf; }
+        more = (int)need_gain + (int)need_min;
+    // GAIN. It is written only when it changed, for the same reason: putting
+    // a byte the sensor already holds back into it costs the solenoid.
+    } else if (need_gain) {
+        if (s_blobreg(0x08, s_hwgain)) { s_hwgain_at = s_hwgain; ++s_bregw; }
+        else                           { done = 0;               ++s_bregf; }
+        more = (int)need_min;
+    }
+    else if (s_hwmin == WIICAM_HW_RESTORE) {
         // 0 is the direction that cannot cost an LED: accept the smallest
         // blobs. The power-on default is unknown, so there is nothing else to
         // go back to.
-        if (s_blobreg(0x1B, 0)) s_hwmin = WIICAM_HW_LEAVE;
-        else done = 0;
-    } else if (s_hwmin != WIICAM_HW_LEAVE) {
-        if (!s_blobreg(0x1B, s_hwmin)) done = 0;
+        if (s_blobreg(0x1B, 0)) { s_hwmin = WIICAM_HW_LEAVE; s_hwmin_at = 0; ++s_bregw; }
+        else                    { done = 0;                                  ++s_bregf; }
+    } else if (need_min) {
+        if (s_blobreg(0x1B, s_hwmin)) { s_hwmin_at = s_hwmin; ++s_bregw; }
+        else                          { done = 0;             ++s_bregf; }
     }
     // Re-marked on failure, so a write refused because the camera was down is
     // tried again rather than forgotten while cam? claims it landed.
-    if (!done) s_hw_dirty = true;
+    if (!done || more) s_hw_dirty = true;
     s_hw_retry_us = done ? 0 : hw_now + 1000000ull;
     s_hw_busy = false;
 }
@@ -934,11 +1278,15 @@ void wiicam_aim_hw_tick(void)
 // search from it; the same preset re-applied gets the loop's value put back.
 void wiicam_aim_hw_dirty(void)
 {
+    hw_shadow_lost();          // the preset wrote the block; ours are gone
     s_hw_dirty = true;
     const int p = loop_preset();
     if (p == s_loop_preset_seen) return;
     s_loop_preset_seen = p;
     if (s_loop_on) { loop_reset(p); s_hwmax = WIICAM_HW_LEAVE; }
+    // The preset rewrote 0x08 as well, and a new sensitivity is a new gain to
+    // search from: everything the gain loop measured was about the old one.
+    if (s_gl_on) { gl_reset(gl_preset()); s_hwgain = WIICAM_HW_LEAVE; }
 }
 
 // ---- the relative gate ----------------------------------------------------
@@ -1064,6 +1412,21 @@ void wiicam_aim_begin(void)
             s_loop_state = LOOP_HOLD;
             s_loop_saved = true;      // it came from flash, so it is still there
             s_loop_from_flash = true; // ...but nothing has vouched for it yet
+        }
+    }
+    // The gain loop, the same way: bounds unknown, the saved byte reinstated
+    // but on probation until a dwell locks at it (K4).
+    s_gl_on = true;
+    s_gl_store_req = false;
+    s_gl_prev_ambig = quad_ambig_total();
+    gl_reset(gl_preset());
+    {
+        int gv = 0, glo = 0, ghi = GL_HI_UNKNOWN;
+        if (aim_hwgain_load(&gv, &glo, &ghi) && gv > 0) {
+            gl_write(gv);
+            s_gl_state = LOOP_HOLD;
+            s_gl_saved = true;
+            s_gl_from_flash = true;
         }
     }
     s_prev_us = 0;
@@ -1597,6 +1960,17 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         // about MAXSIZE: a window seen straight on flickers between two and
         // four fragments, and read as cuts those walked lo up through every
         // value the LEDs had passed (seen on hardware).
+        // A MERGE first, because it changes what a missing corner MEANS. Two
+        // LEDs the sensor reported as one blob leave three where four were --
+        // the exact shape of a cut -- but nothing was cut: no size gate and no
+        // MAXSIZE took anything away, the sensor ran them together. Read as a
+        // cut it would walk MAXSIZE back up for a reason MAXSIZE cannot fix,
+        // and it would hide from the gain loop the one event the gain loop
+        // exists for. Either the resolver split the blob back into two corners
+        // (r.split) or it refused it as ambiguous; both are the same event.
+        const uint32_t amb = quad_ambig_total();
+        const bool merged = (r.split > 0) || (amb != s_gl_prev_ambig);
+        s_gl_prev_ambig = amb;
         const uint64_t since_lock = now_us - s_loop_last_lock_us;
         const bool recent   = s_loop_ever_lock && since_lock < LOOP_RECENT_US;
         const bool unlocked = !s_loop_ever_lock || since_lock >= LOOP_UNLOCKED_US;
@@ -1634,9 +2008,39 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             verdict = V_STRAY;          // four blobs and no lock for a second: a stray-only room
         // A value the LEDs have already passed cannot be what cut one now: a
         // corner gone at a vouched value is a hidden or weak LED, not MAXSIZE.
-        else if (an <= 3 && r.locked && r.n_real >= 2 && recent && !s_loop_vouched)
+        else if (an <= 3 && r.locked && r.n_real >= 2 && recent
+                 && !s_loop_vouched && !merged)
             verdict = V_CUT;            // a corner is gone while the others are tracked
         loop_tick(verdict, r.locked, stray_uncut);
+
+        // ---- the gain loop's own oracle --------------------------------
+        // Intensity and width are measured only on a CLEAN frame, where all
+        // four blobs are corners: the dimmest of the four is what the gain
+        // has left to spend, and the median width is the smear it is making.
+        // A merged or cut frame has a non-LED in the list and would poison
+        // both curves with it.
+        // Full mode only: the intensity and box bytes are the full report's,
+        // and in basic or extended mode they hold whatever the last full
+        // frame left there. A stale 0 read as "the dimmest LED is at zero"
+        // would arm the prediction rail against a measurement that never
+        // happened and freeze the loop for the session.
+        int gimin = -1, gwmed = -1;
+        if (verdict == V_CLEAN && an == 4
+            && (s_ext_state & 3) == WIICAM_FMT_FULL) {
+            int wv[4];
+            gimin = (int)s_bi[0];
+            for (int i = 0; i < 4; ++i) {
+                if ((int)s_bi[i] < gimin) gimin = (int)s_bi[i];
+                wv[i] = (int)s_bw[i];
+            }
+            for (int a = 1; a < 4; ++a) {          // insertion sort, 4 elements
+                const int t = wv[a]; int j = a - 1;
+                while (j >= 0 && wv[j] > t) { wv[j + 1] = wv[j]; --j; }
+                wv[j + 1] = t;
+            }
+            gwmed = (wv[1] + wv[2]) / 2;
+        }
+        gl_tick(verdict, r.locked, merged, gimin, gwmed);
     }
     if (r.locked) { s_loop_last_lock_us = now_us; s_loop_ever_lock = true; }
 
@@ -1901,7 +2305,7 @@ bool wiicam_cam_command(const char* line)
               "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
               "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu bsv=%lu bcold=%lu "
-              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d bwmax=%u benv=%lu bmerge=%lu bwide=%lu bsplit=%lu\n",
+              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d bwmax=%u benv=%lu bmerge=%lu bwide=%lu bsplit=%lu bregw=%lu bregf=%lu\n",
               (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
               (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
               (unsigned)s_rtol, (unsigned)s_bhmax, (unsigned)s_pxmax, (unsigned)s_armax,
@@ -1918,7 +2322,8 @@ bool wiicam_cam_command(const char* line)
               (unsigned long)s_breal[1], (unsigned long)s_breal[0],
               (unsigned long)s_bpolls, (int)s_cam_hold, (unsigned)s_bwmax,
               (unsigned long)s_benv, (unsigned long)quad_ambig_total(),
-              (unsigned long)s_bwide, (unsigned long)s_bsplit);
+              (unsigned long)s_bwide, (unsigned long)s_bsplit,
+              (unsigned long)s_bregw, (unsigned long)s_bregf);
         // In full mode each blob carries three more numbers -- box width, box
         // height and intensity -- so the line grows and the buffer with it.
         // Nine fields a blob in full mode, four of them added since this was
@@ -2140,17 +2545,24 @@ bool wiicam_cam_command(const char* line)
         // make it go dark. MAXSIZE comes back from the sensitivity preset;
         // MINSIZE goes to 0, the direction that cannot cost an LED.
         s_hwmax = WIICAM_HW_RESTORE; s_hwmin = WIICAM_HW_RESTORE;
+        // GAIN as well: it is the other register a loop drives, and a gun the
+        // gain loop has walked dim is exactly the state this command exists
+        // to undo. One sens_set puts both back (see the hw tick).
+        s_hwgain = WIICAM_HW_RESTORE;
         s_hw_dirty = true;
-        // The loop starts over from the preset, and its saved value goes too,
+        // The loops start over from the preset, and their saved values go too,
         // or the reset would fix the session and lose it on the next boot.
         loop_reset(loop_preset());
         s_loop_on = true;
+        gl_reset(gl_preset());
+        s_gl_on = true;
         // Erase every saved key, each attempted whatever the others did.
         bool gone = aim_gate_clear();
         gone = aim_gate2_clear() && gone;
         gone = aim_fit_clear()   && gone;
         fit_cache_dirty();
         gone = aim_hwloop_clear() && gone;
+        gone = aim_hwgain_clear() && gone;
         // The live histograms go too (or the floor outlives the reset), and
         // the capture is armed as at boot (G3), so it refills from here.
         wl_reset();
@@ -2168,7 +2580,8 @@ bool wiicam_cam_command(const char* line)
               "lcxu=%d lcyu=%d beta=%d res=%u dash=%u "
               "ext=%u fmt=%u fullreg=%u bmin=%u bmax=%u rtol=%u "
               "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
-              "loop=%d hwv=%d hwlo=%d hwhi=%d hws=%s bwmax=%u\n",
+              "loop=%d hwv=%d hwlo=%d hwhi=%d hws=%s bwmax=%u "
+              "gloop=%d gval=%d glo=%d ghi=%d gs=%s\n",
               s_sens_get ? s_sens_get() : -1, (int)s_mirx, (int)s_miry,
               (int)s_lead_ms, aim_smooth_get(), aim_dead_get(),
               (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
@@ -2183,7 +2596,28 @@ bool wiicam_cam_command(const char* line)
               (int)(s_hwmax < 0 ? -1 : s_hwmax),
               (int)(s_hwmin < 0 ? -1 : s_hwmin),
               (int)s_loop_on, s_loop_val, s_loop_lo, s_loop_hi,
-              loop_state_name(), (unsigned)s_bwmax);
+              loop_state_name(), (unsigned)s_bwmax,
+              (int)s_gl_on, s_gl_val, s_gl_lo, s_gl_hi, gl_state_name());
+        return true;
+    }
+    if (!strncmp(line, "camgain?", 8)) {
+        // The gain controller in one line. 'lo' is the highest byte still seen
+        // to merge two LEDs, 'hi' the lowest seen to cut one -- a HIGHER byte
+        // is LESS gain on this sensor, so the safe band is between them.
+        // 'imin' is the dimmest corner this dwell -- or the last finished
+        // one, because the counters reset at the boundary and a tool polling
+        // just past it would read nothing. 'icut' is the intensity at
+        // which a cut was last measured, and 'phold' the steps the curve
+        // refused because they would have crossed it.
+        reply("CAM: gain on=%d state=%s val=%d lo=%d hi=%d dwell=%d/%d "
+              "clean=%d merge=%d cut=%d imin=%d wmed=%d icut=%d phold=%lu "
+              "settled=%d saved=%d\n",
+              (int)s_gl_on, gl_state_name(), s_gl_val, s_gl_lo, s_gl_hi,
+              s_gl_dwell, LOOP_DWELL, s_gl_nclean, s_gl_nmerge, s_gl_ncut,
+              (s_gl_imin >= 0) ? s_gl_imin : s_gl_imin_last,
+              (s_gl_wmed >= 0) ? s_gl_wmed : s_gl_wmed_last,
+              s_gl_icut, (unsigned long)s_gl_pred_hold,
+              (int)(s_gl_hold_run >= LOOP_SETTLED), (int)s_gl_saved);
         return true;
     }
     if (!strncmp(line, "camloop?", 8)) {
@@ -2425,6 +2859,41 @@ bool wiicam_cam_command(const char* line)
                 if (nv >= 0) s_loop_val = nv;
                 s_hwmax = nv; s_hw_dirty = true;
             } }
+        // The gain register by hand. Refused below the preset: more gain than
+        // the sensitivity level asks for is not this command's to give, and
+        // at or below GAINLIMIT the camera stops answering at all.
+        else if (!strcmp(key, "hwgain")) {
+            if (val >= 0 && val <= gl_limit())
+                reply("CAM: hwgain:%d refused -- it must stay above GAINLIMIT "
+                      "(%d) or the sensor stops reporting\n", val, gl_limit());
+            else if (val >= 0 && val < gl_preset())
+                reply("CAM: hwgain:%d refused -- below the sensitivity preset "
+                      "(%d), which is as much gain as this level gives\n",
+                      val, gl_preset());
+            else {
+                const int16_t nv = (int16_t)(val < 0 ? WIICAM_HW_LEAVE
+                                             : (val > 255 ? 255 : val));
+                if (nv != s_hwgain && wl_enabled()) {
+                    wl_reset();
+                    reply("CAM: learn cleared -- hwgain changed\n");
+                }
+                s_gl_on = false;
+                s_gl_state = LOOP_OFF;
+                if (nv >= 0) s_gl_val = nv;
+                s_hwgain = nv; s_hw_dirty = true;
+            } }
+        else if (!strcmp(key, "gloop")) {
+            if (val) {
+                gl_reset(s_hwgain >= 0 ? (int)s_hwgain : gl_preset());
+                s_gl_on = true;
+            } else {
+                s_gl_on = false;
+                s_gl_state = LOOP_OFF;
+                s_gl_val = gl_preset();
+                s_gl_saved = false;
+                s_hwgain = WIICAM_HW_RESTORE; s_hw_dirty = true;
+            }
+        }
         else if (!strcmp(key, "hwmin")) {
             const int16_t nv = (int16_t)(val < 0 ? WIICAM_HW_LEAVE
                                          : (val > 255 ? 255 : val));
@@ -2454,7 +2923,8 @@ bool wiicam_cam_command(const char* line)
     s_cache_seen = 0xFFFFFFFFu;    // settings changed: reprocess the next report
     reply("CMD ok (tune) | sens=%d lead=%d smooth=%d beta=%d "
           "lens=%u res=%u dash=%u ext=%u fmt=%u fullreg=%u "
-          "bmin=%u bmax=%u rtol=%u bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d bwmax=%u\n",
+          "bmin=%u bmax=%u rtol=%u bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d bwmax=%u "
+          "hwgain=%d\n",
           s_sens_get ? s_sens_get() : -1, (int)s_lead_ms, aim_smooth_get(),
           aim_beta_get(),
           (unsigned)s_lens, (unsigned)s_res, (unsigned)s_dash,
@@ -2463,6 +2933,7 @@ bool wiicam_cam_command(const char* line)
           (unsigned)s_bmin, (unsigned)s_bmax, (unsigned)s_rtol,
           (unsigned)s_bhmax, (unsigned)s_pxmax, (unsigned)s_armax,
           (int)(s_hwmax < 0 ? -1 : s_hwmax),
-          (int)(s_hwmin < 0 ? -1 : s_hwmin), (unsigned)s_bwmax);
+          (int)(s_hwmin < 0 ? -1 : s_hwmin), (unsigned)s_bwmax,
+          (int)(s_hwgain < 0 ? -1 : s_hwgain));
     return true;
 }

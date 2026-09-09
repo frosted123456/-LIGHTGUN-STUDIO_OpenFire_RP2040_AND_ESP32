@@ -1030,6 +1030,7 @@ class Camera(RowScreen):
         self._learn_t = 0.0        # last '~camlearn?' poll, monotonic
         self._fit_t = 0.0          # ...and the last '~camfit?' one
         self._loop_t = 0.0         # ...and the last '~camloop?' one
+        self._loop_alt = False     # ...and which of the two it asks next
         self._shape_pending = None # (seq0, deadline) while a CSV waits its set
         self._ask_t = 0.0          # the last question of ANY kind, so two of
                                    # them can never be asked in one breath
@@ -1955,9 +1956,17 @@ class Camera(RowScreen):
         # not). One line of ~110 bytes, so it can be the fastest poll -- and
         # while logging it runs at the blob cadence, or the rows pair each
         # frame with a loop state up to a second old.
+        # There are TWO controllers now, on two registers, and they alternate
+        # in this one slot rather than each taking their own: two questions in
+        # one frame come back as one burst (the failure this whole structure
+        # avoids), and a third consumer of the wire starves the fit poll.
+        # Alternating costs each controller half the cadence and the wire
+        # nothing.
         if (self.wiicam() and now_m - self._loop_t > every
                 and self.ask(now_m, self.LOOP_REPLY_S)
-                and self.app.link.send("~camloop?", poll=True)):
+                and self.app.link.send(
+                    "~camgain?" if self._loop_alt else "~camloop?", poll=True)):
+            self._loop_alt = not self._loop_alt
             self._loop_t = now_m
         # The gate's verdict. One short line plus one sentence, so it can be
         # asked for often enough to be live without taking anything from the

@@ -378,13 +378,13 @@ def main():
         "pxmax=14 armax=20 hwmax=-1 hwmin=-1 bn=4 brej=90 brrej=39 bvalve=61 "
         "bframes=1900 bms=19000 bdrop=3 bsrej=27 bfar=13 bnear=4 br4=1700 "
         "br3=250 br2=90 br1=40 br0=20 bpolls=3800 hold=0 bwmax=0 benv=5 "
-        "bmerge=17 bwide=6\n")
+        "bmerge=17 bwide=6 bsplit=2 bregw=9 bregf=1\n")
     link = Link()
     link.src = type("S", (), {"q": _queue_of([blob_line])})()
     link.pump()
     for k, want in (("bsrej", 27), ("bfar", 13), ("bnear", 4),
                     ("bhmax", 10), ("pxmax", 14), ("armax", 20),
-                    ("bmerge", 17), ("bwide", 6)):
+                    ("bmerge", 17), ("bwide", 6), ("bregw", 9), ("bregf", 1)):
         ck(link.last.get(k) == want,
            "'%s=%d' off a real camblob? line reaches last[] (%r)"
            % (k, want, link.last.get(k)))
@@ -421,7 +421,10 @@ def main():
     link.clock = lambda: tclk[0]
     link.src = type("S", (), {"q": _queue_of([
         "CAM: loop on=1 state=LOWER val=127 lo=0 hi=255 dwell=12/50 "
-        "clean=2 stray=9 cut=1 settled=0 saved=0 uncut=4\n"])})()
+        "clean=2 stray=9 cut=1 settled=0 saved=0 uncut=4\n",
+        "CAM: gain on=1 state=LOWER val=24 lo=12 hi=256 dwell=9/50 "
+        "clean=8 merge=13 cut=0 imin=41 wmed=7 icut=-1 phold=0 "
+        "settled=0 saved=0\n"])})()
     link.pump()
     tclk[0] = 100.35
     log5 = BlobLog(os.path.join(d, "loop.csv"), clock=lambda: tclk[0])
@@ -442,16 +445,32 @@ def main():
     ck(lp["loopage"] == "350",
        "...with the age of that loop line in ms, so a reader knows how far "
        "the loop columns lag the frame (%r)" % lp["loopage"])
+    ck(lp["gval"] == "24" and lp["gstate"] == "LOWER" and lp["glo"] == "12"
+       and lp["ghi"] == "256" and lp["gimin"] == "41" and lp["gwmed"] == "7",
+       "the GAIN loop's line lands in its own columns beside the light "
+       "limit's, about register 0x08 and never mixed with 0x06's bracket: %s"
+       % {k: lp[k] for k in ("gval", "gstate", "glo", "ghi", "gimin", "gwmed")})
+    ck(link.gain.get("merge") == 13 and link.loop.get("stray") == 9,
+       "...and the two answers are kept in two dicts: 'merge' belongs to the "
+       "gain loop, 'stray' to the light limit, and neither overwrites the "
+       "other's val/lo/hi")
     ck(lp["loopuc"] == "4",
        "...and the dwell's 'uncut' count -- stray frames the sensor sized "
        "like the LEDs, the ones the loop holds on (%r)" % lp["loopuc"])
-    ck(tuple(BlobLog.COLS[-14:]) == ("loopl", "looph", "loopdw", "loopcl",
+    ck(wire["bregw"] == "9" and wire["bregf"] == "1",
+       "and the register-write counters, which are what say whether a stutter "
+       "was the gun writing to the sensor: %s"
+       % {k: wire[k] for k in ("bregw", "bregf")})
+    ck(tuple(BlobLog.COLS[-22:]) == ("loopl", "looph", "loopdw", "loopcl",
                                      "loopst", "loopcu", "loopsv", "loopage",
                                      "bwmax", "bpolls", "benv",
-                                     "bmerge", "bwide", "loopuc"),
+                                     "bmerge", "bwide", "loopuc",
+                                     "gval", "gstate", "glo", "ghi",
+                                     "gimin", "gwmed", "bregw", "bregf"),
        "and they are on the END, behind loopv/loops, like every column since "
        "the first file -- with the width gate, the poll count, the "
-       "envelope's drops, the merge and wide counts and 'uncut' behind them")
+       "envelope's drops, the merge and wide counts, 'uncut' and the gain "
+       "loop's six and the register-write counters behind them")
     ck(link.loop.get("uncut") == 4 and link.last.get("loopuc") == 4,
        "'uncut=' off the loop line reaches both the loop dict and last[]")
     log6 = BlobLog(os.path.join(d, "noloop.csv"))

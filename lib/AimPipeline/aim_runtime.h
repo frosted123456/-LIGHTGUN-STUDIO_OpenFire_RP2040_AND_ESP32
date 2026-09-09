@@ -117,6 +117,13 @@ bool aim_hwloop_load(int* out_val, int* out_lo, int* out_hi);
 bool aim_hwloop_store(int val, int lo, int hi);
 bool aim_hwloop_clear(void);
 
+// The gain loop's settled value (register 0x08), same shape. The bounds run
+// the other way round: lo is the highest byte still seen to MERGE two LEDs
+// into one blob, hi the lowest byte seen to CUT an LED (256 = never, as 0).
+bool aim_hwgain_load(int* out_val, int* out_lo, int* out_hi);
+bool aim_hwgain_store(int val, int lo, int hi);
+bool aim_hwgain_clear(void);
+
 // Output dead-band, in final output units at the move call. Swallows
 // sub-threshold shimmer around the last SENT position; motion at or above the
 // threshold passes with no added delay. 0 = off, the default; ~16-32 suits a

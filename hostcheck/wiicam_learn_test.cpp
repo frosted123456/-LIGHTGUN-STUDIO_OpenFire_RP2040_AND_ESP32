@@ -93,7 +93,7 @@ esp_err_t nvs_get_blob(nvs_handle_t, const char* k, void* o, size_t* l){
 // taken -- and it does it in the direction that cannot be seen, since a floor
 // only ever refuses.
 struct U32Slot { char key[16]; uint32_t v; bool have; };
-static U32Slot g_u32s[8];       // gate0 gate1 fit0 fit1 hwl0, plus room
+static U32Slot g_u32s[9];       // gate0 gate1 fit0 fit1 hwl0 hwg0, plus room
 static U32Slot* u32_find(const char* k){
     for (auto& s : g_u32s) if (s.have && k && !strcmp(s.key, k)) return &s;
     return nullptr; }
@@ -105,7 +105,8 @@ static bool is_u32key(const char* k){
     return k && (!strcmp(k, "gate0") || !strcmp(k, "gate1")
                                      || !strcmp(k, "fit0")
                                      || !strcmp(k, "fit1")   // the width edge
-                                     || !strcmp(k, "hwl0")); }
+                                     || !strcmp(k, "hwl0")
+                                     || !strcmp(k, "hwg0")); }   // the gain loop
 esp_err_t nvs_erase_key(nvs_handle_t, const char* k){
     if (is_u32key(k)) { if (U32Slot* s = u32_find(k)) s->have = false; }
     else if (is_lens(k)) g_lhave = false; else g_bhave = false;
@@ -2784,6 +2785,162 @@ int main()
            "(benv unchanged): it reaches the resolver and is split");
         aim_fit_clear();
         wiicam_cam_command("camlearn=on:0");
+        wiicam_cam_command("camlearn=reset");
+    }
+
+    // ---- the gain loop's intensity curve, and the rail on it ------------
+    // The loop's evidence is merges; its brake is the LEDs' own brightness.
+    // Every clean dwell records (gain byte, dimmest corner's intensity byte)
+    // for THIS rig, and once a cut has been measured the curve says which
+    // steps would take the dimmest LED back down to the level it was lost at.
+    // That matters exactly once: after NOSAFE, where the clean dwell that
+    // releases it throws away both bounds -- they were about a room that has
+    // changed -- but the LED's own physics has not changed with the room, so
+    // the loop must not walk straight back into the byte it already knows
+    // cuts. Full mode, because the intensity byte only exists there.
+    {
+        auto gain = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camgain?");
+            long v = -999;
+            if (!g_replies.empty()) {
+                const char* q = strstr(g_replies[0].c_str(), key);
+                if (q) sscanf(q + strlen(key), "%ld", &v);
+            }
+            return v;
+        };
+        // Four corners, dimmest 60, and the same four with the bottom pair
+        // run together into one 69-wide blob (the merge the loop feeds on).
+        static const FullObj GRIG[4] = {
+            { 256, 240, 2,  10, 20, 14, 24,  60 },
+            { 768, 240, 3,  10, 20, 15, 25, 100 },
+            { 256, 528, 4,  10, 20, 13, 23, 140 },
+            { 768, 528, 5,  10, 20, 14, 24, 190 },
+        };
+        FullObj dim[4];                       // the same rig, dimmer
+        auto set_dim = [&](int floor_i) {
+            memcpy(dim, GRIG, sizeof(dim));
+            dim[0].inten = floor_i;
+            dim[1].inten = floor_i + 40;
+            dim[2].inten = floor_i + 80;
+            dim[3].inten = floor_i + 120;
+        };
+        // frame() alone is the camera core; the register writes land on the
+        // pump core, and a loop whose write never lands judges nothing.
+        auto gclean = [&](const FullObj* o, int n) {
+            for (int k = 0; k < n; ++k) { frame(o); wiicam_aim_hw_tick(); }
+        };
+        auto gmerge = [&](int n) {            // frames whose bottom pair merged
+            for (int k = 0; k < n; ++k) {
+                FullObj f[4];
+                memcpy(f, GRIG, sizeof(f));
+                f[2].x = 512; f[2].xmn = 30; f[2].xmx = 98; f[2].inten = 250;
+                f[3].x = 1023; f[3].y = 1023;
+                // A byte-identical report is the previous camera frame seen
+                // again and the pipeline answers from cache without judging
+                // it, so a stimulus repeated verbatim never reaches the loop.
+                f[0].x += (g_jit & 1) ? 1 : -1; ++g_jit;
+                memcpy(g_fobj, f, sizeof(g_fobj));
+                float sx = 0.0f, sy = 0.0f;
+                wiicam_aim_full_poll(g_qpx, g_qpy, g_qsz, &g_qseen);
+                g_t += DT;
+                wiicam_aim_process_sz(g_qpx, g_qpy, g_qsz, g_qseen & 7u, g_t, &sx, &sy);
+                wiicam_aim_hw_tick();
+            }
+        };
+        auto gcut = [&](int n) {              // a corner simply gone
+            for (int k = 0; k < n; ++k) {
+                FullObj f[4];
+                memcpy(f, GRIG, sizeof(f));
+                f[3].x = 1023; f[3].y = 1023;
+                f[0].x += (g_jit & 1) ? 1 : -1; ++g_jit;
+                memcpy(g_fobj, f, sizeof(g_fobj));
+                float sx = 0.0f, sy = 0.0f;
+                wiicam_aim_full_poll(g_qpx, g_qpy, g_qsz, &g_qseen);
+                g_t += DT;
+                wiicam_aim_process_sz(g_qpx, g_qpy, g_qsz, g_qseen & 7u, g_t, &sx, &sy);
+                wiicam_aim_hw_tick();
+            }
+        };
+        // A register hook, so the writes the loops ask for actually land: with
+        // none installed s_hw_dirty never clears and BOTH loops sit frozen,
+        // which is a fair model of a dead sensor and no use here.
+        wiicam_set_blobreg_hook(+[](int, int) { return 1; });
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("camlearn=on:0");
+        // MAXSIZE off by VALUE, not by restore: a restore needs the
+        // sensitivity hook this suite does not install, and a hwmax loop left
+        // running would vouch for its own value on the first clean dwell and
+        // then refuse to see a cut at all -- which is the evidence this block
+        // is made of. 255 is the sens-2 preset, so nothing actually moves.
+        wiicam_cam_command("cam=hwmax:255");
+        aim_hwgain_clear();
+        wiicam_cam_command("cam=hwgain:-1");
+        wiicam_aim_hw_tick();
+        gclean(GRIG, 20);
+        wiicam_cam_command("cam=gloop:1");
+        wiicam_aim_hw_tick();
+        ck(quad_locked() && gain("val=") == 0x0C,
+           "gain curve: locked in full mode, the loop at the preset");
+        // A clean dwell at the preset measures the dimmest corner there.
+        gclean(GRIG, 58);
+        ck(gain("imin=") == 60,
+           "...and a clean dwell reports the dimmest of the four corners (60), "
+           "not the median and not the brightest: what the gain has left to "
+           "spend is what the WEAKEST LED still reads");
+        // Merges step the gain down; the LEDs get dimmer with it.
+        gmerge(58);
+        ck(gain("val=") == 0x18 && gain("lo=") == 0x0C,
+           "...a dwell of merged pairs steps the byte to 0x18");
+        set_dim(20);
+        gclean(dim, 58);
+        gcut(6);
+        {
+            char m[200];
+            snprintf(m, sizeof m, "...and when the LEDs are lost at that byte "
+                     "the intensity they were lost AT is recorded: icut %ld",
+                     gain("icut="));
+            ck(gain("icut=") == 20 && gain("hi=") == 0x18, m);
+        }
+        // Drive it to NOSAFE: the bounds close, and the clean dwell that
+        // releases NOSAFE throws them away.
+        {
+            int rounds = 0;
+            while (rounds < 12 && gain("state=") == -999
+                   && strstr(g_replies.empty() ? "" : g_replies[0].c_str(), "NOSAFE") == 0) {
+                ++rounds;
+                gmerge(58);
+                gclean(dim, 12);
+                gcut(6);
+                gclean(dim, 12);
+            }
+        }
+        gclean(GRIG, 58);                          // clean: NOSAFE released
+        const long phold0 = gain("phold=");
+        ck(gain("lo=") == 0 && gain("hi=") == 256 && gain("icut=") == 20,
+           "NOSAFE released by a clean dwell throws both bounds away -- they "
+           "were about a room that has changed -- but keeps icut: the room "
+           "changed, the LEDs did not");
+        // ...and now the rail is the only thing between the loop and the byte
+        // it already knows cuts. With no hi it would double blind; the curve
+        // says where that lands.
+        gmerge(58);
+        {
+            char m[240];
+            snprintf(m, sizeof m, "and with the bounds gone the curve refuses "
+                     "the step instead of taking it: predicted intensity at the "
+                     "doubled byte is at or under the 20 the LEDs were lost at, "
+                     "so the loop HOLDS (phold %ld -> %ld, val %ld)",
+                     phold0, gain("phold="), gain("val="));
+            ck(gain("phold=") == phold0 + 1 && gain("val=") == 0x0C, m);
+        }
+        wiicam_cam_command("cam=gloop:0");
+        wiicam_aim_hw_tick();
+        wiicam_cam_command("cam=hwmax:-1");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        wiicam_set_blobreg_hook(0);
+        aim_hwgain_clear();
         wiicam_cam_command("camlearn=reset");
     }
 

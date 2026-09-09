@@ -1844,15 +1844,35 @@ def main():
     cam3._ask_t = time.monotonic() + 30.0
     n0 = len(ser.written)
     app.step([], t + 12.4)
-    ck(b"camloop?" not in b" ".join(ser.written[n0:]),
+    sent = b" ".join(ser.written[n0:])
+    ck(b"camloop?" not in sent and b"camgain?" not in sent,
        "the loop poll went out while another answer was still on the wire -- "
        "it must go through ask() like every other question on this screen")
     cam3._ask_t = 0.0
     cam3._loop_t = 0.0
     n0 = len(ser.written)
     app.step([], t + 12.5)
-    ck(b"camloop?" in b" ".join(ser.written[n0:]),
+    sent = b" ".join(ser.written[n0:])
+    ck(b"camloop?" in sent or b"camgain?" in sent,
        "...and does go out once the wire is free")
+    # Two controllers on two registers share this one slot and take turns.
+    # Both must actually get asked -- a capture that logs the light limit and
+    # never the gain cannot say which register moved -- and never both in one
+    # frame, which is what the burst rule above forbids.
+    seen_loop = seen_gain = False
+    both_in_one = False
+    for i in range(8):
+        cam3._loop_t = 0.0
+        cam3._ask_t = 0.0
+        n0 = len(ser.written)
+        app.step([], t + 13.0 + i * 0.5)
+        sent = b" ".join(ser.written[n0:])
+        if b"camloop?" in sent: seen_loop = True
+        if b"camgain?" in sent: seen_gain = True
+        if b"camloop?" in sent and b"camgain?" in sent: both_in_one = True
+    ck(seen_loop and seen_gain and not both_in_one,
+       "...and the two controllers alternate in it: both the light limit and "
+       "the gain loop get asked, never both in the same frame")
     # ...and not again inside the same second.
     n0 = len(ser.written)
     app.step([], t + 12.6)
