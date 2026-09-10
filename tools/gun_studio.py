@@ -594,7 +594,13 @@ class BlobLog:
             # solenoid for tens of ms and takes the camera bus off the poll
             # loop, so this is the column that says whether a stutter the user
             # felt was the gun writing registers. On the end.
-            "bregw", "bregf")
+            "bregw", "bregf",
+            # The gun's own stall record: the worst poll gap on each core since
+            # the last row, the longest camera hold since the last row, the
+            # total held since boot (all us), and refused camera reads. These
+            # are what say "the gun stalled" when every other counter kept
+            # counting -- blobs004022014 had two felt seconds and no trace.
+            "c0gap", "c1gap", "holdmax", "holdus", "pfail")
 
     # Pushed to the medium this often, on top of the per-row flush: a
     # flush() only hands the row to the kernel, and a Pi that loses power or
@@ -607,6 +613,15 @@ class BlobLog:
         self._last_frames = None
         self._clock = clock
         self._synced = clock()
+        # The fsync runs on its own thread. On a USB stick it can take
+        # seconds when the stick's own housekeeping kicks in, and it used to
+        # run on the front end's frame loop: blobs004022014 shows pical going
+        # quiet for 2-4 s every 16-18 s, like clockwork, while the gun ran on
+        # at 200 fps -- the hub freezing, blamed on the gun. One in flight at
+        # a time; a sync that finds the last one still busy is skipped and
+        # counted, never queued, so a slow stick can never build a backlog.
+        self._sync_thread = None
+        self.syncs_skipped = 0
         self._f = open(path, "w")
         try:
             self._f.write(",".join(self.COLS) + "\n")
@@ -682,7 +697,8 @@ class BlobLog:
         vals.append(last.get("bwide", ""))
         vals.append(last.get("loopuc", ""))
         for k in ("gval", "gstate", "glo", "ghi", "gimin", "gwmed",
-                  "bregw", "bregf"):
+                  "bregw", "bregf", "c0gap", "c1gap", "holdmax", "holdus",
+                  "pfail"):
             vals.append(last.get(k, ""))
         self._f.write(",".join(str(v) for v in vals) + "\n")
         # Flushed every row: a stick pulled out of a running Pi otherwise keeps
@@ -696,17 +712,36 @@ class BlobLog:
         return True
 
     def _sync(self):
-        try:
-            os.fsync(self._f.fileno())
-        except Exception:
-            pass                    # a medium without fsync still has the flush
+        if self._sync_thread is not None and self._sync_thread.is_alive():
+            self.syncs_skipped += 1  # the medium is still on the last one
+            return
+        fd = self._f.fileno()
+        def run():
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass                # a medium without fsync still has the flush
+        self._sync_thread = threading.Thread(target=run, daemon=True)
+        self._sync_thread.start()
+
+    def _sync_wait(self, timeout_s=5.0):
+        """Let an in-flight sync finish before the handle goes away: an fsync
+        on a closed descriptor is a wasted call, and the rows it was carrying
+        would be reported written without being on the card."""
+        t = self._sync_thread
+        if t is not None and t.is_alive():
+            t.join(timeout_s)
 
     def close(self):
         """Returns False if the final flush failed -- a caller that reports
         "N rows written" should not claim rows that never reached the disk."""
         try:
             self._f.flush()
-            self._sync()
+            self._sync_wait()
+            try:
+                os.fsync(self._f.fileno())   # the last rows, on this thread
+            except Exception:
+                pass
             self._f.close()
             return True
         except Exception:
@@ -1713,6 +1748,14 @@ class Link:
                                                  # solenoid for tens of ms and takes the camera bus,
                                                  # so these say whether a stutter was the gun writing.
                                                  "bregw", "bregf",
+                                                 # The gun's own stall record. c0gap/c1gap: the longest
+                                                 # gap between two camera polls / two passes of the pump
+                                                 # core's loop since the last row (us); holdmax/holdus:
+                                                 # the longest single camera hold since the last row and
+                                                 # the total held since boot (us); pfail: camera reads
+                                                 # the driver refused. A frozen gun leaves its mark here
+                                                 # even when every other counter looks healthy.
+                                                 "c0gap", "c1gap", "holdmax", "holdus", "pfail",
                                                  # The loop's four off 'cam?': on, held limit, bracket.
                                                  # hwmax above is the register (-1 = back on the preset);
                                                  # hwhi 256 = no ceiling known yet, shown as '?'.

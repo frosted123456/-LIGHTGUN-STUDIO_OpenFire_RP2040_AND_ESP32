@@ -7417,6 +7417,83 @@ int main()
         wiicam_cam_command("cam=rtol:0,bhmax:0,fmt:0");
     }
 
+    // ==================================================================
+    // THE GUN'S OWN STALL RECORD
+    // ==================================================================
+    // blobs004022014: the user held a gun that was dead for two seconds and
+    // the log showed a healthy one, because every counter it carried lived on
+    // the core that stayed alive and was read by the core that did not. These
+    // five are the ones that would have shown it.
+    printf("\n  -- the stall record: c0gap, c1gap, holdmax, holdus, pfail --\n");
+    {
+        auto bs = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camblob?");
+            long v = -1;
+            if (!g_replies.empty()) {
+                const char* q = strstr(g_replies[0].c_str(), key);
+                if (q) sscanf(q + strlen(key), "%ld", &v);
+            }
+            return v;
+        };
+        wiicam_aim_begin();
+        wiicam_cam_command("cam=res:2,lead:0,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,fmt:0");
+        int qx[4], qy[4];
+        rig(qx, qy, 512, 384, 512, 384);
+        float sx = 0.0f, sy = 0.0f;
+        // Core 0's cadence: three polls 5 ms apart, then one 480 ms late.
+        uint64_t t0 = 50000000ull;
+        for (int i = 0; i < 3; ++i) { qx[0] += (i & 1) ? 1 : -1; wiicam_aim_process_sz(qx, qy, 0, 0xF, t0, &sx, &sy); t0 += 5000; }
+        bs("bn=");                                   // a read: resets the watermarks
+        qx[0] += 3; wiicam_aim_process_sz(qx, qy, 0, 0xF, t0, &sx, &sy); t0 += 480000;
+        qx[0] -= 3; wiicam_aim_process_sz(qx, qy, 0, 0xF, t0, &sx, &sy);
+        {
+            const long g = bs("c0gap=");
+            char m[200];
+            snprintf(m, sizeof m, "c0gap is the longest gap between two camera "
+                     "polls since the last read: 480000 us (%ld)", g);
+            ck(g == 480000, m);
+        }
+        ck(bs("c0gap=") == 0,
+           "...and it is a watermark: reading it resets it, so a row is 'the "
+           "worst since the last row'");
+        // Core 1's cadence, on its own clock: the pump loop passing every
+        // 200 us, then one pass 161 ms late -- the cost of one register write.
+        g_fake_us += 10000;
+        for (int i = 0; i < 5; ++i) { wiicam_aim_hw_tick(); g_fake_us += 200; }
+        bs("bn=");
+        wiicam_aim_hw_tick(); g_fake_us += 161000; wiicam_aim_hw_tick();
+        {
+            const long g = bs("c1gap=");
+            char m[200];
+            snprintf(m, sizeof m, "c1gap is the longest gap between two passes of "
+                     "the pump core's loop: 161000 us (%ld) -- one register "
+                     "write's worth of a stopped solenoid, now measured", g);
+            ck(g == 161000, m);
+        }
+        // The camera hold: two holds, 150 ms and 12 ms. The longest is the
+        // watermark, the sum is the running total.
+        const long held0 = bs("holdus=");
+        wiicam_aim_cam_hold(1); g_fake_us += 150000; wiicam_aim_cam_hold(0);
+        wiicam_aim_cam_hold(1); g_fake_us += 12000;  wiicam_aim_cam_hold(0);
+        {
+            const long mx = bs("holdmax="), tot = bs("holdus=");
+            char m[220];
+            snprintf(m, sizeof m, "two camera holds, 150 ms and 12 ms: holdmax "
+                     "is the longer (%ld) and holdus the total since boot (+%ld)",
+                     mx, tot - held0);
+            ck(mx == 150000 && tot - held0 == 162000, m);
+        }
+        ck(bs("holdmax=") == 0 && bs("holdus=") == held0 + 162000,
+           "...holdmax resets on read, holdus does not");
+        // Refused camera reads, counted by the poll loop itself.
+        const long pf0 = bs("pfail=");
+        wiicam_aim_note_pollfail(); wiicam_aim_note_pollfail(); wiicam_aim_note_pollfail();
+        ck(bs("pfail=") == pf0 + 3,
+           "three reads the driver refused reach pfail -- the reads that never "
+           "became a frame and so were invisible to every other counter");
+    }
+
     printf("\nwiicam adapter: %s (%d failures)\n", fails ? "FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;
 }

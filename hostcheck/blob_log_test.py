@@ -378,13 +378,16 @@ def main():
         "pxmax=14 armax=20 hwmax=-1 hwmin=-1 bn=4 brej=90 brrej=39 bvalve=61 "
         "bframes=1900 bms=19000 bdrop=3 bsrej=27 bfar=13 bnear=4 br4=1700 "
         "br3=250 br2=90 br1=40 br0=20 bpolls=3800 hold=0 bwmax=0 benv=5 "
-        "bmerge=17 bwide=6 bsplit=2 bregw=9 bregf=1\n")
+        "bmerge=17 bwide=6 bsplit=2 bregw=9 bregf=1 c0gap=5200 c1gap=161000 "
+        "holdmax=150800 holdus=2300000 pfail=3\n")
     link = Link()
     link.src = type("S", (), {"q": _queue_of([blob_line])})()
     link.pump()
     for k, want in (("bsrej", 27), ("bfar", 13), ("bnear", 4),
                     ("bhmax", 10), ("pxmax", 14), ("armax", 20),
-                    ("bmerge", 17), ("bwide", 6), ("bregw", 9), ("bregf", 1)):
+                    ("bmerge", 17), ("bwide", 6), ("bregw", 9), ("bregf", 1),
+                    ("c0gap", 5200), ("c1gap", 161000), ("holdmax", 150800),
+                    ("holdus", 2300000), ("pfail", 3)):
         ck(link.last.get(k) == want,
            "'%s=%d' off a real camblob? line reaches last[] (%r)"
            % (k, want, link.last.get(k)))
@@ -461,16 +464,25 @@ def main():
        "and the register-write counters, which are what say whether a stutter "
        "was the gun writing to the sensor: %s"
        % {k: wire[k] for k in ("bregw", "bregf")})
-    ck(tuple(BlobLog.COLS[-22:]) == ("loopl", "looph", "loopdw", "loopcl",
+    ck(wire["c1gap"] == "161000" and wire["holdmax"] == "150800"
+       and wire["holdus"] == "2300000" and wire["pfail"] == "3"
+       and wire["c0gap"] == "5200",
+       "and the gun's stall record -- the worst gap on each core, the longest "
+       "and total camera hold, refused reads -- which is what says the gun "
+       "stalled when every other counter kept counting: %s"
+       % {k: wire[k] for k in ("c0gap", "c1gap", "holdmax", "holdus", "pfail")})
+    ck(tuple(BlobLog.COLS[-27:]) == ("loopl", "looph", "loopdw", "loopcl",
                                      "loopst", "loopcu", "loopsv", "loopage",
                                      "bwmax", "bpolls", "benv",
                                      "bmerge", "bwide", "loopuc",
                                      "gval", "gstate", "glo", "ghi",
-                                     "gimin", "gwmed", "bregw", "bregf"),
+                                     "gimin", "gwmed", "bregw", "bregf",
+                                     "c0gap", "c1gap", "holdmax", "holdus",
+                                     "pfail"),
        "and they are on the END, behind loopv/loops, like every column since "
        "the first file -- with the width gate, the poll count, the "
-       "envelope's drops, the merge and wide counts, 'uncut' and the gain "
-       "loop's six and the register-write counters behind them")
+       "envelope's drops, the merge and wide counts, 'uncut', the gain "
+       "loop's six, the register-write counters and the stall record behind them")
     ck(link.loop.get("uncut") == 4 and link.last.get("loopuc") == 4,
        "'uncut=' off the loop line reaches both the loop dict and last[]")
     log6 = BlobLog(os.path.join(d, "noloop.csv"))
@@ -501,6 +513,7 @@ def main():
         for i in range(5):
             tclk[0] += 0.3
             log7.sample(dict(base, bframes=3000 + i), "CAM: blobs 30,40,3,1", None)
+            log7._sync_wait()          # the sync runs on its own thread
         n_mid = len(syncs)
         ck(n_mid == 1,
            "five rows over 1.5 s cost one fsync, not five: a card is not "
@@ -508,6 +521,41 @@ def main():
         log7.close()
         ck(len(syncs) == n_mid + 1, "...and close() syncs once more, so the "
            "last rows are on the card before the file is reported written")
+    finally:
+        _gs.os.fsync = real_fsync
+
+    # ...and the fsync is OFF the caller's thread. A USB stick can sit in
+    # fsync for seconds during its own housekeeping; on the frame loop that
+    # was the hub freezing every 16-18 s (blobs004022014) and being blamed on
+    # the gun. A stick that takes 0.4 s per sync must cost sample() nothing,
+    # and a second sync that finds it still busy is skipped, not queued.
+    import time as _time
+    slow_calls = []
+    def slow_fsync(fd):
+        slow_calls.append(fd)
+        _time.sleep(0.4)
+    _gs.os.fsync = slow_fsync
+    try:
+        tclk[0] = 300.0
+        log8 = BlobLog(os.path.join(d, "slow.csv"), clock=lambda: tclk[0])
+        base = dict(link.last)
+        tclk[0] += 1.5                  # due for a sync
+        t0 = _time.monotonic()
+        log8.sample(dict(base, bframes=4000), "CAM: blobs 30,40,3,1", None)
+        dt = _time.monotonic() - t0
+        ck(dt < 0.2,
+           "a sync that takes 0.4 s on the stick costs sample() %.0f ms: the "
+           "fsync runs on its own thread, not the front end's frame loop"
+           % (dt * 1000.0))
+        tclk[0] += 1.5                  # due again, the last one still in flight
+        log8.sample(dict(base, bframes=4001), "CAM: blobs 30,40,3,1", None)
+        ck(log8.syncs_skipped == 1 and len(slow_calls) == 1,
+           "...a sync due while the last one is still on the stick is SKIPPED "
+           "and counted (%d skipped, %d started), never queued behind it"
+           % (log8.syncs_skipped, len(slow_calls)))
+        ck(log8.close() is True and len(slow_calls) == 2,
+           "...and close() waits for the one in flight, then syncs the last "
+           "rows itself before the file is reported written")
     finally:
         _gs.os.fsync = real_fsync
 

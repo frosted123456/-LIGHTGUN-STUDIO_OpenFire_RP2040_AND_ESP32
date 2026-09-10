@@ -128,7 +128,11 @@ esp_err_t nvs_get_u32(nvs_handle_t, const char* k, uint32_t* v){
 esp_err_t nvs_commit(nvs_handle_t){ return ESP_OK; }
 void nvs_close(nvs_handle_t){}
 esp_err_t nvs_flash_init(void){ return ESP_OK; }
-int64_t esp_timer_get_time(void){ return 0; }
+// The pipeline's own clock follows the frames (g_t below): a clock frozen at
+// 0 left the write path's one-second dead-sensor backoff armed for good the
+// first time a restore had no hook to run on, and every loop after it froze.
+static uint64_t g_t = 1000000;
+int64_t esp_timer_get_time(void){ return (int64_t)g_t; }
 }
 
 static std::vector<std::string> g_lines, g_replies;
@@ -220,7 +224,7 @@ static int full_hook(unsigned char* buf, int len)
 static int      g_qpx[4] = {0,0,0,0}, g_qpy[4] = {0,0,0,0};
 static int      g_qsz[4] = {-1,-1,-1,-1};
 static unsigned g_qseen  = 0;
-static uint64_t g_t      = 1000000;
+// g_t: declared above, next to the clock stub that reads it.
 static int      g_jit    = 0;
 // 100 ms a frame, not the sensor's 5: the sink only learns from a lock that
 // has LASTED a second of wall time, and at the stock rate every block here
@@ -2941,6 +2945,327 @@ int main()
         wiicam_aim_hw_tick();
         wiicam_set_blobreg_hook(0);
         aim_hwgain_clear();
+        wiicam_cam_command("camlearn=reset");
+    }
+
+    // ---- two loops, one sensor: who owns a dwell, and who undoes a cut ---
+    // Both loops judge the same frames. On hardware (blobs004022014, t=78)
+    // the LEDs came back over the sun in a burst of merges, the hwmax loop
+    // read the merged pair as a stray, sent MAXSIZE 15 -> 7, cut two corners
+    // and raised again -- two register writes and a cut for a fault that was
+    // gain's, and one that MAXSIZE cannot fix. And with MAXSIZE the last
+    // mover, the gain loop's own cut-raise was disabled for the rest of the
+    // session. This block pins the ownership rules that stop that.
+    {
+        auto gain = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camgain?");
+            long v = -999;
+            if (!g_replies.empty()) {
+                const char* q = strstr(g_replies[0].c_str(), key);
+                if (q) sscanf(q + strlen(key), "%ld", &v);
+            }
+            return v;
+        };
+        auto gstate = [&](const char* want) {
+            g_replies.clear();
+            wiicam_cam_command("camgain?");
+            return !g_replies.empty() && strstr(g_replies[0].c_str(), want) != 0;
+        };
+        auto lp = [&](const char* key) {
+            g_replies.clear();
+            wiicam_cam_command("camloop?");
+            long v = -999;
+            if (!g_replies.empty()) {
+                const char* q = strstr(g_replies[0].c_str(), key);
+                if (q) sscanf(q + strlen(key), "%ld", &v);
+            }
+            return v;
+        };
+        auto lstate = [&](const char* want) {
+            g_replies.clear();
+            wiicam_cam_command("camloop?");
+            return !g_replies.empty() && strstr(g_replies[0].c_str(), want) != 0;
+        };
+        static const FullObj GRIG[4] = {
+            { 256, 240, 2,  10, 20, 14, 24,  60 },
+            { 768, 240, 3,  10, 20, 15, 25, 100 },
+            { 256, 528, 4,  10, 20, 13, 23, 140 },
+            { 768, 528, 5,  10, 20, 14, 24, 190 },
+        };
+        FullObj dim[4];
+        memcpy(dim, GRIG, sizeof(dim));
+        dim[0].inten = 20; dim[1].inten = 60; dim[2].inten = 100; dim[3].inten = 140;
+        auto push = [&](FullObj* f) {
+            f[0].x += (g_jit & 1) ? 1 : -1; ++g_jit;
+            memcpy(g_fobj, f, sizeof(g_fobj));
+            float sx = 0.0f, sy = 0.0f;
+            wiicam_aim_full_poll(g_qpx, g_qpy, g_qsz, &g_qseen);
+            g_t += DT;
+            wiicam_aim_process_sz(g_qpx, g_qpy, g_qsz, g_qseen & 0xF, g_t, &sx, &sy);
+            wiicam_aim_hw_tick();
+        };
+        auto gclean = [&](const FullObj* o, int n) {
+            for (int k = 0; k < n; ++k) { frame(o); wiicam_aim_hw_tick(); }
+        };
+        // The bottom pair run together into one blob at their midpoint, box
+        // width = their separation + one LED: the resolver's own merge test.
+        auto gmerge = [&](int n) {
+            for (int k = 0; k < n; ++k) {
+                FullObj f[4];
+                memcpy(f, GRIG, sizeof(f));
+                f[2].x = 512; f[2].xmn = 30; f[2].xmx = 98; f[2].inten = 250;
+                f[3].x = 1023; f[3].y = 1023;
+                push(f);
+            }
+        };
+        // Four blobs, one of them in the middle of the bar and BIGGER than
+        // the LEDs: the stray MAXSIZE exists for, and no merge.
+        auto gstray = [&](int n) {
+            for (int k = 0; k < n; ++k) {
+                FullObj f[4];
+                memcpy(f, GRIG, sizeof(f));
+                f[3].x = 512; f[3].y = 384; f[3].sz = 9;
+                f[3].xmn = 10; f[3].xmx = 34; f[3].inten = 250;
+                push(f);
+            }
+        };
+        auto gcut = [&](int n) {
+            for (int k = 0; k < n; ++k) {
+                FullObj f[4];
+                memcpy(f, GRIG, sizeof(f));
+                f[3].x = 1023; f[3].y = 1023;
+                push(f);
+            }
+        };
+        // An empty sensor: the same nothing every poll.
+        auto gblind = [&](int n) {
+            for (int k = 0; k < n; ++k) {
+                float sx = 0.0f, sy = 0.0f;
+                g_t += DT;
+                wiicam_aim_process_sz(g_qpx, g_qpy, g_qsz, 0u, g_t, &sx, &sy);
+                wiicam_aim_hw_tick();
+            }
+        };
+        wiicam_set_blobreg_hook(+[](int, int) { return 1; });
+        wiicam_cam_command("cam=fmt:2,bmin:0,bmax:15,rtol:0,bhmax:0,pxmax:0,armax:0,bwmax:0");
+        wiicam_cam_command("camlearn=on:0");
+        // Both loops ON, each at its preset. hwmax:255 IS the sens-2 preset,
+        // and loop:1 adopts it (no restore, no sensitivity hook needed).
+        wiicam_cam_command("cam=hwmax:255");
+        wiicam_cam_command("cam=loop:1");
+        aim_hwgain_clear();
+        wiicam_cam_command("cam=hwgain:-1");
+        wiicam_aim_hw_tick();
+        gclean(GRIG, 20);
+        wiicam_cam_command("cam=gloop:1");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        ck(quad_locked() && gain("val=") == 0x0C && lp("val=") == 255
+           && lstate("state=HOLD"),
+           "two loops: locked in full mode, MAXSIZE at 255 and gain at 0x0C, "
+           "both loops running");
+
+        // (a) A dwell of merged pairs is the GAIN loop's dwell. The merged
+        //     blob leaves a corner unaccounted for, which to the hwmax loop
+        //     looks exactly like a stray -- and MAXSIZE cannot touch a merge.
+        gmerge(58);
+        {
+            char m[240];
+            snprintf(m, sizeof m, "a dwell of merged pairs moves GAIN (0x0C -> "
+                     "%ld) and leaves MAXSIZE alone (%ld, %s): the resolver's "
+                     "merge test says whose fault it is, and it is not "
+                     "MAXSIZE's", gain("val="), lp("val="),
+                     lstate("state=HOLD") ? "HOLD" : "moved");
+            ck(gain("val=") == 0x18 && lp("val=") == 255 && lstate("state=HOLD"), m);
+        }
+        // (b) A clean dwell absorbs the gain step; the mover mark is cleared
+        //     rather than left on gain for the session.
+        gclean(dim, 58);
+        ck(gstate("state=HOLD") && gain("val=") == 0x18,
+           "...a clean dwell after it holds at the new byte");
+
+        // (c) A stray dwell is MAXSIZE's: the hwmax loop LOWERS, gain holds.
+        gstray(58);
+        {
+            char m[200];
+            snprintf(m, sizeof m, "a dwell with a big stray in the bar moves "
+                     "MAXSIZE (255 -> %ld) and leaves gain alone (%ld)",
+                     lp("val="), gain("val="));
+            ck(lp("val=") == 127 && lstate("state=LOWER") && gain("val=") == 0x18, m);
+        }
+        // (d) The dwell after: clean at the lowered MAXSIZE, so it holds --
+        //     and MAXSIZE's move is absorbed too.
+        gclean(dim, 58);
+        ck(lstate("state=HOLD") && lp("val=") == 127,
+           "...and a clean dwell at the lowered MAXSIZE holds it");
+
+        // (e) A cut at a MAXSIZE the LEDs have already passed. The hwmax
+        //     loop's own rule says that value is not what cut one now (it is
+        //     vouched), so the cut is not MAXSIZE's -- and before this it was
+        //     nobody's: the shared verdict dropped it, and the gain loop never
+        //     saw a cut at all while MAXSIZE sat vouched. Now it is gain's:
+        //     hi = the byte that cut, and back halfway into the band.
+        gcut(6);
+        {
+            char m[260];
+            snprintf(m, sizeof m, "a cut at a vouched MAXSIZE (%ld, %s) is GAIN's "
+                     "to undo: hi %ld, val 0x18 -> %ld -- with MAXSIZE the last "
+                     "mover this raise never came, and the verdict never even "
+                     "reached the gain loop", lp("val="),
+                     lstate("state=HOLD") ? "HOLD" : "moved",
+                     gain("hi="), gain("val="));
+            ck(lp("val=") == 127 && lstate("state=HOLD") && gain("hi=") == 0x18
+               && gain("val=") == 0x12 && gstate("state=RAISE"), m);
+        }
+        // (g) The floor, measured. The cut recorded the intensity the LEDs
+        //     were lost at (icut). A clean dwell whose dimmest corner sits at
+        //     that intensity is a cut waiting for a scene change: the loop
+        //     backs up instead of settling there.
+        {
+            const long icut = gain("icut=");
+            FullObj edge[4];
+            memcpy(edge, GRIG, sizeof(edge));
+            edge[0].inten = (int)icut;         // dimmest corner AT the floor
+            gclean(edge, 58);                  // one dwell at 0x12, at the floor
+            char m[240];
+            snprintf(m, sizeof m, "a dwell whose dimmest corner reads the "
+                     "intensity an LED was lost at (icut %ld) is backed up "
+                     "instead of settled: hi 0x12, val 0x12 -> %ld (halfway to "
+                     "lo)", icut, gain("val="));
+            ck(icut > 0 && gain("val=") == 0x0F && gain("hi=") == 0x12
+               && gstate("state=RAISE"), m);
+        }
+        // (h) A blind sensor at a gain above the preset. The hwmax loop has
+        //     no untested value out, so the blindness is gain's: after a
+        //     second of nothing the byte that blinded it becomes hi and the
+        //     loop backs up, without waiting for a frame the sensor cannot
+        //     send.
+        wiicam_cam_command("cam=gloop:0");
+        wiicam_cam_command("cam=hwgain:24");   // 0x18 by hand, then resume from it
+        wiicam_aim_hw_tick();
+        wiicam_cam_command("cam=gloop:1");
+        wiicam_aim_hw_tick();
+        gclean(dim, 58);                       // a clean dwell: imin_last = 20
+        ck(gain("val=") == 0x18 && gstate("state=HOLD"),
+           "blind: the loop resumed at 0x18 and held a clean dwell there");
+        gblind(4);                             // 0.4 s of nothing
+        ck(gain("val=") == 0x18, "...0.4 s of an empty sensor is not yet a verdict");
+        gblind(9);                             // past a second
+        {
+            char m[240];
+            snprintf(m, sizeof m, "...but a whole second of NOTHING at a gain "
+                     "above the preset is a cut: hi %ld, icut %ld (the last "
+                     "clean dwell's dimmest corner), val 0x18 -> %ld",
+                     gain("hi="), gain("icut="), gain("val="));
+            ck(gain("hi=") == 0x18 && gain("icut=") == 20 && gain("val=") < 0x18, m);
+        }
+        // (i) Re-acquire: the first dwell after the sensor comes back is a
+        //     transition, not evidence. Merges in it do not step; merges in
+        //     the next one do.
+        gclean(GRIG, 60);                      // back, and absorbed to HOLD
+        {
+            const long v0 = gain("val=");
+            gblind(3);
+            gmerge(58);
+            const long v1 = gain("val=");
+            gmerge(58);
+            const long v2 = gain("val=");
+            char m[240];
+            snprintf(m, sizeof m, "after a blind spell the first dwell of merges "
+                     "does not move gain (%ld -> %ld) and the second does (-> %ld)",
+                     v0, v1, v2);
+            ck(v1 == v0 && v2 != v1, m);
+        }
+        // (j) The hwmax loop's re-acquire dwell -- the t=78 event itself.
+        //     Two seconds blind, then four blobs with the sun still in the
+        //     bar: the resolver is past its "no lock for a second" window, so
+        //     every frame reads as a stray-only room. The first dwell is a
+        //     transition and holds; the second, still full of strays, LOWERS.
+        wiicam_cam_command("cam=gloop:0");
+        // gloop:0 asks for a sensitivity RESTORE, which this suite has no
+        // hook for; a by-hand preset value clears the request and keeps the
+        // loop off. (On hardware the restore simply completes.)
+        wiicam_cam_command("cam=hwgain:12");
+        wiicam_cam_command("cam=hwmax:255");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        gclean(GRIG, 60);
+        ck(lp("val=") == 255 && lstate("state=HOLD"),
+           "re-acquire: MAXSIZE at 255, gain loop off");
+        gblind(20);                            // 2 s of nothing
+        gstray(58);
+        const long v_first = lp("val=");
+        gstray(58);
+        {
+            char m[240];
+            snprintf(m, sizeof m, "two seconds blind, then a bar with a stray "
+                     "in it: the first dwell HOLDS (255 -> %ld) and the second "
+                     "LOWERS (-> %ld) -- the dwell that sent 15 -> 7 on hardware",
+                     v_first, lp("val="));
+            ck(v_first == 255 && lp("val=") == 127, m);
+        }
+        // (k) The gain loop's move is absorbed too. MAXSIZE LOWERED and not
+        //     yet vouched for (msplit:0 keeps the merge dwell from vouching
+        //     it); gain steps and then holds a clean dwell. A cut after that
+        //     is nobody's move, so K3 goes to MAXSIZE -- which is what it
+        //     would have been refused with gain still marked as the mover.
+        wiicam_cam_command("cam=msplit:0");
+        wiicam_cam_command("cam=gloop:0");
+        wiicam_cam_command("cam=hwgain:12");
+        wiicam_cam_command("cam=hwmax:255");
+        wiicam_aim_hw_tick();
+        wiicam_cam_command("cam=gloop:1");
+        wiicam_cam_command("cam=loop:1");
+        wiicam_aim_hw_tick();
+        gclean(GRIG, 60);                      // relock at both presets
+        gstray(58);                            // MAXSIZE 255 -> 127, unvouched
+        ck(lp("val=") == 127 && lstate("state=LOWER") && gain("val=") == 0x0C,
+           "absorb: MAXSIZE lowered to 127 and not yet vouched for");
+        {
+            const unsigned long sp0 = blobstat("bsplit=");
+            // MAXSIZE is still in LOWER for the rest of its dwell and gain
+            // defers to it, so the merges are fed until gain has taken ONE
+            // step (0x0C -> 0x18) and no more.
+            int fed = 0;
+            while (fed < 140 && gain("val=") != 0x18) { gmerge(1); ++fed; }
+            ck(blobstat("bsplit=") == sp0,
+               "...msplit:0 really is off: a run of merged pairs split nothing");
+            ck(gain("val=") == 0x18 && gstate("state=LOWER") && lp("val=") == 127,
+               "...merged pairs (refused, not split) step gain once and leave "
+               "MAXSIZE at 127");
+        }
+        {
+            // A clean dwell for each: gain's step absorbed, MAXSIZE holding
+            // and -- because it was deferring while gain moved -- still not
+            // vouched for at 127.
+            int fed = 0;
+            while (fed < 140 && !(gstate("state=HOLD") && lstate("state=HOLD")))
+                { gclean(dim, 1); ++fed; }
+            gclean(dim, 8);                    // well inside a fresh dwell of each
+            ck(gstate("state=HOLD") && lstate("state=HOLD") && lp("val=") == 127
+               && gain("val=") == 0x18,
+               "...and clean frames bring both to HOLD, MAXSIZE still at 127");
+        }
+        gcut(6);
+        {
+            char m[260];
+            snprintf(m, sizeof m, "a cut after both moves were absorbed goes to "
+                     "MAXSIZE (127 -> %ld, %s), not gain (%ld): with gain still "
+                     "marked as the last mover MAXSIZE would have refused it",
+                     lp("val="), lstate("state=RAISE") ? "RAISE" : "no raise",
+                     gain("val="));
+            ck(lp("val=") > 127 && lstate("state=RAISE") && gain("val=") == 0x18, m);
+        }
+        wiicam_cam_command("cam=msplit:1");
+        wiicam_cam_command("cam=gloop:0");
+        wiicam_aim_hw_tick();
+        wiicam_cam_command("cam=loop:0");
+        wiicam_cam_command("cam=hwmax:-1");
+        wiicam_aim_hw_tick();
+        wiicam_set_blobreg_hook(0);
+        aim_hwgain_clear();
+        aim_hwloop_clear();
         wiicam_cam_command("camlearn=reset");
     }
 

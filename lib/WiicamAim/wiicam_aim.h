@@ -135,6 +135,9 @@ void wiicam_set_postflash_hook(void (*fn)(void));
 // without it the writer is guessing at a drain time it cannot know.
 void wiicam_aim_cam_hold(int on);
 int  wiicam_aim_cam_held(void);
+// A camera read the driver refused (I2C error, torn frame): the poll loop
+// reports it here so '~camblob?' can count what never became a frame (pfail).
+void wiicam_aim_note_pollfail(void);
 void wiicam_aim_cam_ack(void);
 int  wiicam_aim_cam_acked(void);
 

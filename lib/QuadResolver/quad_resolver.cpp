@@ -825,10 +825,14 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
     // one LED-width in from either end of it. Any mismatch leaves it refused
     // (the 2-real frame of before). Seen in sun: the bottom pair merged into
     // a 30x2 blob every few seconds, and two corners went at once.
+    // The detection runs whenever widths are known, so R.merge can say "a
+    // merged pair" to the controllers even with merge_split off; only the
+    // synthesis of the two corners is behind the flag. Flag off, nothing
+    // downstream of this block changes.
     int split_b = -1;
     auto is_amb = [&](int b) { for (int a = 0; a < n_amb; ++a) if (amb_b[a] == b) return true; return false; };
     auto slot_used_now = [&](int b) { return split_b == b; };
-    if (C.merge_split && s_ow_cur >= n && n + 2 <= QUAD_MAX_IN) {
+    if (s_ow_cur >= n && n + 2 <= QUAD_MAX_IN) {
         // one LED's width: the median of the matched blobs' widths
         int wm[4], m = 0;
         for (int s = 0; s < 4; ++s)
@@ -856,6 +860,8 @@ QuadResult quad_update(const float* xs, const float* ys, int n)
             const float dx = fabsf(px[s1] - px[s2]);
             const float sep = (float)(s_ow[b] - w1);
             if (sep <= 0.0f || fabsf(sep - dx) > 0.3f * dx) continue;
+            R.merge++; ST.merges++;
+            if (!C.merge_split) { split_b = b; continue; }   // judged, not split
             // two synthetic blobs, one LED-width in from either end
             const int left = (px[s1] < px[s2]) ? s1 : s2, right = (left == s1) ? s2 : s1;
             sx_[n] = xs[b] - 0.5f * sep; sy_[n] = ys[b]; slot_of[left]  = n; blob_used[n] = true; ++n;

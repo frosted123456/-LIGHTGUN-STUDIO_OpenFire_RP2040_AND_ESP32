@@ -35,6 +35,12 @@ struct QuadResult {
     // blob (0, or 2 per split). They are published as real; a learner of
     // blob shapes should skip the frame, since the merged blob is not an LED.
     int   split;
+    // Blobs this frame that LOOK like two LEDs merged along a row -- at the
+    // midpoint of two unmatched slots on one row, box width the pair's
+    // separation plus one LED -- whether or not merge_split turned them into
+    // corners. A merge is a gain fault and no size gate can cut it; this is
+    // how the controllers tell it from a stray, which is MAXSIZE's job.
+    int   merge;
 };
 
 // Tunables for association and model learning.
@@ -127,6 +133,7 @@ struct QuadStats {
     uint32_t giveups;       // veto_seed: a model dropped -- refused every re-acquire, or a near blob it never matched
     uint32_t ambig;         // blobs refused as ambiguous between two slots (a merged LED pair)
     uint32_t splits;        // merged pairs split into two corners (merge_split)
+    uint32_t merges;        // blobs judged a merged pair (split or not)
 };
 QuadStats quad_take_stats(void);
 

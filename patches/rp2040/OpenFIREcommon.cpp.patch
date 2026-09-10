@@ -86,7 +86,7 @@
                              GetPosition();
                          }
  
-@@ -648,11 +699,129 @@
+@@ -648,11 +699,134 @@
  void FW_Common::GetPosition()
  {
      if(dfrIRPos != nullptr) {
@@ -166,6 +166,11 @@
 +#else
          int error = dfrIRPos->basicAtomic(DFRobotIRPositionEx::Retry_2);
 +#endif
++#ifdef USE_AIM_PIPELINE
++        // A read the driver refused never becomes a frame, so no counter
++        // downstream sees it; this is the one that does ('~camblob?' pfail).
++        if(error != DFRobotIRPositionEx::Error_Success) wiicam_aim_note_pollfail();
++#endif
          if(error == DFRobotIRPositionEx::Error_Success) {
 +#ifdef USE_AIM_PIPELINE
 +            // A good read clears the latch: a flash write or a probe that
@@ -217,7 +222,7 @@
                  OpenFIREper.warp(OpenFIREdiamond.X(0), OpenFIREdiamond.Y(0),
                                  OpenFIREdiamond.X(1), OpenFIREdiamond.Y(1),
                                  OpenFIREdiamond.X(2), OpenFIREdiamond.Y(2),
-@@ -661,7 +830,7 @@
+@@ -661,7 +835,7 @@
                                  res_y / 2, res_x / 2,
                                  res_y, res_x, res_y / 2);
              } else {
@@ -226,7 +231,7 @@
                  OpenFIREper.warp(OpenFIREsquare.X(0), OpenFIREsquare.Y(0),
                                  OpenFIREsquare.X(1), OpenFIREsquare.Y(1),
                                  OpenFIREsquare.X(2), OpenFIREsquare.Y(2),
-@@ -699,6 +868,9 @@
+@@ -699,6 +873,9 @@
                  default:
                      break;
                  }
@@ -236,7 +241,7 @@
  
              // Constrain that bisch so negatives don't cause underflow
              int32_t conMoveX = constrain(mouseX, 0, res_x);
-@@ -753,9 +925,28 @@
+@@ -753,9 +930,28 @@
                       buttons.offScreen = true;
                  else buttons.offScreen = false;
  
@@ -268,7 +273,7 @@
  
              } else {
                  if(gunMode == FW_Const::GunMode_Verification) {
-@@ -970,6 +1161,13 @@
+@@ -970,6 +1166,13 @@
      }
  
      if(dfrIRPos != nullptr) dfrIRPos->sensitivityLevel((DFRobotIRPositionEx::Sensitivity_e)sensitivity);

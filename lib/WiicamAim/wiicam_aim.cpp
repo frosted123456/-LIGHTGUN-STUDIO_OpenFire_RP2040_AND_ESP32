@@ -445,8 +445,27 @@ static int loop_preset(void)
 
 // Two loops, one sensor: whichever is mid-search owns it, and a cut backs off
 // whichever moved last. Declared here because loop_write() sets it.
+// The mark is CLEARED once the mover's loop has finished a dwell in HOLD: its
+// move is absorbed, and a cut after that is nobody's to own. Left sticky, one
+// MAXSIZE move disabled the gain loop's cut-raise for the rest of the session
+// (seen on hardware: gain parked at the sensor's floor, no way back up).
 enum { MOVER_NONE = 0, MOVER_MAX, MOVER_GAIN };
 static int  s_last_mover = MOVER_NONE;
+// Merge frames in one dwell that buy the gain loop a step. Defined here
+// because both loops' declarations are read together.
+#define GL_MERGE_N     (LOOP_DWELL / 4)
+// The gain loop's state, declared early because the hwmax loop defers to it
+// the same way it defers to the hwmax loop: one search at a time.
+static int  s_gl_state = LOOP_HOLD;           // the gain loop's, see below
+static volatile bool s_gl_on = true;
+// The first dwell after the sensor came back from seeing nothing is a scene
+// in transition -- LEDs returning one at a time, the sun still in frame, the
+// resolver not yet re-locked so four blobs read as "a stray-only room" -- and
+// neither loop treats it as evidence to LOWER. Cuts still raise (K3). On
+// hardware (blobs004022014, t=78) that dwell sent MAXSIZE 15 -> 7 and cut two
+// corners, two register writes and a stutter for a scene that was fixing itself.
+static bool s_loop_reacq = false, s_gl_reacq = false;   // one per loop
+static bool s_an_low = false;                 // the sensor is seeing <= 1 blob
 
 static void loop_new_dwell(void)
 {
@@ -543,6 +562,7 @@ static void loop_dwell_end(void)
             s_loop_state = LOOP_HOLD;
             s_loop_hold_run = 0;
             s_loop_saved = false;
+            if (s_last_mover == MOVER_MAX) s_last_mover = MOVER_NONE;
         }
         loop_new_dwell();
         return;
@@ -563,6 +583,16 @@ static void loop_dwell_end(void)
     }
     // The dwell after a RAISE is the one that says whether its lo was real.
     loop_lo_settle(s_loop_state == LOOP_RAISE && s_loop_dwell_nlock >= LOOP_DWELL / 2);
+    // The first dwell after a blind spell is not evidence to LOWER on: hold,
+    // and let the next dwell judge.
+    const bool lower_allowed = !s_loop_reacq;
+    s_loop_reacq = false;                 // consumed by this dwell, whatever it decides
+    if (s_loop_ncut == 0 && s_loop_nstray >= LOOP_DWELL / 2 && !lower_allowed) {
+        s_loop_state = LOOP_HOLD;
+        if (s_last_mover == MOVER_MAX) s_last_mover = MOVER_NONE;
+        loop_new_dwell();
+        return;
+    }
     if (s_loop_ncut == 0 && s_loop_nstray >= LOOP_DWELL / 2) {
         // The sensor's own size byte says whether MAXSIZE can reach this
         // stray at all. A streak the sensor reports at the LEDs' size (seen
@@ -571,6 +601,7 @@ static void loop_dwell_end(void)
         // a dwell. Hold instead; the value the LEDs pass at is kept.
         if (s_loop_nstray_uncut * 2 >= s_loop_nstray) {
             s_loop_state = LOOP_HOLD;
+            if (s_last_mover == MOVER_MAX) s_last_mover = MOVER_NONE;
             loop_new_dwell();
             return;
         }
@@ -596,6 +627,7 @@ static void loop_dwell_end(void)
         return;
     }
     s_loop_state = LOOP_HOLD;
+    if (s_last_mover == MOVER_MAX) s_last_mover = MOVER_NONE;   // absorbed
     // Only a clean dwell counts toward settling; an indecisive one (nothing in
     // frame) is not evidence, so flash only ever gets a value this gun aimed with.
     if (s_loop_nclean >= LOOP_DWELL / 2) {
@@ -619,6 +651,10 @@ static void loop_tick(int verdict, bool locked, bool stray_uncut)
     // it lands were still taken under the old value. Neither is evidence.
     if (s_hw_dirty) return;
     if (s_loop_settle > 0) { --s_loop_settle; return; }
+    // Arbitration, both ways: while the gain loop is mid-search the sensor is
+    // its, and frames taken under a moving GAIN say nothing about MAXSIZE.
+    if (s_gl_on && (s_gl_state == LOOP_LOWER || s_gl_state == LOOP_RAISE))
+        return;
     if (locked) ++s_loop_dwell_nlock;
     if      (verdict == V_CLEAN) ++s_loop_nclean;
     else if (verdict == V_STRAY) { ++s_loop_nstray; if (stray_uncut) ++s_loop_nstray_uncut; }
@@ -628,6 +664,8 @@ static void loop_tick(int verdict, bool locked, bool stray_uncut)
     else                  s_loop_cut_run = 0;
     // NOSAFE ignores a cut: it is sitting at the preset, where a missing
     // corner is an off-screen gun and not something MAXSIZE can fix.
+    // (A cut right after a GAIN step never reaches here: this loop defers
+    // while gain is mid-search, and gain's mark is cleared once it holds.)
     if (s_loop_state != LOOP_NOSAFE && s_loop_cut_run >= LOOP_RAISE_N) {
         loop_raise();
         return;
@@ -653,6 +691,7 @@ static void loop_reset(int val)
     s_loop_lo_prev = 0;
     s_loop_lo_pending = false;
     s_loop_uncured = 0;
+    s_loop_reacq = false;
     loop_new_dwell();
 }
 
@@ -716,13 +755,13 @@ static const char* loop_state_name(void)
                               // gain this codebase already ships to users, and
                               // the far end of the search. Not a tuning value.
 #define GL_HI_UNKNOWN   256   // no byte is known to cut an LED yet
-#define GL_MERGE_N     (LOOP_DWELL / 4)  // merge frames in a dwell that buy a step
+// GL_MERGE_N (merge frames in a dwell that buy a step) is defined with the
+// hwmax loop, which reads it too.
 #define GL_CURVE_N      8     // settled dwells kept for the intensity curve
 
-static volatile bool s_gl_on = true;
+// s_gl_on and s_gl_state are declared with the hwmax loop, which defers to them.
 static volatile bool s_gl_store_req = false;   // settled: store hwg0 from the pump core
 static volatile bool s_gl_saved = false;
-static int  s_gl_state = LOOP_HOLD;
 static int  s_gl_val   = 0;            // what we last asked 0x08 for; 0 = preset
 static int  s_gl_lo    = 0;            // highest byte seen to merge
 static int  s_gl_hi    = GL_HI_UNKNOWN;// lowest byte seen to cut an LED
@@ -739,6 +778,16 @@ static uint32_t s_gl_pred_hold = 0;    // steps the prediction refused
 static uint32_t s_gl_prev_ambig = 0;   // quad_ambig_total() at the last frame
 static int  s_gl_cn = 0;               // curve points held
 static int  s_gl_cbyte[GL_CURVE_N], s_gl_cimin[GL_CURVE_N];
+static uint64_t s_gl_blind_us = 0;     // when a run of empty reports started
+// The hwmax loop has nothing left to give: a cut nobody owns is gain's to undo
+// only once MAXSIZE is back at its preset (or off, or has given up).
+static bool loop_exhausted(void)
+{
+    // ...or vouched for: a MAXSIZE the LEDs have already passed is not what
+    // cut one now, which is the hwmax loop's own rule for refusing the cut.
+    return !s_loop_on || s_loop_state == LOOP_NOSAFE || s_loop_state == LOOP_OFF
+        || s_loop_val >= loop_preset() || s_loop_vouched;
+}
 // The byte the sensitivity preset puts in 0x08. The loop never goes below it:
 // more gain than the preset is not ours to give.
 static int gl_preset(void)
@@ -791,6 +840,8 @@ static void gl_reset(int val)
     s_gl_icut = -1;
     s_gl_imin_last = -1; s_gl_wmed_last = -1;
     s_gl_cn = 0;
+    s_gl_blind_us = 0;
+    s_gl_reacq = false;
     gl_new_dwell();
 }
 
@@ -814,7 +865,10 @@ static void gl_raise(void)
         return;
     }
     s_gl_hi = s_gl_val;
-    s_gl_icut = s_gl_imin;               // the intensity at which it happened
+    // The intensity at which it happened. A dwell that cut on its first frames
+    // measured nothing at this byte; the last clean dwell's dimmest corner is
+    // then the best measurement of where the edge is, and it is on this rig.
+    s_gl_icut = (s_gl_imin >= 0) ? s_gl_imin : s_gl_imin_last;
     if (s_gl_lo + 1 >= s_gl_hi) { gl_nosafe(); return; }
     int nv = (s_gl_lo > 0) ? (s_gl_lo + s_gl_val) / 2 : preset;
     if (nv >= s_gl_hi) nv = s_gl_hi - 1;
@@ -863,7 +917,9 @@ static void gl_dwell_end(void)
             s_gl_state = LOOP_HOLD;
             s_gl_hold_run = 0;
             s_gl_saved = false;
+            if (s_last_mover == MOVER_GAIN) s_last_mover = MOVER_NONE;
         }
+        s_gl_reacq = false;
         gl_new_dwell();
         return;
     }
@@ -876,10 +932,23 @@ static void gl_dwell_end(void)
         return;
     }
     gl_curve_note();
+    const bool reacq = s_gl_reacq;
+    s_gl_reacq = false;
+    // The floor, measured: this value's dimmest corner is at or under the
+    // intensity at which this rig has lost an LED. It is a cut waiting for a
+    // scene change (on hardware: 2 s blind when the sun moved), so it is
+    // treated as one now -- hi = this byte, and back up into the band.
+    if (s_gl_icut >= 0 && s_gl_imin >= 0 && s_gl_imin <= s_gl_icut
+        && s_gl_val > gl_preset()) {
+        gl_raise();
+        return;
+    }
     // Merges, and no cut: less gain. One step per dwell, bisecting toward the
     // byte that cut if one is known and doubling into the unknown if not --
     // 0x0C, 0x18, 0x30, 0x60, 0xC0 is five steps across the whole range.
-    if (s_gl_ncut == 0 && s_gl_nmerge >= GL_MERGE_N) {
+    // Not on the first dwell after a blind spell: the LEDs coming back over
+    // the sun merge for a moment and then do not.
+    if (s_gl_ncut == 0 && s_gl_nmerge >= GL_MERGE_N && !reacq) {
         int nv = (s_gl_hi < GL_HI_UNKNOWN) ? (s_gl_val + s_gl_hi) / 2
                                            : (s_gl_val * 2);
         if (nv > GL_CEIL) nv = GL_CEIL;
@@ -892,6 +961,7 @@ static void gl_dwell_end(void)
         if (s_gl_icut >= 0 && pred >= 0 && pred <= s_gl_icut) {
             ++s_gl_pred_hold;
             s_gl_state = LOOP_HOLD;
+            if (s_last_mover == MOVER_GAIN) s_last_mover = MOVER_NONE;
             gl_new_dwell();
             return;
         }
@@ -903,6 +973,7 @@ static void gl_dwell_end(void)
         return;
     }
     s_gl_state = LOOP_HOLD;
+    if (s_last_mover == MOVER_GAIN) s_last_mover = MOVER_NONE;   // absorbed
     if (s_gl_nclean >= LOOP_DWELL / 2) {
         if (s_gl_hold_run < LOOP_SETTLED) ++s_gl_hold_run;
     }
@@ -933,13 +1004,38 @@ static void gl_tick(int verdict, bool locked, bool merged, int imin, int wmed)
     if (verdict == V_CUT) ++s_gl_cut_run;
     else                  s_gl_cut_run = 0;
     // K3, and the arbitration's other half: a cut backs off whichever loop
-    // moved last. If that was MAXSIZE, this one holds and lets it raise.
-    if (s_gl_state != LOOP_NOSAFE && s_gl_cut_run >= LOOP_RAISE_N
-        && s_last_mover != MOVER_MAX) {
+    // moved last. If that was MAXSIZE, this one holds and lets it raise. A
+    // cut nobody moved for goes to MAXSIZE first -- raising it cannot bring
+    // a merge back -- and to gain only once MAXSIZE has nothing left to give.
+    const bool mine = (s_last_mover == MOVER_GAIN)
+                   || (s_last_mover == MOVER_NONE && loop_exhausted());
+    if (s_gl_state != LOOP_NOSAFE && s_gl_cut_run >= LOOP_RAISE_N && mine) {
         gl_raise();
         return;
     }
     if (s_gl_dwell >= LOOP_DWELL) gl_dwell_end();
+}
+
+// A blind sensor sends the same empty report every poll and no frame reaches
+// the verdict, so a dwell never ends. If the hwmax loop has an untested value
+// out, the blindness is its to answer for (loop_blind). Otherwise, with gain
+// above the preset, the LEDs have gone under the sensor's threshold at THIS
+// gain -- the edge the rail exists to stay away from, measured for real: the
+// last clean dwell's dimmest corner is the intensity they were lost at.
+static void gl_blind(uint64_t now_us)
+{
+    if (!s_gl_on || s_hw_dirty) return;
+    const bool max_owns = s_loop_on && s_loop_val < loop_preset()
+        && (s_loop_state == LOOP_LOWER || (s_loop_from_flash && !s_loop_ever_lock));
+    const bool ours = !max_owns && s_gl_state != LOOP_NOSAFE
+        && (s_gl_val > gl_preset());
+    if (!ours) { s_gl_blind_us = 0; return; }
+    if (!s_gl_blind_us) { s_gl_blind_us = now_us; return; }
+    if (now_us - s_gl_blind_us < LOOP_BLIND_US) return;
+    s_gl_blind_us = 0;
+    s_gl_from_flash = false;
+    s_gl_imin = -1;                      // nothing measured at this byte: use the last dwell's
+    gl_raise();
 }
 
 static const char* gl_state_name(void)
@@ -1059,10 +1155,36 @@ int wiicam_aim_full_poll(int* px, int* py, int* sizes, unsigned* seen)
 // and every one of them has to honour the same flag.
 static volatile int s_cam_hold = 0;
 static volatile int s_cam_ack  = 0;
-
+// The gun's own record of its stalls, so a log can never again show a
+// healthy gun while the user is holding a dead one (blobs004022014: two
+// seconds felt, nothing recorded, because every counter lived on the core
+// that stayed alive). Watermarks reset on each '~camblob?' read, so a row is
+// "the worst since the last row"; the two totals run since boot.
+//   c0gap   longest gap between two camera polls that produced a frame (us)
+//   c1gap   longest gap between two passes of the pump core's loop (us)
+//   holdmax longest single camera hold (us); holdus  total held (us)
+//   pfail   camera reads the driver refused (I2C error, torn frame)
+static uint64_t s_c0_last_us = 0, s_c1_last_us = 0, s_hold_from_us = 0;
+static volatile uint32_t s_c0_gap = 0, s_c1_gap = 0, s_hold_max = 0;
+static volatile uint32_t s_hold_us = 0, s_pfail = 0;
+static inline void note_gap(uint64_t now, uint64_t* last, volatile uint32_t* mx)
+{
+    if (*last && now > *last) {
+        const uint64_t d = now - *last;
+        if (d > *mx) *mx = (d > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)d;
+    }
+    *last = now;
+}
+void wiicam_aim_note_pollfail(void) { ++s_pfail; }
 void wiicam_aim_cam_hold(int on)
 {
-    if (on) s_cam_ack = 0;
+    if (on) { s_cam_ack = 0; s_hold_from_us = fx_now(); }
+    else if (s_hold_from_us) {
+        const uint64_t d = fx_now() - s_hold_from_us;
+        s_hold_from_us = 0;
+        s_hold_us += (uint32_t)d;
+        if (d > s_hold_max) s_hold_max = (uint32_t)d;
+    }
     s_cam_hold = on ? 1 : 0;
 }
 int  wiicam_aim_cam_held(void)  { return s_cam_hold; }
@@ -1178,6 +1300,7 @@ void wiicam_aim_hw_tick(void)
     // rather than the shot paying for the write.
     // Both the dirty mark and the store requests persist, so leaving is all
     // that deferring takes; the next tick is microseconds away.
+    note_gap(fx_now(), &s_c1_last_us, &s_c1_gap);
     if (fx_busy(fx_now())) return;
     if (s_loop_store_req) {
         s_loop_store_req = false;
@@ -1405,6 +1528,7 @@ void wiicam_aim_begin(void)
     s_loop_store_req = false;
     s_loop_preset_seen = loop_preset();
     loop_reset(s_loop_preset_seen);
+    s_an_low = false;                    // a boot is not a re-acquire
     {
         int lv = 0, llo = 0, lhi = LOOP_HI_UNKNOWN;
         if (aim_hwloop_load(&lv, &llo, &lhi) && lv > 0) {
@@ -1505,6 +1629,7 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
     // Counted before the cache: polls advancing while bframes stands still is a
     // sensor repeating one frame; polls standing still is a poll that stopped.
     ++s_bpolls;
+    note_gap(now_us, &s_c0_last_us, &s_c0_gap);
 
     // A byte-identical report is the previous camera frame seen again: return
     // the cached answer and leave every stateful stage untouched.
@@ -1521,11 +1646,11 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             if ((seen & (1u << i)) && sizes[i] != s_cache_sz[i])
                 same = false;
     if (same) {
-        if (seen == 0) loop_blind(now_us);   // nothing seen, again
+        if (seen == 0) { loop_blind(now_us); gl_blind(now_us); }   // nothing seen, again
         *sx = s_cache_sx; *sy = s_cache_sy;
         return s_cache_ret;
     }
-    if (seen) s_loop_blind_us = 0;
+    if (seen) { s_loop_blind_us = 0; s_gl_blind_us = 0; }
     s_cache_seen = seen;
     for (int i = 0; i < 4; ++i) {
         s_cache_px[i] = px[i]; s_cache_py[i] = py[i];
@@ -1969,12 +2094,17 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
         // exists for. Either the resolver split the blob back into two corners
         // (r.split) or it refused it as ambiguous; both are the same event.
         const uint32_t amb = quad_ambig_total();
-        const bool merged = (r.split > 0) || (amb != s_gl_prev_ambig);
+        const bool merged = (r.split > 0) || (r.merge > 0) || (amb != s_gl_prev_ambig);
         s_gl_prev_ambig = amb;
         const uint64_t since_lock = now_us - s_loop_last_lock_us;
         const bool recent   = s_loop_ever_lock && since_lock < LOOP_RECENT_US;
         const bool unlocked = !s_loop_ever_lock || since_lock >= LOOP_UNLOCKED_US;
         int verdict = V_NONE;
+        // The cut itself, before the question of whose it is: the gain loop
+        // must see it even at a MAXSIZE value the LEDs have passed -- THAT is
+        // the case where it is gain's (on hardware: MAXSIZE vouched at 15,
+        // the LEDs lost at the gain floor, and no loop ever told).
+        const bool cut_seen = (an <= 3 && r.locked && r.n_real >= 2 && recent && !merged);
         // In the sensor's own measure -- the size byte MAXSIZE bounds -- is
         // the stray any bigger than the corners? If not, no MAXSIZE cuts it
         // without cutting an LED. Judged against the resolver's corners
@@ -2008,9 +2138,12 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             verdict = V_STRAY;          // four blobs and no lock for a second: a stray-only room
         // A value the LEDs have already passed cannot be what cut one now: a
         // corner gone at a vouched value is a hidden or weak LED, not MAXSIZE.
-        else if (an <= 3 && r.locked && r.n_real >= 2 && recent
-                 && !s_loop_vouched && !merged)
+        else if (cut_seen && !s_loop_vouched)
             verdict = V_CUT;            // a corner is gone while the others are tracked
+        // Back from seeing (almost) nothing: the next dwell of each loop is
+        // a transition, not evidence.
+        if (an <= 1) s_an_low = true;
+        else if (s_an_low) { s_an_low = false; s_loop_reacq = true; s_gl_reacq = true; }
         loop_tick(verdict, r.locked, stray_uncut);
 
         // ---- the gain loop's own oracle --------------------------------
@@ -2040,7 +2173,9 @@ bool wiicam_aim_process_sz(const int* px, const int* py, const int* sizes,
             }
             gwmed = (wv[1] + wv[2]) / 2;
         }
-        gl_tick(verdict, r.locked, merged, gimin, gwmed);
+        // The gain loop's verdict carries the cut whether or not MAXSIZE has
+        // been vouched for; everything else is the same judgement.
+        gl_tick(cut_seen ? V_CUT : verdict, r.locked, merged, gimin, gwmed);
     }
     if (r.locked) { s_loop_last_lock_us = now_us; s_loop_ever_lock = true; }
 
@@ -2305,7 +2440,7 @@ bool wiicam_cam_command(const char* line)
               "bhmax=%u pxmax=%u armax=%u hwmax=%d hwmin=%d "
               "bn=%d brej=%lu brrej=%lu bvalve=%lu bframes=%lu bms=%lu "
               "bdrop=%lu bsrej=%lu bfar=%lu bnear=%lu bsv=%lu bcold=%lu "
-              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d bwmax=%u benv=%lu bmerge=%lu bwide=%lu bsplit=%lu bregw=%lu bregf=%lu\n",
+              "br4=%lu br3=%lu br2=%lu br1=%lu br0=%lu bpolls=%lu hold=%d bwmax=%u benv=%lu bmerge=%lu bwide=%lu bsplit=%lu bregw=%lu bregf=%lu c0gap=%lu c1gap=%lu holdmax=%lu holdus=%lu pfail=%lu\n",
               (unsigned)fmt, (unsigned)(fmt >= WIICAM_FMT_EXT),
               (unsigned)wiicam_aim_fullreg(), (unsigned)s_bmin, (unsigned)s_bmax,
               (unsigned)s_rtol, (unsigned)s_bhmax, (unsigned)s_pxmax, (unsigned)s_armax,
@@ -2323,7 +2458,11 @@ bool wiicam_cam_command(const char* line)
               (unsigned long)s_bpolls, (int)s_cam_hold, (unsigned)s_bwmax,
               (unsigned long)s_benv, (unsigned long)quad_ambig_total(),
               (unsigned long)s_bwide, (unsigned long)s_bsplit,
-              (unsigned long)s_bregw, (unsigned long)s_bregf);
+              (unsigned long)s_bregw, (unsigned long)s_bregf,
+              (unsigned long)s_c0_gap, (unsigned long)s_c1_gap,
+              (unsigned long)s_hold_max, (unsigned long)s_hold_us,
+              (unsigned long)s_pfail);
+        s_c0_gap = 0; s_c1_gap = 0; s_hold_max = 0;   // worst since the last read
         // In full mode each blob carries three more numbers -- box width, box
         // height and intensity -- so the line grows and the buffer with it.
         // Nine fields a blob in full mode, four of them added since this was
@@ -2801,6 +2940,14 @@ bool wiicam_cam_command(const char* line)
                           "fmt:2 and this gun is in fmt:%d\n",
                           v, (int)(s_ext_state & 3));
             }
+        }
+        else if (!strcmp(key, "msplit")) {
+            // merge_split, live: a row-merged pair is either split back into
+            // its two corners (1) or refused and left to the gain loop (0).
+            // Not persisted -- an A/B knob for the field, defaulting on.
+            // Takes effect through the resolver reset the camera core runs.
+            s_quad_cfg.merge_split = (val != 0);
+            s_quad_reset_pending = true;
         }
         else if (!strcmp(key, "bwmax")) {
             // Same floor rule as bhmax: this rig's widest measured LED.

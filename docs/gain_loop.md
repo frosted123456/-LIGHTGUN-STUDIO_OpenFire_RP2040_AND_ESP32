@@ -281,3 +281,73 @@ counters by pical's log timestamps and concluded the gun was fine. It is not
 safe to do that — while pical is backlogged its rows are stale, so gun-side
 events get smeared across the wrong seconds. Always re-key on `gun_ms`, which
 tracks wall time to ±0.5 s even when a core is blocked.
+
+## Field note 2 — the same capture, read again
+
+A second pass over `blobs004022014`, with the CSV rather than the memory of
+it, overturns most of field note 1's diagnosis. The write storm did not
+happen: **two** register writes in 135 s (`hwmax` 15 → 7 → 14, both at
+02:21:33), `gval` 24 and `HOLD` on all 364 rows. What the capture actually
+holds:
+
+| t (s) | bn | hwmax | what the row says |
+|---|---|---|---|
+| 72–76 | 4 | 15 | steady; `gimin` = **4**, corner intensity median 7 (scale 0–255) |
+| 76–78 | **0–1** | 15 | LEDs gone for ~2 s, `bdrop` +228 — the "hang": nothing to see |
+| 78 | 4 | **15→7** | LEDs return; resolver past its 1 s no-lock window, so four blobs read as a stray-only room; hwmax LOWERs |
+| 79 | **2** | 7 | 7 cuts two LEDs |
+| 79 | 4 | **7→14** | K3 raises. Two writes, two `fx_glue_shutdown()` — the stutter |
+
+**Root cause.** The loop settled at 0x18 with the dimmest corner at intensity
+4 — the sensor's floor, not a margin above it (p10 of all corner readings is
+4). No cut had ever been measured (`ghi` 256), so `icut` stayed −1 and the
+prediction rail never armed. A scene shift took the LEDs under threshold;
+the re-acquire dwell then fed the hwmax loop a "stray-only room".
+
+**Fixed, in `wiicam_aim.cpp`, each with a mutation-tested assertion:**
+
+1. `s_last_mover` is cleared once the mover's loop finishes a dwell in HOLD.
+   Left sticky, one MAXSIZE move disabled the gain loop's cut-raise for the
+   rest of the session.
+2. The hwmax loop defers to the gain loop mid-search, the same way the gain
+   loop already deferred to it.
+3. The **re-acquire dwell**: the first dwell after the sensor reported ≤ 1
+   blob is not evidence to LOWER on, for either loop. This is the t=78 fix.
+4. A cut nobody moved for goes to MAXSIZE first (cannot bring a merge back)
+   and to gain only once MAXSIZE has nothing left — at its preset, NOSAFE,
+   off, **or vouched**. The gain loop also now *sees* the cut at a vouched
+   MAXSIZE: the shared verdict used to drop it there, so gain was never told.
+5. The rail from a measured floor: `icut` falls back to the last clean
+   dwell's dimmest corner when the cut dwell measured nothing; a settled
+   dwell whose dimmest corner is at or under `icut` is treated as a cut
+   (hi = this byte, back into the band) instead of kept; and a second of an
+   empty sensor at a gain above the preset, with no untested MAXSIZE out, is
+   a cut too (`gl_blind`, mirroring `loop_blind`).
+6. `~cam=msplit:0/1` — merge_split as a live A/B knob; `QuadResult.merge`
+   counts blobs the resolver judged a merged pair whether or not it split
+   them.
+
+**Not fixed, on purpose.** A 2 s watchdog was planned. `wiicam_aim_hw_tick()`
+only runs in Run mode; Pause has 300 ms delays and Docked has its own
+`for(;;)`, so any feed placed in the overlay would reset the gun in the
+pause menu or while docked to the Studio. It needs a beat at the top of both
+upstream loops in every mode, which is an upstream edit, not an overlay one.
+
+**The stall record.** `~camblob?` (and the Studio/pical CSV) now carry
+`c0gap` / `c1gap` (longest gap between camera polls / between passes of the
+pump core's loop since the last read, µs), `holdmax` / `holdus` (longest
+single camera hold since the last read, total held since boot) and `pfail`
+(camera reads the driver refused). A frozen gun cannot leave a clean log
+again.
+
+**Two more things the capture says.**
+
+- pical goes quiet for 2–4 s every 15.6–18.3 s, like clockwork, with the
+  gun at ~200 fps throughout. `BlobLog` called `os.fsync()` every second on
+  the front end's frame loop; a USB stick's housekeeping can hold that for
+  seconds. The sync now runs on its own thread, one in flight at a time,
+  skipped and counted when the last is still busy. This is the hub freezing.
+- `bpolls` sustains ~600/s against `startIrCamTimer(420)`. Upstream's timer
+  is a PWM wrap whose divider is computed from `clk_sys` *at init*; OpenFIRE
+  overclocks after, so the tick runs proportionally faster. Not a fault, but
+  it means ~2/3 of full-mode reads are duplicates of a ~200 Hz sensor.
